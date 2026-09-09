@@ -1,0 +1,157 @@
+#include "mtmd-vad.h"
+
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "gguf.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+struct context_deleter {
+    void operator()(ggml_context * ctx) const { ggml_free(ctx); }
+};
+using context_ptr = std::unique_ptr<ggml_context, context_deleter>;
+}
+
+struct mtmd_vad::impl {
+    context_ptr weights;
+    std::vector<float> weight_data;
+    context_ptr work;
+    ggml_cgraph * graph = nullptr;
+    ggml_cplan plan{};
+    std::vector<uint8_t> scratch;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * h_in = nullptr;
+    ggml_tensor * c_in = nullptr;
+    ggml_tensor * h_out = nullptr;
+    ggml_tensor * c_out = nullptr;
+    ggml_tensor * probability = nullptr;
+    std::array<float, 64> context{};
+
+    ggml_tensor * weight(const std::string & name, int64_t a, int64_t b = 1, int64_t c = 1) {
+        auto * t = ggml_get_tensor(weights.get(), ("vad." + name).c_str());
+        if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != a || t->ne[1] != b || t->ne[2] != c || t->ne[3] != 1) {
+            throw std::runtime_error("invalid VAD tensor: " + name);
+        }
+        return t;
+    }
+
+    ggml_tensor * conv(ggml_tensor * x, ggml_tensor * w, int stride, int padding) {
+        auto * ctx = work.get();
+        // The generic conv helper lowers activations to F16. Keep reference parity in F32.
+        auto * col = ggml_im2col(ctx, w, x, stride, 0, padding, 0, 1, 0, false, GGML_TYPE_F32);
+        auto * y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, col, col->ne[0], col->ne[1] * col->ne[2]),
+                                    ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
+        return ggml_reshape_2d(ctx, y, col->ne[1], w->ne[2]);
+    }
+
+    explicit impl(const std::string & path) {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file || file.tellg() <= 0 || file.tellg() > 2 * 1024 * 1024) {
+            throw std::runtime_error("VAD fixture must be at most 2 MiB");
+        }
+        ggml_context * raw = nullptr;
+        auto * meta = gguf_init_from_file(path.c_str(), {true, &raw});
+        weights.reset(raw);
+        if (!meta) {
+            throw std::runtime_error("cannot load VAD GGUF");
+        }
+        const auto metadata = std::unique_ptr<gguf_context, decltype(&gguf_free)>(meta, gguf_free);
+        const auto file_size = static_cast<size_t>(file.tellg());
+        const size_t data_offset = gguf_get_data_offset(meta);
+        if (gguf_get_n_tensors(meta) != 14 || data_offset > file_size) {
+            throw std::runtime_error("invalid VAD tensor inventory");
+        }
+        size_t total = 0;
+        for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) {
+            auto * t = ggml_get_tensor(weights.get(), gguf_get_tensor_name(meta, i));
+            const size_t bytes = ggml_nbytes(t);
+            const size_t offset = gguf_get_tensor_offset(meta, i);
+            if (t->type != GGML_TYPE_F32 || bytes > 2 * 1024 * 1024 - total ||
+                    offset > file_size - data_offset || bytes > file_size - data_offset - offset) {
+                throw std::runtime_error("invalid VAD tensor extent");
+            }
+            total += bytes;
+        }
+        weight_data.resize(total / sizeof(float));
+        size_t cursor = 0;
+        for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) {
+            auto * t = ggml_get_tensor(weights.get(), gguf_get_tensor_name(meta, i));
+            t->data = weight_data.data() + cursor;
+            file.seekg(data_offset + gguf_get_tensor_offset(meta, i));
+            if (!file.read(static_cast<char *>(t->data), ggml_nbytes(t))) {
+                throw std::runtime_error("cannot read VAD tensor");
+            }
+            cursor += ggml_nelements(t);
+        }
+        work.reset(ggml_init({16 * 1024 * 1024, nullptr, false}));
+        if (!work) {
+            throw std::runtime_error("cannot allocate VAD graph");
+        }
+        auto * ctx = work.get();
+        input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 576, 1);
+        h_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        c_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        auto * z = conv(ggml_pad_reflect_1d(ctx, input, 0, 64), weight("stft_conv.weight", 256, 1, 258), 128, 0);
+        auto * re = ggml_view_2d(ctx, z, 4, 129, z->nb[1], 0);
+        auto * im = ggml_view_2d(ctx, z, 4, 129, z->nb[1], 129 * z->nb[1]);
+        z = ggml_sqrt(ctx, ggml_add(ctx, ggml_sqr(ctx, re), ggml_sqr(ctx, im)));
+        const int channels[] = {129, 128, 64, 64, 128};
+        for (int i = 0; i < 4; ++i) {
+            const auto name = "conv" + std::to_string(i + 1);
+            z = conv(z, weight(name + ".weight", 3, channels[i], channels[i + 1]), i == 1 || i == 2 ? 2 : 1, 1);
+            auto * bias = ggml_reshape_2d(ctx, weight(name + ".bias", channels[i + 1]), 1, channels[i + 1]);
+            z = ggml_relu(ctx, ggml_add(ctx, z, bias));
+        }
+        z = ggml_reshape_1d(ctx, z, 128);
+        auto * gates = ggml_add(ctx, ggml_add(ctx,
+                ggml_mul_mat(ctx, weight("lstm_cell.Wx", 128, 512), z),
+                ggml_mul_mat(ctx, weight("lstm_cell.Wh", 128, 512), h_in)), weight("lstm_cell.bias", 512));
+        auto gate = [&](int index) { return ggml_view_1d(ctx, gates, 128, index * 128 * sizeof(float)); };
+        c_out = ggml_add(ctx, ggml_mul(ctx, ggml_sigmoid(ctx, gate(1)), c_in),
+                             ggml_mul(ctx, ggml_sigmoid(ctx, gate(0)), ggml_tanh(ctx, gate(2))));
+        h_out = ggml_mul(ctx, ggml_sigmoid(ctx, gate(3)), ggml_tanh(ctx, c_out));
+        probability = ggml_sigmoid(ctx, ggml_add(ctx,
+                ggml_mul_mat(ctx, ggml_reshape_2d(ctx, weight("final_conv.weight", 1, 128, 1), 128, 1), ggml_relu(ctx, h_out)),
+                weight("final_conv.bias", 1)));
+        graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, probability);
+        plan = ggml_graph_plan(graph, 1, nullptr);
+        scratch.resize(plan.work_size);
+        plan.work_data = scratch.data();
+    }
+};
+
+mtmd_vad::mtmd_vad(const std::string & path) : data(std::make_unique<impl>(path)) { reset(); }
+mtmd_vad::~mtmd_vad() = default;
+
+void mtmd_vad::reset() {
+    data->context.fill(0);
+    ggml_set_zero(data->h_in);
+    ggml_set_zero(data->c_in);
+}
+
+float mtmd_vad::process(const std::array<float, 512> & samples) {
+    if (!std::all_of(samples.begin(), samples.end(), [](float x) { return std::isfinite(x); })) {
+        throw std::runtime_error("VAD input contains non-finite samples");
+    }
+    auto * input = static_cast<float *>(data->input->data);
+    std::copy(data->context.begin(), data->context.end(), input);
+    std::copy(samples.begin(), samples.end(), input + 64);
+    if (ggml_graph_compute(data->graph, &data->plan) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("VAD graph execution failed");
+    }
+    const float p = ggml_get_f32_1d(data->probability, 0);
+    if (!std::isfinite(p)) {
+        throw std::runtime_error("VAD produced a non-finite probability");
+    }
+    std::copy(samples.end() - 64, samples.end(), data->context.begin());
+    std::memcpy(data->h_in->data, data->h_out->data, 128 * sizeof(float));
+    std::memcpy(data->c_in->data, data->c_out->data, 128 * sizeof(float));
+    return p;
+}
