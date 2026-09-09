@@ -1,0 +1,6 @@
+set(TARGET llama-frankie-realtime)
+add_executable(${TARGET} realtime-server.cpp brain-session.cpp mouth-session.cpp)
+target_link_libraries(${TARGET} PRIVATE llama-common mtmd Threads::Threads)
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_include_directories(${TARGET} SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
