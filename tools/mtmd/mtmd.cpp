@@ -1934,6 +1934,36 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
 
     *out = {};
 
+    if (inp->type == MTMD_GEN_PROCESS_TYPE_EMBED_CODES) {
+        if (mtmd_gen_audio_get_info(ctx).type != MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
+            LOG_ERR("%s: code embedding requires Qwen3-TTS\n", __func__);
+            return 1;
+        }
+        if (!inp->codes || inp->n_codes != 16) {
+            LOG_ERR("%s: code embedding requires one 16-code frame\n", __func__);
+            return 1;
+        }
+        std::vector<int32_t> codes(inp->codes, inp->codes + inp->n_codes);
+        clip_image_f32 dummy;
+        dummy.set_size({1, 1}, false, true);
+        dummy.cpy_buf(std::vector<float>(1, 0.0f));
+        clip_image_f32_batch batch;
+        batch.is_audio = true;
+        batch.entries.push_back(std::move(dummy));
+        std::vector<float> embd((size_t) clip_n_mmproj_embd(ctx_clip));
+        clip_encode_params params;
+        params.imgs = &batch;
+        params.n_threads = ctx->n_threads;
+        params.gen_process = CLIP_GEN_PROCESS_EMBED_CODES;
+        params.codes = &codes;
+        params.out_embd = &embd;
+        params.seed = inp->seed;
+        if (!clip_encode(ctx_clip, &params)) { return 1; }
+        ctx->gen_out_embd = std::move(embd);
+        out->embd = ctx->gen_out_embd.data();
+        return 0;
+    }
+
     if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
         const size_t n_embd = (size_t) clip_n_mmproj_embd(ctx_clip);
 

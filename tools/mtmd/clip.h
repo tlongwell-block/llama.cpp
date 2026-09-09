@@ -94,6 +94,7 @@ enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
     CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
+    CLIP_GEN_PROCESS_EMBED_CODES, // one codec frame to talker embedding
 };
 struct clip_encode_params {
     int n_threads = 1;

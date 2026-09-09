@@ -102,6 +102,45 @@ protected:
     mtmd_gen_audio_info info;
 };
 
+bool mtmd_helper_qwen3tts_body(
+        size_t width, size_t max_rows,
+        const std::vector<float> & ref_text, const std::vector<float> & target_text,
+        const float * ref_codec, size_t n_ref_codec,
+        const std::vector<float> & tts_eos, const std::vector<float> & tts_pad,
+        const std::vector<float> & codec_bos, const std::vector<float> & codec_pad,
+        std::vector<float> & output) {
+    if (width == 0 || width > 16384 || max_rows > 32768 || max_rows < 2 ||
+        ref_text.size() % width || target_text.size() % width ||
+        tts_eos.size() != width || tts_pad.size() != width ||
+        codec_bos.size() != width || codec_pad.size() != width ||
+        (ref_codec == nullptr) != (n_ref_codec == 0)) {
+        return false;
+    }
+    size_t rows = 2;
+    for (size_t n : {ref_text.size() / width, target_text.size() / width, n_ref_codec}) {
+        if (n > max_rows - rows) { return false; }
+        rows += n;
+    }
+    std::vector<float> result;
+    result.reserve(rows * width);
+    auto append = [&](const float * data, size_t n, const std::vector<float> & pad) {
+        for (size_t i = 0; i < n * width; ++i) {
+            const float value = data[i] + pad[i % width];
+            if (!std::isfinite(value)) { return false; }
+            result.push_back(value);
+        }
+        return true;
+    };
+    if (!append(ref_text.data(), ref_text.size() / width, codec_pad) ||
+        !append(target_text.data(), target_text.size() / width, codec_pad) ||
+        !append(tts_eos.data(), 1, codec_pad) || !append(codec_bos.data(), 1, tts_pad) ||
+        !append(ref_codec, n_ref_codec, tts_pad)) {
+        return false;
+    }
+    output.swap(result);
+    return true;
+}
+
 // Qwen3-TTS: backbone samples codec_0, code_predictor gives the other 15 codebooks,
 // then code2wav decodes them to PCM
 class qwen3tts_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
@@ -126,6 +165,18 @@ public:
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
         reset();
         seq_id = inp->seq_id;
+        if (!inp->prompt || inp->prompt_len > 131072 || inp->ref_text_len > 131072 ||
+            (inp->target_embd == nullptr) != (inp->n_target_embd == 0) ||
+            (inp->ref_codec_embd == nullptr) != (inp->n_ref_codec_embd == 0) ||
+            (inp->ref_text == nullptr) != (inp->ref_text_len == 0) ||
+            (inp->ref_codes == nullptr) != (inp->n_ref_frames == 0) ||
+            (inp->n_ref_frames && inp->n_ref_codec_embd) ||
+            (inp->ref_text_len > 0) != (inp->n_ref_codec_embd > 0 || inp->n_ref_frames > 0) ||
+            inp->prime_frames > inp->n_ref_frames ||
+            inp->n_target_embd > 32768 || inp->n_ref_codec_embd > 32768 || inp->n_ref_frames > 32768) {
+            LOG_ERR("mtmd_helper_gen_audio: invalid Qwen conditioning input\n");
+            return 1;
+        }
 
         if (!ensure_cache()) {
             return 1;
@@ -181,9 +232,61 @@ public:
         prompt.push_back(sum_row(tts_pad, c_think_e));
         if (!speaker_embd.empty()) prompt.push_back(sum_vec(tts_pad, speaker_embd));
         prompt.push_back(sum_row(tts_bos, codec_pad));
-        for (int i = 3; i < n_ids - 5; i++) prompt.push_back(sum_row(ids[(size_t) i], codec_pad));
-        prompt.push_back(sum_row(tts_eos, codec_pad));
-        prompt.push_back(sum_row(tts_pad, codec_bos));
+        std::vector<float> reference_rows, target_rows, body;
+        if (inp->ref_text_len) {
+            const std::string reference = "<|im_start|>assistant\n" +
+                std::string(inp->ref_text, inp->ref_text_len) + "<|im_end|>\n";
+            std::vector<llama_token> ref_ids(reference.size() + 16);
+            const int count = llama_tokenize(vocab, reference.c_str(), (int32_t) reference.size(),
+                                             ref_ids.data(), (int32_t) ref_ids.size(), false, true);
+            if (count < 5) { return 1; }
+            for (int i = 3; i < count - 2; ++i) {
+                const auto value = row(ref_ids[i]);
+                reference_rows.insert(reference_rows.end(), value.begin(), value.end());
+            }
+        }
+        if (inp->target_embd) {
+            if (inp->n_target_embd != (size_t) (n_ids - 8)) {
+                LOG_ERR("mtmd_helper_gen_audio: target conditioning token count mismatch\n");
+                return 1;
+            }
+            target_rows.assign(inp->target_embd, inp->target_embd + inp->n_target_embd * n_e);
+        } else {
+            for (int i = 3; i < n_ids - 5; ++i) {
+                const auto value = row(ids[i]);
+                target_rows.insert(target_rows.end(), value.begin(), value.end());
+            }
+        }
+        std::vector<float> reference_codec_rows;
+        if (inp->ref_codes) {
+            const size_t max_frames = std::min<size_t>(llama_n_ctx(lctx), 32768);
+            if (inp->n_ref_frames > max_frames) { return 1; }
+            reference_codec_rows.reserve(inp->n_ref_frames * n_e);
+            for (size_t frame = 0; frame < inp->n_ref_frames; ++frame) {
+                std::vector<int32_t> codes(inp->ref_codes + frame * 16, inp->ref_codes + (frame + 1) * 16);
+                auto request = mtmd_gen_inp_default(mctx);
+                request.type = MTMD_GEN_PROCESS_TYPE_EMBED_CODES;
+                request.codes = codes.data();
+                request.n_codes = codes.size();
+                request.seed = inp->seed;
+                mtmd_gen_out result{};
+                if (mtmd_gen_audio_process(mctx, &request, &result)) { return 1; }
+                reference_codec_rows.insert(reference_codec_rows.end(), result.embd, result.embd + n_e);
+            }
+        }
+        const float * ref_codec = inp->ref_codes ? reference_codec_rows.data() : inp->ref_codec_embd;
+        const size_t ref_frames = inp->ref_codes ? inp->n_ref_frames : inp->n_ref_codec_embd;
+        const size_t capacity = std::min<size_t>(llama_n_ctx(lctx), 32768);
+        if (capacity <= prompt.size() || !mtmd_helper_qwen3tts_body(
+                n_e, capacity - prompt.size(), reference_rows, target_rows,
+                ref_codec, ref_frames,
+                row(tts_eos), row(tts_pad), row(codec_bos), row(codec_pad), body)) {
+            LOG_ERR("mtmd_helper_gen_audio: invalid or oversized Qwen prefill\n");
+            return 1;
+        }
+        for (size_t i = 0; i < body.size(); i += n_e) {
+            prompt.emplace_back(body.begin() + i, body.begin() + i + n_e);
+        }
 
         n_prompt = (int) prompt.size();
 
@@ -213,6 +316,21 @@ public:
         // frame adds tts_pad on top of the codes embedding
         overlay = row(tts_pad);
 
+        for (size_t start = inp->n_ref_frames - inp->prime_frames; start < inp->n_ref_frames;) {
+            const size_t frames = std::min(window_frames, inp->n_ref_frames - start);
+            std::vector<int32_t> codes(inp->ref_codes + start * 16, inp->ref_codes + (start + frames) * 16);
+            auto request = mtmd_gen_inp_default(mctx);
+            request.type = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
+            request.codes = codes.data();
+            request.n_codes = codes.size();
+            request.seed = seed;
+            request.state_data = c2w_state.empty() ? nullptr : (const char *) c2w_state.data();
+            request.state_size = c2w_state.size();
+            mtmd_gen_out result{};
+            if (mtmd_gen_audio_process(mctx, &request, &result)) { reset(); return 1; }
+            c2w_state.assign(result.state_data, result.state_data + result.state_size);
+            start += frames;
+        }
         return 0;
     }
 
@@ -525,6 +643,12 @@ public:
         }
 
         pack = pockettts_pack(info.model_variant);
+
+        if (inp->target_embd || inp->n_target_embd || inp->ref_text || inp->ref_text_len ||
+            inp->ref_codec_embd || inp->n_ref_codec_embd || inp->ref_codes || inp->n_ref_frames || inp->prime_frames) {
+            LOG_ERR("mtmd_helper_gen_audio: conditioning rows require Qwen3-TTS\n");
+            return 1;
+        }
 
         const std::string text = prepare_text(std::string(inp->prompt, inp->prompt_len),
                                               pack.pad_short_text);

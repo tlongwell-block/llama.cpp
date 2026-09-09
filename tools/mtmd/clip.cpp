@@ -1121,7 +1121,16 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
+                int n_frames = ctx->model.hparams.wav_tfm_swa;
+                if (params && gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+                    const size_t groups = ctx->model.gen_code_head_w->ne[2] + 1;
+                    if (!params->codes || params->codes->empty() || params->codes->size() % groups ||
+                        params->codes->size() / groups > (size_t) n_frames) {
+                        throw std::runtime_error("invalid Qwen decoder frame count");
+                    }
+                    n_frames = (int) (params->codes->size() / groups);
+                }
+                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_frames);
             } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {
@@ -4504,7 +4513,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
     };
 
-    auto set_input_i32 = [&get_inp_tensor](const char * name, std::vector<int32_t> & values) {
+    auto set_input_i32 = [&get_inp_tensor](const char * name, const std::vector<int32_t> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
@@ -4598,7 +4607,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
         set_input_f32("inp_raw", inp_raw);
 
-    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
+    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV &&
+               params->gen_process != CLIP_GEN_PROCESS_EMBED_CODES) {
         // audio input. GEN_WAV is not here: it takes codes or feats, set in the switch below
         GGML_ASSERT(imgs.entries.size() == 1);
 
@@ -5302,7 +5312,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             } break;
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             {
-                if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+                if (params->gen_process == CLIP_GEN_PROCESS_EMBED_CODES) {
+                    const int64_t groups = model.gen_code_head_w->ne[2] + 1;
+                    if (!params->codes || params->codes->size() != (size_t) groups) { return false; }
+                    for (int64_t g = 0; g < groups; ++g) {
+                        const int64_t vocab = g == 0 ? model.gen_code_out_embd_w->ne[1] : model.gen_code_embd_w->ne[1];
+                        const int32_t code = (*params->codes)[g];
+                        if (code < 0 || code >= vocab) {
+                            LOG_ERR("%s: reference code out of range\n", __func__);
+                            return false;
+                        }
+                    }
+                    set_input_i32("inp_ref_codes", *params->codes);
+                } else if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
                     GGML_ASSERT(params->codes != nullptr);
 
                     // frame-major input to group-major, rear-padded with code 0 up to one window
@@ -5326,10 +5348,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                         }
                     }
 
-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
+                    std::vector<int32_t> codes(n_frames * n_codes);
                     for (int64_t f = 0; f < n_frames; f++) {
                         for (int64_t g = 0; g < n_codes; g++) {
-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
+                            codes[g * n_frames + f] = (*params->codes)[f * n_codes + g];
                         }
                     }
                     set_input_i32("inp_codes", codes);
@@ -5787,7 +5809,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     }
 
     // the last node is the embedding tensor, code2wav has no out_embd
-    ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+    ggml_tensor * embeddings = !params->out_embd ? nullptr :
+        params->gen_process == CLIP_GEN_PROCESS_EMBED_CODES ? ggml_graph_get_tensor(gf, "ref_code_embd") :
+        ggml_graph_node(gf, -1);
 
     if (embeddings != nullptr) {
         // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
@@ -5858,7 +5882,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
         const int64_t n_frames_w = hparams.wav_tfm_swa;
         const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
-        if (n_frames < n_frames_w) {
+        if (n_frames < n_frames_w && ctx->proj_type() != PROJECTOR_TYPE_QWEN3TTS_GEN) {
             const size_t hop = out_audio.size() / n_frames_w;
             out_audio.resize((size_t) n_frames * hop);
         }

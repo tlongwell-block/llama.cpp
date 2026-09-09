@@ -394,6 +394,7 @@ enum mtmd_gen_process_type {
     MTMD_GEN_PROCESS_TYPE_GEN_WAV,  // convert semantic to PCM audio
                                     // for qwen3tts, this is code2wav
                                     // for pocket-tts, this is mimi decoder
+    MTMD_GEN_PROCESS_TYPE_EMBED_CODES, // Qwen3-TTS: one complete codec frame to summed talker row
 };
 
 struct mtmd_gen_inp {

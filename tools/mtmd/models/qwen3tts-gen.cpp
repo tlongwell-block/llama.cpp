@@ -661,6 +661,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     switch (gen_process) {
         case CLIP_GEN_PROCESS_GEN_CODE: idx = 0; break;
         case CLIP_GEN_PROCESS_GEN_WAV:  idx = 1; break;
+        case CLIP_GEN_PROCESS_EMBED_CODES: idx = 2; break;
         default: GGML_ABORT("unknown gen_process");
     }
 
@@ -732,7 +733,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     cb(out_embd, "gen_audio_out", -1);
 
     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
+    GGML_ASSERT(n_frames > 0 && n_frames <= hparams.wav_tfm_swa);
 
     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
     ggml_set_name(inp_codes, "inp_codes");
@@ -755,16 +756,33 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
         ggml_set_output(slot.second);
     }
 
+    ggml_tensor * ref_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_codes);
+    ggml_set_name(ref_codes, "inp_ref_codes");
+    ggml_set_input(ref_codes);
+    ggml_tensor * ref_embd = nullptr;
+    for (int g = 0; g < n_codes; ++g) {
+        ggml_tensor * code = ggml_view_1d(ctx0, ref_codes, 1, (size_t) g * sizeof(int32_t));
+        ggml_tensor * table = g == 0 ? model.gen_code_out_embd_w :
+            ggml_view_2d(ctx0, model.gen_code_embd_w, model.gen_code_embd_w->ne[0], model.gen_code_embd_w->ne[1],
+                         model.gen_code_embd_w->nb[1], (size_t) (g - 1) * model.gen_code_embd_w->nb[2]);
+        ggml_tensor * value = ggml_get_rows(ctx0, table, code);
+        ref_embd = ref_embd ? ggml_add(ctx0, ref_embd, value) : value;
+    }
+
+    ggml_set_name(ref_embd, "ref_code_embd");
+    ggml_set_output(ref_embd);
+
     // out_embd goes last, clip_encode() reads it back via ggml_graph_node(gf, -1)
-    ggml_tensor * outs[2];
+    ggml_tensor * outs[3];
+    outs[2] = ref_embd;
     outs[0] = out_codes; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 2, idx);
+    ggml_build_forward_select(gf, outs, 3, idx);
     for (auto & slot : c2w.state_out) {
         outs[0] = out_codes; outs[1] = slot.second;
-        ggml_build_forward_select(gf, outs, 2, idx);
+        ggml_build_forward_select(gf, outs, 3, idx);
     }
     outs[0] = out_embd; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 2, idx);
+    ggml_build_forward_select(gf, outs, 3, idx);
 
     return gf;
 }

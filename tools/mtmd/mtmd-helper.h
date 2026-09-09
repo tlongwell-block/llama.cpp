@@ -207,6 +207,21 @@ struct mtmd_helper_gen_audio_inp {
     uint32_t seed; // UINT32_MAX for random (default: random)
 
     enum mtmd_helper_gen_audio_outtype out_type;
+
+    // Qwen3-TTS only. Projected target rows replace the tokenized target body, not control or reference rows.
+    const float * target_embd;
+    size_t        n_target_embd; // rows, each llama_model_n_embd() floats; must match the target token count
+
+    // Optional ICL context. Codec rows are sums of all talker codebook embeddings, without codec BOS.
+    const char * ref_text;
+    size_t       ref_text_len;
+    const float * ref_codec_embd;
+    size_t        n_ref_codec_embd; // rows, each llama_model_n_embd() floats
+
+    // Alternative to ref_codec_embd: frame-major codec IDs, 16 IDs per frame. Copied during set_input().
+    const int32_t * ref_codes;
+    size_t          n_ref_frames;
+    size_t          prime_frames; // last reference frames decoded silently before generated audio; requires ref_codes
 };
 
 MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(
@@ -254,6 +269,18 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
 #ifdef __cplusplus
 #include <set>
 #include <memory>
+#include <vector>
+
+// Qwen3-TTS non-streaming ICL body: reference text, target text, EOS, codec BOS, reference codes.
+// Returns false for malformed/non-finite rows or a body exceeding max_rows. Output is unchanged on failure.
+bool mtmd_helper_qwen3tts_body(
+    size_t width, size_t max_rows,
+    const std::vector<float> & ref_text, const std::vector<float> & target_text,
+    const float * ref_codec, size_t n_ref_codec,
+    const std::vector<float> & tts_eos, const std::vector<float> & tts_pad,
+    const std::vector<float> & codec_bos, const std::vector<float> & codec_pad,
+    std::vector<float> & output);
+
 
 namespace mtmd_helper {
 
