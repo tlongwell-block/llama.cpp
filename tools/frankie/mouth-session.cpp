@@ -1,6 +1,7 @@
 #include "mouth-session.h"
 
 #include "llama-ext.h"
+#include "text-alignment.h"
 
 #include <cmath>
 #include <cstring>
@@ -40,6 +41,7 @@ mouth_session::mouth_session(const std::string & package) :
     if (!mctx) {
         throw std::runtime_error("mouth load failed");
     }
+    generator = std::make_unique<mtmd_helper::gen_audio>(ctx.get(), mctx.get());
     ggml_context *                                      raw = nullptr;
     std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
         gguf_init_from_callback(component::callback, &side_source, 1024 * 1024, side_source.size(), { false, &raw }),
@@ -48,7 +50,7 @@ mouth_session::mouth_session(const std::string & package) :
     if (!metadata || !side_weights) {
         throw std::runtime_error("Side load failed");
     }
-    side = std::make_unique<mtmd_side>(raw);
+    side = std::make_unique<mtmd_side>(raw, true);
     embeddings.resize(llama_model_get_tok_embd(model.get(), nullptr));
     if (embeddings.empty() || llama_model_get_tok_embd(model.get(), embeddings.data()) != embeddings.size()) {
         throw std::runtime_error("talker embeddings failed");
@@ -77,73 +79,50 @@ mouth_session::mouth_session(const std::string & package) :
     }
 }
 
-std::vector<float> mouth_session::speak(const brain_session::response & response) {
+std::vector<float> mouth_session::speak(const brain_session::response & response, const audio_callback & on_audio, const brain_session::stage_callback & on_stage) {
+    if (on_stage) { on_stage("mouth_phrase_start"); }
     if (!response.message.tool_calls.empty()) {
         throw std::runtime_error("cannot speak tool arguments");
     }
     const auto & brain  = response.raw;
     std::string  spoken = response.message.content;
-    auto         begin = spoken.find_first_not_of(" \t\r\n"), end = spoken.find_last_not_of(" \t\r\n");
-    if (begin == std::string::npos) {
+    const frankie_text_offsets input_offsets(spoken);
+    size_t begin = 0, end = spoken.size();
+    while (begin < end && input_offsets.whitespace[input_offsets.floor[begin]]) { ++begin; }
+    while (end > begin && input_offsets.whitespace[input_offsets.floor[end - 1]]) { --end; }
+    if (begin == end) {
         throw std::runtime_error("empty spoken response");
     }
-    spoken = spoken.substr(begin, end - begin + 1);
+    spoken = spoken.substr(begin, end - begin);
     if (spoken.size() > 8192 || brain.hidden.size() != brain.ends.size()) {
         throw std::runtime_error("response shape/bounds");
     }
-    size_t lead = brain.text.find(spoken);
-    if (lead == std::string::npos) {
+    size_t lead = response.content_offset == std::string::npos ? brain.text.find(spoken) : response.content_offset + begin;
+    if (lead == std::string::npos || brain.text.compare(lead, spoken.size(), spoken) != 0) {
         throw std::runtime_error("parsed content is not a contiguous generated span");
     }
-    // Unicode alignment is not yet verified against the reference tokenizer.
-    for (unsigned char c : spoken) {
-        if (c >= 128) {
-            throw std::runtime_error("Unicode alignment not verified");
-        }
-    }
-    auto *                   vocab = llama_model_get_vocab(model.get());
-    std::vector<llama_token> ids(spoken.size() + 16);
-    int count = llama_tokenize(vocab, spoken.data(), spoken.size(), ids.data(), ids.size(), false, false);
-    if (count <= 0 || count > 256) {
-        throw std::runtime_error("talker token bounds");
-    }
+    const frankie_normalized_text normalized(spoken);
+    auto * vocab = llama_model_get_vocab(model.get());
+    std::vector<llama_token> ids(normalized.text.size() + 16);
+    int count = llama_tokenize(vocab, normalized.text.data(), normalized.text.size(), ids.data(), ids.size(), false, false);
+    if (count <= 0 || count > 256) { throw std::runtime_error("talker token bounds"); }
     ids.resize(count);
-    std::vector<float> target;
-    std::string        roundtrip;
-    size_t             start = 0;
+    std::string roundtrip;
+    std::vector<size_t> talker_ends;
     for (auto id : ids) {
         char piece[512];
-        int  n = llama_token_to_piece(vocab, id, piece, sizeof(piece), 0, false);
-        if (n <= 0) {
-            throw std::runtime_error("talker piece bounds");
-        }
+        int n = llama_token_to_piece(vocab, id, piece, sizeof(piece), 0, false);
+        if (n <= 0 || n > int(sizeof(piece))) { throw std::runtime_error("talker piece bounds"); }
         roundtrip.append(piece, n);
-        size_t finish = start + n, chosen = brain.ends.size();
-        for (size_t i = 0; i < brain.ends.size(); ++i) {
-            size_t bs = i ? brain.ends[i - 1] : 0, be = brain.ends[i];
-            if (be > brain.text.size() || be < bs) {
-                throw std::runtime_error("brain span bounds");
-            }
-            bool keep = brain.text.substr(bs, be - bs).find_first_not_of(" \t\r\n") != std::string::npos;
-            if (keep && be >= lead + finish) {
-                chosen = i;
-                break;
-            }
-        }
-        if (chosen == brain.ends.size() || (chosen ? brain.ends[chosen - 1] : 0) > lead + start) {
-            int best = -1;
-            for (size_t i = 0; i < brain.ends.size(); ++i) {
-                size_t bs = i ? brain.ends[i - 1] : 0, be = brain.ends[i];
-                if (brain.text.substr(bs, be - bs).find_first_not_of(" \t\r\n") == std::string::npos) {
-                    continue;
-                }
-                int overlap = int(std::min(be, lead + finish)) - int(std::max(bs, lead + start));
-                if (overlap > best) {
-                    best   = overlap;
-                    chosen = i;
-                }
-            }
-        }
+        talker_ends.push_back(roundtrip.size());
+    }
+    if (roundtrip != normalized.text) { throw std::runtime_error("talker token roundtrip"); }
+    const auto aligned = frankie_align_text(brain.text, brain.ends, lead, spoken, talker_ends, normalized.spans(talker_ends));
+    std::vector<float> target;
+    target.reserve(ids.size() * 2048);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const auto id = ids[i];
+        const size_t chosen = aligned[i];
         if (chosen >= brain.hidden.size() || id < 0 || size_t(id + 1) * 2048 > embeddings.size()) {
             throw std::runtime_error("alignment bounds");
         }
@@ -151,17 +130,13 @@ std::vector<float> mouth_session::speak(const brain_session::response & response
         for (size_t j = 0; j < 2048; ++j) {
             target.push_back(embeddings[size_t(id) * 2048 + j] + 0.5f * residual[j]);
         }
-        start = finish;
-    }
-    if (roundtrip != spoken) {
-        throw std::runtime_error("talker token roundtrip");
     }
     llama_memory_clear(llama_get_memory(ctx.get()), true);
-    mtmd_helper::gen_audio    gen(ctx.get(), mctx.get());
+    auto & gen = *generator;
     mtmd_helper_gen_audio_inp input{};
     input.seq_id        = 0;
-    input.prompt        = spoken.c_str();
-    input.prompt_len    = spoken.size();
+    input.prompt        = normalized.text.c_str();
+    input.prompt_len    = normalized.text.size();
     input.speaker_ref   = speaker.get();
     input.lang          = "en";
     input.top_k         = 40;
@@ -178,9 +153,11 @@ std::vector<float> mouth_session::speak(const brain_session::response & response
     if (cancelled.load()) {
         throw std::runtime_error("cancelled");
     }
+    if (on_stage) { on_stage("mouth_conditioning_done"); }
     if (gen.set_input(&input)) {
         throw std::runtime_error("mouth input failed");
     }
+    if (on_stage) { on_stage("mouth_input_primed"); }
     for (;;) {
         if (cancelled.load()) {
             throw std::runtime_error("cancelled");
@@ -193,6 +170,7 @@ std::vector<float> mouth_session::speak(const brain_session::response & response
             break;
         }
     }
+    if (on_stage) { on_stage("mouth_prefill_done"); }
     common_params_sampling sampling;
     sampling.temp = 0.6f;
     sampling.seed = 42;
@@ -201,6 +179,28 @@ std::vector<float> mouth_session::speak(const brain_session::response & response
     if (!sampler) {
         throw std::runtime_error("mouth sampler failed");
     }
+    size_t emitted = 0;
+    auto emit = [&]() {
+        int32_t rate = 0;
+        const char * data = nullptr;
+        size_t bytes = 0;
+        int64_t samples = 0;
+        if (gen.get_output(&rate, &data, &bytes, &samples) || rate != 24000 || samples < 0 ||
+            size_t(samples) < emitted || bytes > 4 * 1024 * 1024 || bytes != size_t(samples) * sizeof(float)) {
+            throw std::runtime_error("streaming mouth output bounds");
+        }
+        const auto * pcm = reinterpret_cast<const float *>(data);
+        for (size_t i = emitted; i < size_t(samples); ++i) {
+            if (!std::isfinite(pcm[i])) {
+                throw std::runtime_error("nonfinite streaming PCM");
+            }
+        }
+        if (size_t(samples) > emitted) {
+            if (emitted == 0 && on_stage) { on_stage("mouth_first_chunk"); }
+            on_audio(pcm + emitted, size_t(samples) - emitted);
+            emitted = samples;
+        }
+    };
     bool          stop   = false;
     const float * hidden = llama_get_embeddings_ith(ctx.get(), -1);
     for (int frame = 0; frame < 256 && !stop; ++frame) {
@@ -213,6 +213,9 @@ std::vector<float> mouth_session::speak(const brain_session::response & response
         if (gen.step_gen(token, hidden, &next, &stop)) {
             throw std::runtime_error("mouth generation failed");
         }
+        if (on_audio && ((frame + 1) % 3 == 0 || stop)) {
+            emit();
+        }
         if (!next) {
             break;
         }
@@ -220,6 +223,9 @@ std::vector<float> mouth_session::speak(const brain_session::response & response
     }
     if (cancelled.load()) {
         throw std::runtime_error("cancelled");
+    }
+    if (on_audio) {
+        emit();
     }
     int32_t      rate    = 0;
     const char * data    = nullptr;

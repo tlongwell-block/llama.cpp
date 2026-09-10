@@ -1,4 +1,8 @@
 #include "testing.h"
+#ifdef LLAMA_TEST_FRANKIE
+#include "../tools/frankie/text-alignment.h"
+#include "../tools/frankie/speech-boundary.h"
+#endif
 
 #include "mtmd-image.h"
 #include "mtmd-vad.h"
@@ -49,6 +53,70 @@ struct test_registry {
     static const test_registry test_registry_ ## name(#name, &name);  \
     static void name(testing & t)
 
+
+#ifdef LLAMA_TEST_FRANKIE
+MAKE_TEST(test_frankie_speech_boundary) {
+    t.assert_equal("no three-word opener", size_t(0), frankie_speech_boundary("Let me check the machine", 0, false));
+    t.assert_equal("no clause cut", size_t(0), frankie_speech_boundary("Let me check, then answer", 0, false));
+    t.assert_equal("join short interjection", size_t(0), frankie_speech_boundary("Ha. That sounds", 0, false));
+    const std::string joined = "Ha. That sounds good. Next";
+    t.assert_equal("natural sentence", joined.find(" Next"), frankie_speech_boundary(joined, 0, false));
+    t.assert_equal("short final answer", size_t(4), frankie_speech_boundary("Yes.", 0, true));
+    t.assert_equal("tool flush", size_t(9), frankie_speech_boundary("Checking.", 0, true));
+    std::string long_sentence;
+    for (int i = 0; i < 50; ++i) { long_sentence += "word "; }
+    t.assert_equal("fifty word bound", long_sentence.size() - 1, frankie_speech_boundary(long_sentence, 0, false));
+    const std::string prefix = "This is done.";
+    t.assert_equal("next fragment has own count", prefix.size(), frankie_speech_boundary(prefix + " And three words ", prefix.size(), false));
+}
+
+MAKE_TEST(test_frankie_unicode_alignment) {
+    struct fixture {
+        std::string text, normalized;
+        std::vector<size_t> brain_ends, talker_ends, indices;
+        std::vector<std::pair<size_t, size_t>> offsets;
+    };
+    // Frozen HF Qwen brain/talker token offsets, checked against actual converted vocabularies.
+    const std::vector<fixture> cases = {
+        {"It\342\200\231s a lovely day.","It\342\200\231s a lovely day.",{2,6,8,15,19,20},{2,6,8,15,19,20},{0,1,2,3,4,5},{{0,2},{2,4},{4,6},{6,13},{13,17},{17,18}}},
+        {"  Caf\303\251 \342\200\224 d\303\251j\303\240 vu!","Caf\303\251 \342\200\224 d\303\251j\303\240 vu!",{1,7,11,18,21,22},{1,3,5,9,16,19,20},{1,1,1,2,3,4,5},{{0,1},{1,3},{3,4},{4,6},{6,11},{11,14},{14,15}}},
+        {"\344\275\240\345\245\275\357\274\214\344\270\226\347\225\214\343\200\202","\344\275\240\345\245\275\357\274\214\344\270\226\347\225\214\343\200\202",{6,9,15,18},{6,9,15,18},{0,1,2,3},{{0,2},{2,3},{3,5},{5,6}}},
+        {"An emoji \360\237\246\212 says hi.","An emoji \360\237\246\212 says hi.",{2,8,11,12,13,18,21,22},{2,8,11,12,13,18,21,22},{0,1,2,2,2,5,6,7},{{0,2},{2,8},{8,10},{9,10},{9,10},{10,15},{15,18},{18,19}}},
+        {"e\314\201 is accented.","\303\251 is accented.",{1,3,6,10,15,16},{2,5,9,14,15},{0,2,3,4,5},{{0,1},{2,5},{5,9},{9,14},{14,15}}},
+        {"\302\240Hello\342\200\203world.","Hello\342\200\203world.",{2,7,9,10,15,16},{5,7,8,13,14},{1,2,2,4,5},{{0,5},{5,6},{5,6},{6,11},{11,12}}},
+        {"e\314\201 is accented.","\303\251 is accented.",{1,3,6,10,15,16},{2,5,9,14,15},{0,2,3,4,5},{{0,1},{2,5},{5,9},{9,14},{14,15}}},
+        {"\341\204\200\341\205\241\341\206\250 test","\352\260\201 test",{1,2,3,4,5,6,7,8,9,14},{3,8},{0,9},{{0,1},{3,8}}},
+        {"a\314\201\314\243 test","\341\272\241\314\201 test",{1,3,4,5,10},{3,5,10},{0,2,4},{{0,1},{2,3},{3,8}}},
+        {"\342\204\253 test","\303\205 test",{2,3,8},{2,7},{0,2},{{0,1},{1,6}}},
+        {"a\314\201b","\303\241b",{1,3,4},{3},{0},{{0,3}}},
+        {"\315\204","\314\210\314\201",{1,2},{1,2,4},{0,0,0},{{0,1},{0,1},{0,1}}},
+        {"\341\270\212\314\243","\341\270\214\314\207",{1,2,3,4,5},{3,4,5},{0,3,3},{{0,1},{1,2},{1,2}}},
+        {"\342\200\203Hello\302\240","Hello",{2,3,8,10},{5},{2},{{0,5}}},
+        {"A \360\237\221\251\360\237\217\275\342\200\215\360\237\222\273 works.","A \360\237\221\251\360\237\217\275\342\200\215\360\237\222\273 works.",{1,5,6,8,9,10,12,13,16,17,23,24},{1,5,6,10,12,13,17,23,24},{0,1,1,3,6,6,8,10,11},{{0,1},{1,3},{2,3},{3,4},{4,5},{4,5},{5,6},{6,12},{12,13}}},
+        {"\314\201\314\243 starts.","\314\243\314\201 starts.",{2,3,4,11,12},{1,2,4,11,12},{0,0,1,3,4},{{0,1},{0,1},{1,2},{2,9},{9,10}}},
+        {"\341\270\212\314\243","\341\270\214\314\207",{1,2,3,4,5},{3,4,5},{0,3,3},{{0,1},{1,2},{1,2}}},
+        {"I\342\200\231m here. What\342\200\231s next?","I\342\200\231m here. What\342\200\231s next?",{1,5,10,11,16,20,25,26},{1,5,10,11,16,20,25,26},{0,1,2,3,4,5,6,7},{{0,1},{1,3},{3,8},{8,9},{9,14},{14,16},{16,21},{21,22}}},
+        {"\012\012Sure \342\200\224 let\342\200\231s go!","Sure \342\200\224 let\342\200\231s go!",{2,6,10,14,18,21,22},{4,8,12,16,19,20},{1,2,3,4,5,6},{{0,4},{4,6},{6,10},{10,12},{12,15},{15,16}}},
+    };
+    for (const auto & c : cases) {
+        const frankie_text_offsets map(c.text);
+        size_t lead = 0, tail = c.text.size();
+        while (lead < tail && map.whitespace[map.floor[lead]]) { ++lead; }
+        while (tail > lead && map.whitespace[map.floor[tail - 1]]) { --tail; }
+        const auto spoken = c.text.substr(lead, tail - lead);
+        const frankie_normalized_text normalized(spoken);
+        t.assert_true("NFC text", normalized.text == c.normalized);
+        const auto spans = normalized.spans(c.talker_ends);
+        t.assert_true("original character offsets", spans == c.offsets);
+        t.assert_true("hidden row alignment", frankie_align_text(c.text, c.brain_ends, lead, spoken, c.talker_ends, spans) == c.indices);
+    }
+    for (const std::string invalid : {std::string("\300\200"), std::string("\355\240\200"), std::string("\360\237"), std::string("\364\220\200\200")}) {
+        bool rejected = false;
+        try { const frankie_normalized_text normalized(invalid); } catch (const std::runtime_error &) { rejected = true; }
+        t.assert_true("invalid UTF-8 rejected", rejected);
+    }
+}
+#endif
 
 //
 // mtmd_image
@@ -155,8 +223,8 @@ MAKE_TEST(test_vad_reference) {
         return;
     }
     const std::string dir(root);
-    mtmd_vad vad(dir + "/vad-f32.gguf");
-    mtmd_vad other(dir + "/vad-f32.gguf");
+    mtmd_vad vad(dir + "/vad-f32.gguf", std::getenv("MTMD_COMPONENT_GPU"));
+    mtmd_vad other(dir + "/vad-f32.gguf", std::getenv("MTMD_COMPONENT_GPU"));
     std::ifstream audio(dir + "/chunks.f32", std::ios::binary);
     std::ifstream expected(dir + "/probabilities.f32", std::ios::binary);
     if (!audio || !expected) {
@@ -210,7 +278,7 @@ MAKE_TEST(test_ear_reference) {
     const auto weights = std::unique_ptr<ggml_context, decltype(&ggml_free)>(raw, ggml_free);
     const auto metadata = std::unique_ptr<gguf_context, decltype(&gguf_free)>(meta, gguf_free);
     if (!meta || !raw) { throw std::runtime_error("missing ear weights fixture"); }
-    mtmd_ear ear(raw);
+    mtmd_ear ear(raw, std::getenv("MTMD_COMPONENT_GPU"));
     auto read = [&](const char * name, size_t count) {
         std::ifstream file(dir + "/" + name + ".f32", std::ios::binary);
         std::vector<float> out(count);
@@ -245,7 +313,7 @@ MAKE_TEST(test_ear_reference) {
         params.cb_eval_user_data = const_cast<std::string *>(&dir);
         params.cb_eval = [](ggml_tensor * tensor, bool ask, void * user) {
             const std::string name(tensor->name);
-            const bool capture = name == "encoder_out" || (name.find("enc_") == 0 && name.size() > 4 && name.substr(name.size() - 4) == "_res");
+            const bool capture = name == "encoder_out" || name.find("pre_") == 0 || (name.find("enc_") == 0 && name.size() > 4 && name.substr(name.size() - 4) == "_res");
             if (ask) { return capture; }
             if (capture && tensor->type == GGML_TYPE_F32) {
                 std::vector<float> values(ggml_nelements(tensor));
@@ -373,7 +441,7 @@ MAKE_TEST(test_side_reference) {
         return;
     }
     const std::string dir(root);
-    mtmd_side side(dir + "/side-f32.gguf");
+    mtmd_side side(dir + "/side-f32.gguf", std::getenv("MTMD_COMPONENT_GPU"));
     std::ifstream input(dir + "/inputs.f32", std::ios::binary);
     std::ifstream expected(dir + "/outputs.f32", std::ios::binary);
     if (!input || !expected) { throw std::runtime_error("missing side fixture"); }
