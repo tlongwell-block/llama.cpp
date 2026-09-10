@@ -258,7 +258,12 @@ public:
             }
         }
         std::vector<float> reference_codec_rows;
-        if (inp->ref_codes) {
+        const bool cacheable_reference = inp->ref_codes && inp->n_ref_frames <= 2048;
+        const bool same_reference = cacheable_reference && cached_codes.size() == inp->n_ref_frames * 16 &&
+            std::equal(cached_codes.begin(), cached_codes.end(), inp->ref_codes);
+        if (same_reference) {
+            reference_codec_rows = cached_codec_rows;
+        } else if (inp->ref_codes) {
             const size_t max_frames = std::min<size_t>(llama_n_ctx(lctx), 32768);
             if (inp->n_ref_frames > max_frames) { return 1; }
             reference_codec_rows.reserve(inp->n_ref_frames * n_e);
@@ -316,7 +321,10 @@ public:
         // frame adds tts_pad on top of the codes embedding
         overlay = row(tts_pad);
 
-        for (size_t start = inp->n_ref_frames - inp->prime_frames; start < inp->n_ref_frames;) {
+        const bool same_prime = same_reference && cached_prime_frames == inp->prime_frames;
+        if (same_prime) { c2w_state = cached_prime_state; }
+        for (size_t start = same_prime ? inp->n_ref_frames : inp->n_ref_frames - inp->prime_frames;
+             start < inp->n_ref_frames;) {
             const size_t frames = std::min(window_frames, inp->n_ref_frames - start);
             std::vector<int32_t> codes(inp->ref_codes + start * 16, inp->ref_codes + (start + frames) * 16);
             auto request = mtmd_gen_inp_default(mctx);
@@ -330,6 +338,17 @@ public:
             if (mtmd_gen_audio_process(mctx, &request, &result)) { reset(); return 1; }
             c2w_state.assign(result.state_data, result.state_data + result.state_size);
             start += frames;
+        }
+        // One exact reference per model instance; retain only successful bounded state.
+        if (cacheable_reference && c2w_state.size() <= 64 * 1024 * 1024) {
+            cached_codes.assign(inp->ref_codes, inp->ref_codes + inp->n_ref_frames * 16);
+            cached_codec_rows = reference_codec_rows;
+            cached_prime_frames = inp->prime_frames;
+            cached_prime_state = c2w_state;
+        } else {
+            cached_codes.clear();
+            cached_codec_rows.clear();
+            cached_prime_state.clear();
         }
         return 0;
     }
@@ -554,6 +573,11 @@ private:
 
     // must match hparams.wav_tfm_swa hardcoded in clip.cpp
     size_t window_frames = 72;
+
+    std::vector<int32_t> cached_codes;
+    std::vector<float> cached_codec_rows;
+    std::vector<uint8_t> cached_prime_state;
+    size_t cached_prime_frames = 0;
 
     // per-generation state, cleared by reset()
     llama_seq_id seq_id = 0;
