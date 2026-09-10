@@ -1,7 +1,7 @@
 #include "mtmd-side.h"
 
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "mtmd-backend.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -23,8 +23,8 @@ struct mtmd_side::impl {
     std::vector<float> storage;
     context_ptr work;
     ggml_cgraph * graph = nullptr;
-    ggml_cplan plan{};
-    std::vector<uint8_t> scratch;
+    std::unique_ptr<mtmd_backend> backend;
+    mtmd_buffer_ptr buffer{nullptr, ggml_backend_buffer_free};
     ggml_tensor * input = nullptr;
     ggml_tensor * output = nullptr;
 
@@ -36,7 +36,7 @@ struct mtmd_side::impl {
         return t;
     }
 
-    explicit impl(const std::string & path) {
+    explicit impl(const std::string & path, bool use_gpu) {
         constexpr size_t limit = 32 * 1024 * 1024;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file || file.tellg() <= 0 || file.tellg() > static_cast<std::streamoff>(limit)) {
@@ -81,10 +81,12 @@ struct mtmd_side::impl {
             }
             cursor += ggml_nelements(t);
         }
+        backend = std::make_unique<mtmd_backend>(weight_ctx, use_gpu, "side.");
+        weight_ctx = backend->context();
         init_graph();
     }
 
-    explicit impl(ggml_context * loaded) : weight_ctx(loaded) {
+    explicit impl(ggml_context * loaded, bool use_gpu) : weight_ctx(loaded) {
         if (!loaded) { throw std::runtime_error("missing side weights"); }
         weight("ln.weight", 5120); weight("ln.bias", 5120);
         weight("up.weight", 5120, 1024); weight("up.bias", 1024);
@@ -97,11 +99,13 @@ struct mtmd_side::impl {
                 throw std::runtime_error("non-finite side weights");
             }
         }
+        backend = std::make_unique<mtmd_backend>(weight_ctx, use_gpu, "side.");
+        weight_ctx = backend->context();
         init_graph();
     }
 
     void init_graph() {
-        work.reset(ggml_init({1024 * 1024, nullptr, false}));
+        work.reset(ggml_init({1024 * 1024, nullptr, true}));
         if (!work) { throw std::runtime_error("cannot allocate side graph"); }
         auto * ctx = work.get();
         input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5120);
@@ -110,26 +114,22 @@ struct mtmd_side::impl {
         output = ggml_add(ctx, ggml_mul_mat(ctx, weight("down.weight", 1024, 2048), ggml_gelu_erf(ctx, up)), weight("down.bias", 2048));
         graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, output);
-        plan = ggml_graph_plan(graph, 2, nullptr);
-        scratch.resize(plan.work_size);
-        plan.work_data = scratch.data();
+        buffer = backend->allocate(ctx);
     }
 };
 
-mtmd_side::mtmd_side(const std::string & path) : data(std::make_unique<impl>(path)) {}
-mtmd_side::mtmd_side(ggml_context * weights) : data(std::make_unique<impl>(weights)) {}
+mtmd_side::mtmd_side(const std::string & path, bool use_gpu) : data(std::make_unique<impl>(path, use_gpu)) {}
+mtmd_side::mtmd_side(ggml_context * weights, bool use_gpu) : data(std::make_unique<impl>(weights, use_gpu)) {}
 mtmd_side::~mtmd_side() = default;
 
 std::array<float, 2048> mtmd_side::process(const std::array<float, 5120> & hidden) {
     if (!std::all_of(hidden.begin(), hidden.end(), [](float x) { return std::isfinite(x); })) {
         throw std::runtime_error("side input contains non-finite values");
     }
-    std::copy(hidden.begin(), hidden.end(), static_cast<float *>(data->input->data));
-    if (ggml_graph_compute(data->graph, &data->plan) != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("side graph execution failed");
-    }
+    ggml_backend_tensor_set(data->input, hidden.data(), 0, sizeof(hidden));
+    data->backend->compute(data->graph);
     std::array<float, 2048> result;
-    std::copy_n(static_cast<const float *>(data->output->data), result.size(), result.begin());
+    ggml_backend_tensor_get(data->output, result.data(), 0, sizeof(result));
     if (!std::all_of(result.begin(), result.end(), [](float x) { return std::isfinite(x); })) {
         throw std::runtime_error("side produced non-finite values");
     }

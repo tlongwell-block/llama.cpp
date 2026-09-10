@@ -432,6 +432,12 @@ ggml_cgraph * clip_graph_parakeet::build() {
 
     if (hparams.parakeet_mlx_frontend) {
         ggml_build_forward_expand(gf, cur);
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            auto * node = ggml_graph_node(gf, i);
+            if (node->op == GGML_OP_MUL_MAT) {
+                ggml_prec_set_src(node, GGML_PREC_F32, 1);
+            }
+        }
         return gf;
     }
 

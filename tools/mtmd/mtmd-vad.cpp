@@ -1,7 +1,7 @@
 #include "mtmd-vad.h"
 
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "mtmd-backend.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -20,11 +20,12 @@ using context_ptr = std::unique_ptr<ggml_context, context_deleter>;
 
 struct mtmd_vad::impl {
     context_ptr weights;
+    ggml_context * loaded = nullptr;
     std::vector<float> weight_data;
     context_ptr work;
     ggml_cgraph * graph = nullptr;
-    ggml_cplan plan{};
-    std::vector<uint8_t> scratch;
+    std::unique_ptr<mtmd_backend> backend;
+    mtmd_buffer_ptr buffer{nullptr, ggml_backend_buffer_free};
     ggml_tensor * input = nullptr;
     ggml_tensor * h_in = nullptr;
     ggml_tensor * c_in = nullptr;
@@ -34,7 +35,7 @@ struct mtmd_vad::impl {
     std::array<float, 64> context{};
 
     ggml_tensor * weight(const std::string & name, int64_t a, int64_t b = 1, int64_t c = 1) {
-        auto * t = ggml_get_tensor(weights.get(), ("vad." + name).c_str());
+        auto * t = ggml_get_tensor(loaded, ("vad." + name).c_str());
         if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != a || t->ne[1] != b || t->ne[2] != c || t->ne[3] != 1) {
             throw std::runtime_error("invalid VAD tensor: " + name);
         }
@@ -50,7 +51,7 @@ struct mtmd_vad::impl {
         return ggml_reshape_2d(ctx, y, col->ne[1], w->ne[2]);
     }
 
-    explicit impl(const std::string & path) {
+    explicit impl(const std::string & path, bool use_gpu) {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file || file.tellg() <= 0 || file.tellg() > 2 * 1024 * 1024) {
             throw std::runtime_error("VAD fixture must be at most 2 MiB");
@@ -89,7 +90,23 @@ struct mtmd_vad::impl {
             }
             cursor += ggml_nelements(t);
         }
-        work.reset(ggml_init({16 * 1024 * 1024, nullptr, false}));
+        loaded = weights.get();
+        backend = std::make_unique<mtmd_backend>(loaded, use_gpu, "vad.");
+        loaded = backend->context();
+        build();
+    }
+
+    explicit impl(ggml_context * source, bool use_gpu) : loaded(source) {
+        if (!loaded) {
+            throw std::runtime_error("missing VAD weights");
+        }
+        backend = std::make_unique<mtmd_backend>(loaded, use_gpu, "vad.");
+        loaded = backend->context();
+        build();
+    }
+
+    void build() {
+        work.reset(ggml_init({16 * 1024 * 1024, nullptr, true}));
         if (!work) {
             throw std::runtime_error("cannot allocate VAD graph");
         }
@@ -121,37 +138,36 @@ struct mtmd_vad::impl {
                 weight("final_conv.bias", 1)));
         graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, probability);
-        plan = ggml_graph_plan(graph, 1, nullptr);
-        scratch.resize(plan.work_size);
-        plan.work_data = scratch.data();
+        buffer = backend->allocate(ctx);
     }
 };
 
-mtmd_vad::mtmd_vad(const std::string & path) : data(std::make_unique<impl>(path)) { reset(); }
+mtmd_vad::mtmd_vad(const std::string & path, bool use_gpu) : data(std::make_unique<impl>(path, use_gpu)) { reset(); }
+mtmd_vad::mtmd_vad(ggml_context * weights, bool use_gpu) : data(std::make_unique<impl>(weights, use_gpu)) { reset(); }
 mtmd_vad::~mtmd_vad() = default;
 
 void mtmd_vad::reset() {
     data->context.fill(0);
-    ggml_set_zero(data->h_in);
-    ggml_set_zero(data->c_in);
+    ggml_backend_tensor_memset(data->h_in, 0, 0, 128 * sizeof(float));
+    ggml_backend_tensor_memset(data->c_in, 0, 0, 128 * sizeof(float));
 }
 
 float mtmd_vad::process(const std::array<float, 512> & samples) {
     if (!std::all_of(samples.begin(), samples.end(), [](float x) { return std::isfinite(x); })) {
         throw std::runtime_error("VAD input contains non-finite samples");
     }
-    auto * input = static_cast<float *>(data->input->data);
-    std::copy(data->context.begin(), data->context.end(), input);
-    std::copy(samples.begin(), samples.end(), input + 64);
-    if (ggml_graph_compute(data->graph, &data->plan) != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("VAD graph execution failed");
-    }
-    const float p = ggml_get_f32_1d(data->probability, 0);
+    std::array<float, 576> input;
+    std::copy(data->context.begin(), data->context.end(), input.begin());
+    std::copy(samples.begin(), samples.end(), input.begin() + 64);
+    ggml_backend_tensor_set(data->input, input.data(), 0, sizeof(input));
+    data->backend->compute(data->graph);
+    float p;
+    ggml_backend_tensor_get(data->probability, &p, 0, sizeof(p));
     if (!std::isfinite(p)) {
         throw std::runtime_error("VAD produced a non-finite probability");
     }
     std::copy(samples.end() - 64, samples.end(), data->context.begin());
-    std::memcpy(data->h_in->data, data->h_out->data, 128 * sizeof(float));
-    std::memcpy(data->c_in->data, data->c_out->data, 128 * sizeof(float));
+    ggml_backend_tensor_copy(data->h_out, data->h_in);
+    ggml_backend_tensor_copy(data->c_out, data->c_in);
     return p;
 }

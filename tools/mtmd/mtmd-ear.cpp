@@ -1,6 +1,6 @@
 #include "mtmd-ear.h"
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "mtmd-backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,6 +8,7 @@
 #include <string>
 
 struct mtmd_ear::impl {
+    mtmd_backend backend;
     ggml_context * weights;
 
     ggml_tensor * weight(const std::string & name, int64_t a, int64_t b = 1) {
@@ -18,7 +19,7 @@ struct mtmd_ear::impl {
         return t;
     }
 
-    explicit impl(ggml_context * ctx) : weights(ctx) {
+    explicit impl(ggml_context * ctx, bool use_gpu) : backend(ctx, use_gpu, "ear"), weights(backend.context()) {
         if (!ctx) { throw std::runtime_error("missing ear weights"); }
         weight("ear.ctc.weight", 512, 1025); weight("ear.ctc.bias", 1025);
         weight("ear.proj.weight", 1025, 5120);
@@ -44,21 +45,21 @@ struct mtmd_ear::impl {
     }
 };
 
-mtmd_ear::mtmd_ear(ggml_context * weights) : data(std::make_unique<impl>(weights)) {}
+mtmd_ear::mtmd_ear(ggml_context * weights, bool use_gpu) : data(std::make_unique<impl>(weights, use_gpu)) {}
 mtmd_ear::~mtmd_ear() = default;
 
-std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames) {
+std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames, std::vector<int32_t> * ctc_ids) {
     if (!frames || n_frames == 0 || n_frames > 1024) { throw std::runtime_error("ear requires 1..1024 frames"); }
     if (!std::all_of(frames, frames + n_frames * 512, [](float x) { return std::isfinite(x); })) {
         throw std::runtime_error("non-finite ear input");
     }
     const size_t mem_size = 2 * 1024 * 1024 + n_frames * 256 * 1024;
-    const auto work = std::unique_ptr<ggml_context, decltype(&ggml_free)>(ggml_init({mem_size, nullptr, false}), ggml_free);
+    const auto work = std::unique_ptr<ggml_context, decltype(&ggml_free)>(ggml_init({mem_size, nullptr, true}), ggml_free);
     if (!work) { throw std::runtime_error("cannot allocate ear graph"); }
     auto * ctx = work.get();
     auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n_frames);
-    std::copy_n(frames, n_frames * 512, static_cast<float *>(input->data));
     auto * probs = ggml_soft_max(ctx, data->linear(ctx, "ear.ctc", input, 1025));
+    auto * ids = ctc_ids ? ggml_argmax(ctx, probs) : nullptr;
     auto * rows = ggml_add(ctx, ggml_mul_mat(ctx, data->weight("ear.proj.weight", 1025, 5120), probs), data->residual(ctx, "ear", input));
 
     // Pool over time, not over feature channels. Variance uses population normalization.
@@ -74,12 +75,13 @@ std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames) {
     auto * output = ggml_concat(ctx, rows, ggml_reshape_2d(ctx, tone, 5120, 1), 1);
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
-    auto plan = ggml_graph_plan(graph, 2, nullptr);
-    std::vector<uint8_t> scratch(plan.work_size);
-    plan.work_data = scratch.data();
-    if (ggml_graph_compute(graph, &plan) != GGML_STATUS_SUCCESS) { throw std::runtime_error("ear graph execution failed"); }
-    const auto * begin = static_cast<const float *>(output->data);
-    std::vector<float> result(begin, begin + (n_frames + 1) * 5120);
+    if (ids) { ggml_build_forward_expand(graph, ids); }
+    auto buffer = data->backend.allocate(ctx);
+    ggml_backend_tensor_set(input, frames, 0, n_frames * 512 * sizeof(float));
+    data->backend.compute(graph);
+    if (ids) { ctc_ids->resize(n_frames); ggml_backend_tensor_get(ids, ctc_ids->data(), 0, n_frames * sizeof(int32_t)); }
+    std::vector<float> result((n_frames + 1) * 5120);
+    ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
     if (!std::all_of(result.begin(), result.end(), [](float x) { return std::isfinite(x); })) {
         throw std::runtime_error("non-finite ear output");
     }
