@@ -3,30 +3,19 @@
 #include "ggml.h"
 #include "mtmd-backend.h"
 #include "mtmd-graph.h"
-#include "gguf.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <stdexcept>
 #include <vector>
 
-namespace {
-struct context_deleter {
-    void operator()(ggml_context * ctx) const { ggml_free(ctx); }
-};
-using context_ptr = std::unique_ptr<ggml_context, context_deleter>;
-}
-
 struct mtmd_vad::impl {
-    context_ptr weights;
     ggml_context * loaded = nullptr;
-    std::vector<float> weight_data;
-    context_ptr work;
+    ggml_context_ptr work;
     ggml_cgraph * graph = nullptr;
     std::unique_ptr<mtmd_backend> backend;
-    mtmd_buffer_ptr buffer{nullptr, ggml_backend_buffer_free};
+    ggml_backend_buffer_ptr buffer;
     ggml_tensor * input = nullptr;
     ggml_tensor * h_in = nullptr;
     ggml_tensor * c_in = nullptr;
@@ -45,51 +34,6 @@ struct mtmd_vad::impl {
 
     ggml_tensor * conv(ggml_tensor * x, ggml_tensor * w, int stride, int padding) {
         return mtmd_conv_1d_f32(work.get(), x, w, stride, padding);
-    }
-
-    explicit impl(const std::string & path, bool use_gpu) {
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file || file.tellg() <= 0 || file.tellg() > 2 * 1024 * 1024) {
-            throw std::runtime_error("VAD fixture must be at most 2 MiB");
-        }
-        ggml_context * raw = nullptr;
-        auto * meta = gguf_init_from_file(path.c_str(), {true, &raw});
-        weights.reset(raw);
-        if (!meta) {
-            throw std::runtime_error("cannot load VAD GGUF");
-        }
-        const auto metadata = std::unique_ptr<gguf_context, decltype(&gguf_free)>(meta, gguf_free);
-        const auto file_size = static_cast<size_t>(file.tellg());
-        const size_t data_offset = gguf_get_data_offset(meta);
-        if (gguf_get_n_tensors(meta) != 14 || data_offset > file_size) {
-            throw std::runtime_error("invalid VAD tensor inventory");
-        }
-        size_t total = 0;
-        for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) {
-            auto * t = ggml_get_tensor(weights.get(), gguf_get_tensor_name(meta, i));
-            const size_t bytes = ggml_nbytes(t);
-            const size_t offset = gguf_get_tensor_offset(meta, i);
-            if (t->type != GGML_TYPE_F32 || bytes > 2 * 1024 * 1024 - total ||
-                    offset > file_size - data_offset || bytes > file_size - data_offset - offset) {
-                throw std::runtime_error("invalid VAD tensor extent");
-            }
-            total += bytes;
-        }
-        weight_data.resize(total / sizeof(float));
-        size_t cursor = 0;
-        for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) {
-            auto * t = ggml_get_tensor(weights.get(), gguf_get_tensor_name(meta, i));
-            t->data = weight_data.data() + cursor;
-            file.seekg(data_offset + gguf_get_tensor_offset(meta, i));
-            if (!file.read(static_cast<char *>(t->data), ggml_nbytes(t))) {
-                throw std::runtime_error("cannot read VAD tensor");
-            }
-            cursor += ggml_nelements(t);
-        }
-        loaded = weights.get();
-        backend = std::make_unique<mtmd_backend>(loaded, use_gpu, "vad.");
-        loaded = backend->context();
-        build();
     }
 
     explicit impl(ggml_context * source, bool use_gpu) : loaded(source) {
@@ -132,11 +76,10 @@ struct mtmd_vad::impl {
                 weight("final_conv.bias", 1)));
         graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, probability);
-        buffer = backend->allocate(ctx);
+        buffer = backend->allocate(ctx, graph);
     }
 };
 
-mtmd_vad::mtmd_vad(const std::string & path, bool use_gpu) : data(std::make_unique<impl>(path, use_gpu)) { reset(); }
 mtmd_vad::mtmd_vad(ggml_context * weights, bool use_gpu) : data(std::make_unique<impl>(weights, use_gpu)) { reset(); }
 mtmd_vad::~mtmd_vad() = default;
 

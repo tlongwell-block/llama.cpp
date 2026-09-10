@@ -209,9 +209,9 @@ struct mtmd_helper_gen_audio_inp {
 
     enum mtmd_helper_gen_audio_outtype out_type;
 
-    // Qwen3-TTS only. Projected target rows replace the tokenized target body, not control or reference rows.
-    const float * target_embd;
-    size_t        n_target_embd; // rows, each llama_model_n_embd() floats; must match the target token count
+    // Qwen3-TTS only. Add these offsets to target token embeddings, leaving control and reference rows unchanged.
+    const float * target_offset;
+    size_t        n_target_offset; // rows, each llama_model_n_embd_inp() floats; must match the target token count
 
     // Optional ICL context. Codec rows are sums of all talker codebook embeddings, without codec BOS.
     const char * ref_text;

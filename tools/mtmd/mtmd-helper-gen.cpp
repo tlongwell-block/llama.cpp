@@ -166,7 +166,7 @@ public:
         reset();
         seq_id = inp->seq_id;
         if (!inp->prompt || inp->prompt_len > 131072 || inp->ref_text_len > 131072 ||
-            (inp->target_embd == nullptr) != (inp->n_target_embd == 0) ||
+            (inp->target_offset == nullptr) != (inp->n_target_offset == 0) ||
             (inp->ref_codec_embd == nullptr) != (inp->n_ref_codec_embd == 0) ||
             (inp->ref_text == nullptr) != (inp->ref_text_len == 0) ||
             (inp->ref_codes == nullptr) != (inp->n_ref_frames == 0) ||
@@ -175,7 +175,7 @@ public:
             (inp->n_ref_frames && inp->n_ref_codec_embd) ||
             (inp->ref_text_len > 0) != (inp->n_ref_codec_embd > 0 || inp->n_ref_frames > 0) ||
             inp->prime_frames > inp->n_ref_frames ||
-            inp->n_target_embd > 32768 || inp->n_ref_codec_embd > 32768 || inp->n_ref_frames > 32768) {
+            inp->n_target_offset > 32768 || inp->n_ref_codec_embd > 32768 || inp->n_ref_frames > 32768) {
             LOG_ERR("mtmd_helper_gen_audio: invalid Qwen conditioning input\n");
             return 1;
         }
@@ -256,17 +256,16 @@ public:
                 reference_rows.insert(reference_rows.end(), value.begin(), value.end());
             }
         }
-        if (inp->target_embd) {
-            if (inp->n_target_embd != (size_t) (n_ids - 8)) {
-                LOG_ERR("mtmd_helper_gen_audio: target conditioning token count mismatch\n");
-                return 1;
+        if (inp->target_offset && inp->n_target_offset != (size_t) (n_ids - 8)) {
+            LOG_ERR("mtmd_helper_gen_audio: target conditioning token count mismatch\n");
+            return 1;
+        }
+        for (int i = 3; i < n_ids - 5; ++i) {
+            auto value = row(ids[i]);
+            if (inp->target_offset) {
+                for (int j = 0; j < n_e; ++j) { value[j] += inp->target_offset[(size_t) (i - 3) * n_e + j]; }
             }
-            target_rows.assign(inp->target_embd, inp->target_embd + inp->n_target_embd * n_e);
-        } else {
-            for (int i = 3; i < n_ids - 5; ++i) {
-                const auto value = row(ids[i]);
-                target_rows.insert(target_rows.end(), value.begin(), value.end());
-            }
+            target_rows.insert(target_rows.end(), value.begin(), value.end());
         }
         std::vector<float> reference_codec_rows;
         const bool cacheable_reference = inp->ref_codes && inp->n_ref_frames <= 2048;
@@ -703,7 +702,7 @@ public:
 
         pack = pockettts_pack(info.model_variant);
 
-        if (inp->target_embd || inp->n_target_embd || inp->ref_text || inp->ref_text_len ||
+        if (inp->target_offset || inp->n_target_offset || inp->ref_text || inp->ref_text_len ||
             inp->ref_codec_embd || inp->n_ref_codec_embd || inp->ref_codes || inp->n_ref_frames || inp->prime_frames ||
             inp->speaker_offset || inp->n_speaker_offset) {
             LOG_ERR("mtmd_helper_gen_audio: conditioning rows require Qwen3-TTS\n");

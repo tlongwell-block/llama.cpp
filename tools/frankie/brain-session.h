@@ -23,7 +23,6 @@ class brain_session {
   private:
     component                                           encoder_source, bridge_source, brain_source, vision_source;
     std::unique_ptr<clip_ctx, decltype(&clip_free)>     encoder{ nullptr, clip_free };
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights{ nullptr, ggml_free };
     std::unique_ptr<mtmd_ear>                           ear;
     llama_model_ptr                                     model;
     mtmd::context_ptr                                   vision;

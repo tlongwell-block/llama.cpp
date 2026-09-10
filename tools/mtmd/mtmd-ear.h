@@ -8,7 +8,7 @@
 
 struct ggml_context;
 
-// The tensor context and its loaded data must outlive this processor.
+// Copies the loaded F32 weights to the selected backend.
 class MTMD_API mtmd_ear {
 public:
     explicit mtmd_ear(ggml_context * weights, bool use_gpu = false);

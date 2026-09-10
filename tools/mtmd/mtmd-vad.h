@@ -2,15 +2,13 @@
 
 #include <array>
 #include <memory>
-#include <string>
 
 struct ggml_context;
 
 // Fixed Silero v5 16 kHz stream. Weights are immutable; state belongs to one stream.
 class mtmd_vad {
 public:
-    explicit mtmd_vad(const std::string & path, bool use_gpu = false);
-    // Caller keeps the loaded F32 weights alive for this stream.
+    // Copies the loaded F32 weights to the selected backend.
     explicit mtmd_vad(ggml_context * weights, bool use_gpu = false);
     ~mtmd_vad();
     mtmd_vad(const mtmd_vad &) = delete;

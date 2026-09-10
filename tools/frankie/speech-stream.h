@@ -103,14 +103,14 @@ class speech_stream {
         if (end <= committed.size()) {
             return;
         }
-        auto phrase = response;
+        brain_session::response phrase;
         const size_t lead = response.content_offset == std::string::npos ? response.raw.text.rfind(text) : response.content_offset;
         if (lead == std::string::npos || response.raw.text.compare(lead, text.size(), text) != 0) {
             throw std::runtime_error("parsed speech is not a contiguous generated span");
         }
-        phrase.content_offset = lead + committed.size();
+        phrase.content_offset = 0;
+        phrase.raw = response.raw.slice(lead + committed.size(), lead + end);
         phrase.message.content = text.substr(committed.size(), end - committed.size());
-        phrase.message.tool_calls.clear();
         committed = text.substr(0, end);
         if (phrase.message.content.find_first_not_of(" \t\r\n") == std::string::npos) {
             return;

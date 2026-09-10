@@ -25,7 +25,7 @@
 #include <thread>
 using json = nlohmann::ordered_json;
 
-// Local manual-turn prototype. Realtime owns items; model objects only execute requests.
+// Realtime owns items; model objects only execute requests.
 struct realtime_session {
     brain_session &             brain;
     mouth_session &             mouth;
@@ -49,7 +49,6 @@ struct realtime_session {
     size_t                      serial = 0;
     std::string                 response_id;
     component vad_source;
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> vad_weights{ nullptr, ggml_free };
     std::unique_ptr<mtmd_vad> vad;
     std::vector<char> vad_frame, playback_frame;
     std::unique_ptr<frankie_turn_session> turns;
@@ -205,7 +204,7 @@ struct realtime_session {
         ggml_context * raw = nullptr;
         std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
             gguf_init_from_callback(component::callback, &vad_source, 1024 * 1024, vad_source.size(), { false, &raw }), gguf_free);
-        vad_weights.reset(raw);
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> vad_weights(raw, ggml_free);
         if (!metadata || !vad_weights) {
             throw std::runtime_error("VAD component load failed");
         }

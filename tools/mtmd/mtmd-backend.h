@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ggml-alloc.h"
+#include "ggml-cpp.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
@@ -10,13 +10,11 @@
 #include <cmath>
 #include <cstdio>
 
-using mtmd_buffer_ptr = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>;
-
 // Own a device copy of immutable component weights. No CPU fallback for GPU requests.
 class mtmd_backend {
-    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend{nullptr, ggml_backend_free};
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights{nullptr, ggml_free};
-    mtmd_buffer_ptr buffer{nullptr, ggml_backend_buffer_free};
+    ggml_backend_ptr backend;
+    ggml_context_ptr weights;
+    ggml_backend_buffer_ptr buffer;
     std::string name;
     size_t peak_graph_bytes = 0;
 
@@ -56,8 +54,8 @@ public:
 
     ggml_context * context() const { return weights.get(); }
 
-    mtmd_buffer_ptr allocate(ggml_context * ctx) {
-        mtmd_buffer_ptr result(ggml_backend_alloc_ctx_tensors(ctx, backend.get()), ggml_backend_buffer_free);
+    ggml_backend_buffer_ptr allocate(ggml_context * ctx, ggml_cgraph * graph = nullptr) {
+        ggml_backend_buffer_ptr result(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
         if (!result) { throw std::runtime_error("cannot allocate component tensors"); }
         if (ctx != weights.get()) {
             const auto bytes = ggml_backend_buffer_get_size(result.get());
@@ -66,17 +64,17 @@ public:
                 std::fprintf(stderr, "memory component=%s backend=%s peak_graph_buffer=%zu\n", name.c_str(), ggml_backend_name(backend.get()), bytes);
             }
         }
-        return result;
-    }
-
-    void compute(ggml_cgraph * graph) {
-        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        for (int i = 0; graph && i < ggml_graph_n_nodes(graph); ++i) {
             auto * node = ggml_graph_node(graph, i);
             if (node->op == GGML_OP_MUL_MAT) { ggml_prec_set_src(node, GGML_PREC_F32, 1); }
             if (!ggml_backend_supports_op(backend.get(), node)) {
                 throw std::runtime_error(std::string("component backend does not support ") + ggml_op_name(node->op));
             }
         }
+        return result;
+    }
+
+    void compute(ggml_cgraph * graph) {
         if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("component graph execution failed");
         }

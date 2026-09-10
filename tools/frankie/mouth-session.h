@@ -14,10 +14,8 @@ class mouth_session {
     llama_context_ptr                                   ctx;
     mtmd::context_ptr                                   mctx;
     std::unique_ptr<mtmd_helper::gen_audio>               generator;
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> side_weights{ nullptr, ggml_free };
     std::unique_ptr<mtmd_side>                          side;
     std::unique_ptr<mtmd_expression>                    expression;
-    std::vector<float>                                  embeddings;
     mtmd::bitmap_ptr                                    speaker;
     std::vector<int32_t>                                codes;
     std::string                                         reference;

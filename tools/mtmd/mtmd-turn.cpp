@@ -10,7 +10,6 @@
 #include <string>
 
 namespace {
-using context_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 constexpr int dim = 256, heads = 4, retained = 199;
 }
 
@@ -19,8 +18,8 @@ struct mtmd_turn::impl {
     int frames;
     int valid = 0;
     mtmd_backend backend;
-    context_ptr work{nullptr, ggml_free};
-    mtmd_buffer_ptr buffer{nullptr, ggml_backend_buffer_free};
+    ggml_context_ptr work;
+    ggml_backend_buffer_ptr buffer;
     ggml_cgraph * graph = nullptr;
     std::array<ggml_tensor *, 2> input{}, features{};
     std::array<mtmd_lstm_state, 2> initial{}, final{};
@@ -74,7 +73,7 @@ struct mtmd_turn::impl {
         }
         graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_build_forward_expand(graph, probabilities);
-        buffer = backend.allocate(ctx);
+        buffer = backend.allocate(ctx, graph);
     }
 
     ggml_tensor * linear(ggml_tensor * x, const std::string & prefix, int in, int out) {

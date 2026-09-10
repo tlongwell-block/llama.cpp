@@ -34,11 +34,12 @@ brain_session::brain_session(const std::string & package, const frankie_options 
         gguf_init_from_callback(component::callback, &bridge_source, 1024 * 1024, bridge_source.size(),
                                 { false, &raw }),
         gguf_free);
-    weights.reset(raw);
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(raw, ggml_free);
     if (!metadata || !weights) {
         throw std::runtime_error("bridge load failed");
     }
     ear             = std::make_unique<mtmd_ear>(raw, options.use_gpu);
+    weights.reset();
     auto mp         = llama_model_default_params();
     mp.n_gpu_layers = options.use_gpu ? 99 : 0;
     model.reset(llama_model_init_from_user(brain_source.metadata(), component::set_tensor, &brain_source, mp));

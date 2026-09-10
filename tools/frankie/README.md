@@ -84,6 +84,8 @@ The small VAD graph runs on CPU so GPU work cannot block microphone transport. B
 
 During speech, the existing phrase worker gives the mouth priority when emitted audio has less than 160 ms of lead. Brain decoding resumes once that lead is restored or the phrase finishes. This avoids audio starvation from competing decode graphs without delaying the first PCM chunk or adding a separate inference implementation.
 
+The phrase queue copies only the token states for each spoken span. Side conditioning adds offsets through the existing Qwen TTS embedding cache, without a second vocabulary matrix. Small component graphs validate backend support once when allocated, and release their host weight copies after loading.
+
 Input uses VAD, in-speech ear prefill with a 20-frame lag, and speculative generation after short silence. VAP gates publication, with a 1500 ms silence ceiling and stale-prediction fallback. Resumed speech restores recurrent state. Short heard false starts can merge within 700 ms, without crossing published tool calls. Interruption history retains completed heard phrases rather than claiming exact word alignment.
 
 Backchannels use the shared MaAI graph at 10 Hz, the actual rendered speaker PCM, and a temporary brain probe restricted to listener reactions. They have separate bounded audio events and never create an assistant turn or execute a tool. The probe shares prefix state through llama.cpp sequence operations and restores it after selection. Normal speech supersedes listener audio.

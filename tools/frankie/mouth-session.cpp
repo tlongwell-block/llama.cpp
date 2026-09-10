@@ -51,15 +51,11 @@ mouth_session::mouth_session(const std::string & package, const frankie_options 
         std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
             gguf_init_from_callback(component::callback, &side_source, 1024 * 1024, side_source.size(), { false, &raw }),
             gguf_free);
-        side_weights.reset(raw);
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> side_weights(raw, ggml_free);
         if (!metadata || !side_weights) {
             throw std::runtime_error("Side load failed");
         }
         side = std::make_unique<mtmd_side>(raw, options.use_gpu);
-        embeddings.resize(llama_model_get_tok_embd(model.get(), nullptr));
-        if (embeddings.empty() || llama_model_get_tok_embd(model.get(), embeddings.data()) != embeddings.size()) {
-            throw std::runtime_error("talker embeddings failed");
-        }
     }
     std::vector<char> bytes, wav;
     if (options.voice.empty()) {
@@ -212,14 +208,13 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
     const auto aligned = frankie_align_text(brain.text, brain.ends, lead, spoken, talker_ends, normalized.spans(talker_ends));
     target.reserve(ids.size() * 2048);
     for (size_t i = 0; i < ids.size(); ++i) {
-        const auto id = ids[i];
         const size_t chosen = aligned[i];
-        if (chosen >= brain.hidden.size() || id < 0 || size_t(id + 1) * 2048 > embeddings.size()) {
+        if (chosen >= brain.hidden.size()) {
             throw std::runtime_error("alignment bounds");
         }
         auto residual = side->process(brain.hidden[chosen]);
         for (size_t j = 0; j < 2048; ++j) {
-            target.push_back(embeddings[size_t(id) * 2048 + j] + options.side_scale * residual[j]);
+            target.push_back(options.side_scale * residual[j]);
         }
     }
     }
@@ -241,8 +236,8 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
     input.ref_codes     = codes.empty() ? nullptr : codes.data();
     input.n_ref_frames  = codes.size() / 16;
     input.prime_frames  = input.n_ref_frames;
-    input.target_embd   = target.empty() ? nullptr : target.data();
-    input.n_target_embd = target.size() / 2048;
+    input.target_offset   = target.empty() ? nullptr : target.data();
+    input.n_target_offset = target.size() / 2048;
     input.speaker_offset = expression ? speaker_offset.data() : nullptr;
     input.n_speaker_offset = expression ? speaker_offset.size() : 0;
     if (is_cancelled()) {
@@ -310,7 +305,6 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
                 const float rms = std::sqrt(energy / samples);
                 if (rms > 0) { gain = std::min(gain, reference_rms * std::pow(10.0f, (style ? style->rms_db : 3.0f) / 20.0f) / rms); }
             }
-            rendered.reserve(samples);
             for (size_t i = emitted; i < size_t(samples); ++i) { rendered.push_back(pcm[i] * gain); }
             if (on_audio) { on_audio(rendered.data() + emitted, size_t(samples) - emitted); }
             emitted = samples;

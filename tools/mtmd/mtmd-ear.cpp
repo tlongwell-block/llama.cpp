@@ -55,7 +55,7 @@ std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames, std:
     }
     // Tensor data lives in the backend buffer; metadata does not grow with frame count.
     const size_t mem_size = 2 * 1024 * 1024;
-    const auto work = std::unique_ptr<ggml_context, decltype(&ggml_free)>(ggml_init({mem_size, nullptr, true}), ggml_free);
+    const auto work = ggml_context_ptr(ggml_init({mem_size, nullptr, true}));
     if (!work) { throw std::runtime_error("cannot allocate ear graph"); }
     auto * ctx = work.get();
     auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n_frames);
@@ -77,7 +77,7 @@ std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames, std:
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
     if (ids) { ggml_build_forward_expand(graph, ids); }
-    auto buffer = data->backend.allocate(ctx);
+    auto buffer = data->backend.allocate(ctx, graph);
     ggml_backend_tensor_set(input, frames, 0, n_frames * 512 * sizeof(float));
     data->backend.compute(graph);
     if (ids) { ctc_ids->resize(n_frames); ggml_backend_tensor_get(ids, ctc_ids->data(), 0, n_frames * sizeof(int32_t)); }

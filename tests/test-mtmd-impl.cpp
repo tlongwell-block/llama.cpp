@@ -9,6 +9,7 @@ namespace httplib::detail {
     bool write_websocket_frame(Stream &, ws::Opcode, const char *, size_t, bool, bool);
 }
 #include "../tools/frankie/speech-boundary.h"
+#include "../tools/frankie/brain-output.h"
 #include "../tools/frankie/turn-session.h"
 #include "../tools/frankie/token-boundary.h"
 #include "llama-cpp.h"
@@ -161,6 +162,20 @@ MAKE_TEST(test_frankie_speech_boundary) {
     t.assert_equal("fifty word bound", long_sentence.size() - 1, frankie_speech_boundary(long_sentence, 0, false));
     const std::string prefix = "This is done.";
     t.assert_equal("next fragment has own count", prefix.size(), frankie_speech_boundary(prefix + " And three words ", prefix.size(), false));
+
+    brain_output raw;
+    raw.text = "<think>private</think>Hello. Next phrase.";
+    raw.ends = {27, 28, 33, 41};
+    raw.hidden.resize(raw.ends.size());
+    for (size_t i = 0; i < raw.hidden.size(); ++i) { raw.hidden[i].fill(float(i)); }
+    const auto phrase = raw.slice(28, 41);
+    t.assert_equal("only phrase text is queued", std::string(" Next phrase."), phrase.text);
+    t.assert_equal("prior phrases and reasoning are not copied", size_t(2), phrase.hidden.size());
+    t.assert_equal("phrase rows retain their states", 2.0f, phrase.hidden.front()[0]);
+    t.assert_true("phrase offsets are rebased", phrase.ends == std::vector<size_t>({5, 13}));
+    const auto partial = raw.slice(30, 37);
+    t.assert_equal("phrase may clip a token", std::string("ext phr"), partial.text);
+    t.assert_true("clipped token offsets", partial.ends == std::vector<size_t>({3, 7}));
 }
 
 MAKE_TEST(test_frankie_unicode_alignment) {
@@ -202,8 +217,16 @@ MAKE_TEST(test_frankie_unicode_alignment) {
         const auto spans = normalized.spans(c.talker_ends);
         t.assert_true("original character offsets", spans == c.offsets);
         t.assert_true("hidden row alignment", frankie_align_text(c.text, c.brain_ends, lead, spoken, c.talker_ends, spans) == c.indices);
+        brain_output raw;
+        raw.text = c.text; raw.ends = c.brain_ends; raw.hidden.resize(c.brain_ends.size());
+        for (size_t i = 0; i < raw.hidden.size(); ++i) { raw.hidden[i].fill(float(i)); }
+        const auto phrase = raw.slice(lead, tail);
+        const auto aligned = frankie_align_text(phrase.text, phrase.ends, 0, spoken, c.talker_ends, spans);
+        for (size_t i = 0; i < aligned.size(); ++i) {
+            t.assert_equal("sliced Unicode preserves hidden row", float(c.indices[i]), phrase.hidden[aligned[i]][0]);
+        }
     }
-    for (const std::string invalid : {std::string("\300\200"), std::string("\355\240\200"), std::string("\360\237"), std::string("\364\220\200\200")}) {
+    for (const std::string & invalid : {std::string("\300\200"), std::string("\355\240\200"), std::string("\360\237"), std::string("\364\220\200\200")}) {
         bool rejected = false;
         try { const frankie_normalized_text normalized(invalid); } catch (const std::runtime_error &) { rejected = true; }
         t.assert_true("invalid UTF-8 rejected", rejected);
@@ -309,6 +332,15 @@ MAKE_TEST(test_temporal_merge_grouping) {
     }
 }
 
+static std::unique_ptr<ggml_context, decltype(&ggml_free)> load_component_fixture(const std::string & path) {
+    ggml_context * raw = nullptr;
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
+        gguf_init_from_file(path.c_str(), {false, &raw}), gguf_free);
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(raw, ggml_free);
+    if (!metadata || !weights) { throw std::runtime_error("missing component fixture: " + path); }
+    return weights;
+}
+
 MAKE_TEST(test_vad_reference) {
     const char * root = std::getenv("MTMD_VAD_FIXTURE");
     if (!root) {
@@ -316,8 +348,10 @@ MAKE_TEST(test_vad_reference) {
         return;
     }
     const std::string dir(root);
-    mtmd_vad vad(dir + "/vad-f32.gguf", std::getenv("MTMD_COMPONENT_GPU"));
-    mtmd_vad other(dir + "/vad-f32.gguf", std::getenv("MTMD_COMPONENT_GPU"));
+    auto weights = load_component_fixture(dir + "/vad-f32.gguf");
+    mtmd_vad vad(weights.get(), std::getenv("MTMD_COMPONENT_GPU"));
+    mtmd_vad other(weights.get(), std::getenv("MTMD_COMPONENT_GPU"));
+    weights.reset();
     std::ifstream audio(dir + "/chunks.f32", std::ios::binary);
     std::ifstream expected(dir + "/probabilities.f32", std::ios::binary);
     if (!audio || !expected) {
@@ -366,12 +400,8 @@ MAKE_TEST(test_ear_reference) {
         return;
     }
     const std::string dir(root);
-    ggml_context * raw = nullptr;
-    auto * meta = gguf_init_from_file((dir + "/bridge-f32.gguf").c_str(), {false, &raw});
-    const auto weights = std::unique_ptr<ggml_context, decltype(&ggml_free)>(raw, ggml_free);
-    const auto metadata = std::unique_ptr<gguf_context, decltype(&gguf_free)>(meta, gguf_free);
-    if (!meta || !raw) { throw std::runtime_error("missing ear weights fixture"); }
-    mtmd_ear ear(raw, std::getenv("MTMD_COMPONENT_GPU"));
+    const auto weights = load_component_fixture(dir + "/bridge-f32.gguf");
+    mtmd_ear ear(weights.get(), std::getenv("MTMD_COMPONENT_GPU"));
     auto read = [&](const char * name, size_t count) {
         std::ifstream file(dir + "/" + name + ".f32", std::ios::binary);
         std::vector<float> out(count);
@@ -534,7 +564,9 @@ MAKE_TEST(test_side_reference) {
         return;
     }
     const std::string dir(root);
-    mtmd_side side(dir + "/side-f32.gguf", std::getenv("MTMD_COMPONENT_GPU"));
+    auto weights = load_component_fixture(dir + "/side-f32.gguf");
+    mtmd_side side(weights.get(), std::getenv("MTMD_COMPONENT_GPU"));
+    weights.reset();
     std::ifstream input(dir + "/inputs.f32", std::ios::binary);
     std::ifstream expected(dir + "/outputs.f32", std::ios::binary);
     if (!input || !expected) { throw std::runtime_error("missing side fixture"); }
@@ -564,12 +596,8 @@ MAKE_TEST(test_turn_reference) {
     if (!root) { std::cout << "SKIP turn parity: set MTMD_TURN_FIXTURE\n"; return; }
     const std::string dir(root);
     for (const std::string mode : {"vap", "bc"}) {
-        ggml_context * raw = nullptr;
-        std::unique_ptr<gguf_context, decltype(&gguf_free)> meta(
-            gguf_init_from_file((dir + "/" + mode + ".gguf").c_str(), {false, &raw}), gguf_free);
-        std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(raw, ggml_free);
-        if (!meta || !weights) { throw std::runtime_error("missing turn fixture"); }
-        mtmd_turn model(raw, mode == "vap" ? mtmd_turn::mode::vap : mtmd_turn::mode::backchannel,
+        const auto weights = load_component_fixture(dir + "/" + mode + ".gguf");
+        mtmd_turn model(weights.get(), mode == "vap" ? mtmd_turn::mode::vap : mtmd_turn::mode::backchannel,
                         std::getenv("MTMD_COMPONENT_GPU"));
         std::ifstream input(dir + "/input.f32", std::ios::binary);
         std::ifstream output(dir + "/" + mode + "-output.f32", std::ios::binary);
@@ -618,12 +646,8 @@ MAKE_TEST(test_expression_reference) {
         return;
     }
     const std::string dir(root);
-    ggml_context * raw = nullptr;
-    std::unique_ptr<gguf_context, decltype(&gguf_free)> meta(
-        gguf_init_from_file((dir + "/expression.gguf").c_str(), {false, &raw}), gguf_free);
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(raw, ggml_free);
-    if (!meta || !weights) { throw std::runtime_error("missing expression fixture"); }
-    mtmd_expression head(raw, std::getenv("MTMD_COMPONENT_GPU"));
+    const auto weights = load_component_fixture(dir + "/expression.gguf");
+    mtmd_expression head(weights.get(), std::getenv("MTMD_COMPONENT_GPU"));
     std::ifstream input(dir + "/expression-inputs.f32", std::ios::binary);
     std::ifstream expected(dir + "/expression-outputs.f32", std::ios::binary);
     if (!input || !expected) { throw std::runtime_error("missing expression outputs"); }
