@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Repack Frankie components and voice assets without re-quantizing any tensors.
+"""Pack Frankie components and voice assets without re-quantizing any tensors.
 
-A base package supplies unchanged components. Each --component NAME=GGUF replaces
-one component; --voice plus matching transcript/codes replaces its default voice.
+An optional base package supplies unchanged components. Each --component NAME=GGUF
+supplies one component; --voice plus matching transcript/codes sets its default voice.
 The completed package is published only after every tensor is checked byte for byte.
 """
 import argparse
@@ -21,7 +21,7 @@ COMPONENTS = ('ear', 'bridge', 'side', 'vad', 'brain', 'talker', 'mouth', 'visio
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base', required=True, type=Path)
+    parser.add_argument('--base', type=Path, help='reuse components and assets from an existing package')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--component', action='append', default=[], metavar='NAME=GGUF')
     parser.add_argument('--voice', type=Path)
@@ -35,8 +35,8 @@ def main():
         raise ValueError('output or incomplete output already exists')
     if bool(args.voice_text_file) != bool(args.voice_codes) or ((args.voice_text_file or args.voice_codes) and not args.voice):
         raise ValueError('matching ICL text/codes require --voice and each other')
-    base = gguf.GGUFReader(args.base)
-    if base.get_field('general.architecture').contents() != 'frankie' or base.get_field('frankie.version').contents() != 1:
+    base = gguf.GGUFReader(args.base) if args.base else None
+    if base is not None and (base.get_field('general.architecture').contents() != 'frankie' or base.get_field('frankie.version').contents() != 1):
         raise ValueError('unsupported base package')
     replacements = {}
     for item in args.component:
@@ -44,6 +44,11 @@ def main():
         if name not in COMPONENTS or name in replacements:
             raise ValueError('unknown or duplicate component: ' + name)
         replacements[name] = Path(path)
+    if base is None:
+        missing = [name for name in COMPONENTS if name not in replacements]
+        if missing: raise ValueError('missing components: ' + ', '.join(missing))
+        if not all((args.voice, args.voice_text_file, args.voice_codes, args.expression, args.vap, args.bc)):
+            raise ValueError('a new package requires voice WAV/text/codes, expression, VAP and BC assets')
     source = {name: gguf.GGUFReader(path) for name, path in replacements.items()}
     tensor_map = {}
     source_shapes = {}
@@ -61,7 +66,7 @@ def main():
             field = base.get_field(f'frankie.{name}.size')
             if field is None: raise ValueError('base package is missing ' + name)
             sizes[name] = field.contents()
-    for tensor in base.tensors:
+    for tensor in base.tensors if base is not None else ():
         if any(tensor.name.startswith(f'frankie.{name}.') or tensor.name == f'assets.{name}.header' for name in replacements):
             continue
         tensor_map[tensor.name] = (tensor.data, tensor.tensor_type)
@@ -89,9 +94,12 @@ def main():
     changed = {f'frankie.{name}.size' for name in COMPONENTS}
     changed.update(('general.architecture', 'frankie.side_scale', 'frankie.components'))
     if args.voice: changed.update(('frankie.voice.ref_text', 'frankie.voice.sample_rate', 'frankie.voice.prime_frames'))
-    for field in base.fields.values():
+    for field in base.fields.values() if base is not None else ():
         if field.name.startswith('GGUF.') or field.name in changed: continue
         writer.add_key_value(field.name, field.contents(), field.types[0], field.types[-1] if len(field.types) > 1 else None)
+    if base is None:
+        writer.add_uint32('frankie.version', 1)
+        writer.add_uint32('frankie.bridge_layer', 16)
     writer.add_array('frankie.components', list(COMPONENTS))
     writer.add_float32('frankie.side_scale', 0)
     for name, size in sizes.items(): writer.add_uint64(f'frankie.{name}.size', size)
@@ -106,7 +114,7 @@ def main():
     writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_tensors_to_file(); writer.close()
     check = gguf.GGUFReader(temporary)
     if len(check.tensors) != len(tensor_map): raise ValueError('packaged tensor inventory differs')
-    manifest = {'base': args.base.name, 'replacements': {k:v.name for k,v in replacements.items()},
+    manifest = {'base': args.base.name if args.base else None, 'replacements': {k:v.name for k,v in replacements.items()},
                 'bytes': temporary.stat().st_size, 'tensors': {}}
     for tensor in check.tensors:
         expected, dtype = tensor_map[tensor.name]

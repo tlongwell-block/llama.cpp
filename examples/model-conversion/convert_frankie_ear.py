@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Export the pinned MLX Parakeet encoder, without its ASR decoder."""
 import argparse
+import json
 from pathlib import Path
 import sys
 import mlx.core as mx
@@ -11,7 +12,7 @@ import gguf
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('model', type=Path)
-parser.add_argument('fixture', type=Path)
+parser.add_argument('fixture', type=Path, nargs='?', help='optional frozen filters.f32/window.f32; otherwise use the installed Parakeet frontend')
 parser.add_argument('output', type=Path)
 a = parser.parse_args()
 if a.output.exists(): parser.error('output exists')
@@ -44,6 +45,17 @@ for name, value in mx.load(str(a.model / 'model.safetensors')).items():
     if mapped is None: raise ValueError('unmapped tensor: ' + name)
     w.add_tensor(mapped, np.ascontiguousarray(value))
     print(name, mapped, value.shape, flush=True)
-w.add_tensor('a.mel_filters', np.fromfile(a.fixture/'filters.f32', dtype=np.float32))
-w.add_tensor('a.window', np.fromfile(a.fixture/'window.f32', dtype=np.float32))
+if a.fixture:
+    filters = np.fromfile(a.fixture/'filters.f32', dtype=np.float32)
+    window = np.fromfile(a.fixture/'window.f32', dtype=np.float32)
+else:
+    from parakeet_mlx.audio import PreprocessArgs, hanning
+    config = json.loads((a.model / 'config.json').read_text())['preprocessor']
+    preprocessor = PreprocessArgs(**{key: value for key, value in config.items() if key in PreprocessArgs.__dataclass_fields__})
+    if (preprocessor.sample_rate, preprocessor.n_fft, preprocessor.features, preprocessor.win_length, preprocessor.hop_length, preprocessor.window) != (16000, 512, 80, 400, 160, 'hann'):
+        raise ValueError('unsupported Parakeet frontend')
+    filters = np.asarray(preprocessor._filterbanks, dtype=np.float32).reshape(-1)
+    window = np.asarray(hanning(400), dtype=np.float32)
+w.add_tensor('a.mel_filters', filters)
+w.add_tensor('a.window', window)
 w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()

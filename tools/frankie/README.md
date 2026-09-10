@@ -68,7 +68,23 @@ python tools/mtmd/quantize-audio.py encoder-f32.gguf encoder-q8.gguf --model par
 python tools/mtmd/quantize-audio.py mmproj-f16.gguf mmproj-q8.gguf --model qwen3tts
 ```
 
-`tools/frankie/pack.py --help` describes replacing components and embedding the voice, expression, VAP and backchannel assets in an existing package. It preserves unchanged tensors and metadata, verifies every written tensor against its input and writes a manifest. Failed assembly leaves an `.incomplete` file rather than a final GGUF.
+`tools/frankie/pack.py` can assemble the first package directly from components, without an existing Frankie GGUF:
+
+```sh
+python tools/frankie/pack.py --output frankie.gguf \
+  --component brain=brain-q4_1.gguf --component vision=vision-f16.gguf \
+  --component ear=ear-q8.gguf --component bridge=bridge-f32.gguf \
+  --component talker=talker-q8.gguf --component mouth=mouth-q8.gguf \
+  --component side=side-f32.gguf --component vad=vad-f32.gguf \
+  --voice voice.wav --voice-text-file voice.txt --voice-codes voice.i32 \
+  --expression expression.gguf --vap vap.gguf --bc bc.gguf
+```
+
+The custom MLX brain, vision and Parakeet exporters are in `examples/model-conversion/convert_frankie_{brain,vision,ear}.py`. The ear exporter accepts `MODEL OUTPUT` and uses the installed `parakeet_mlx` frontend; its optional middle `FIXTURE` argument preserves frozen filter/window exports. Use the existing `convert_hf_to_gguf.py` for Qwen3-TTS, once for the talker and once with `--mmproj` for the speaker/code/codec component. These source conversions need the Python dependencies of their reference models; native inference does not.
+
+Bridge, tone, optional Side, VAD, expression, turn checkpoints and matching reference codes must come from the same source configuration. In particular, tone's emotion rows come from the original brain embedding, and the Studio's default Side has zero output. Do not substitute unrelated adapters or reference codec IDs.
+
+To update an existing package, pass `--base existing.gguf` and only the replacement components/assets. The packer preserves unchanged tensors and metadata, verifies every written tensor against its input and writes a manifest. Failed assembly leaves an `.incomplete` file rather than a final GGUF.
 
 The September 10 package is 20,326,799,488 bytes (18.93 GiB). That is slightly above 20 decimal GB. File size alone cannot establish whether the complete system fits a 24 GiB GPU: KV/recurrent state, compute buffers, vision, audio and turn models must be counted together during execution.
 
