@@ -170,6 +170,8 @@ public:
             (inp->ref_codec_embd == nullptr) != (inp->n_ref_codec_embd == 0) ||
             (inp->ref_text == nullptr) != (inp->ref_text_len == 0) ||
             (inp->ref_codes == nullptr) != (inp->n_ref_frames == 0) ||
+            (inp->speaker_offset == nullptr) != (inp->n_speaker_offset == 0) ||
+            (inp->n_speaker_offset && (!inp->speaker_ref || inp->n_speaker_offset != (size_t) n_embd)) ||
             (inp->n_ref_frames && inp->n_ref_codec_embd) ||
             (inp->ref_text_len > 0) != (inp->n_ref_codec_embd > 0 || inp->n_ref_frames > 0) ||
             inp->prime_frames > inp->n_ref_frames ||
@@ -193,6 +195,15 @@ public:
         if (inp->speaker_ref) {
             if (!encode_speaker(inp->speaker_ref, speaker_embd)) {
                 return 1;
+            }
+        }
+
+        if (inp->speaker_offset) {
+            if (speaker_embd.size() != inp->n_speaker_offset) { return 1; }
+            for (size_t i = 0; i < speaker_embd.size(); ++i) {
+                if (!std::isfinite(inp->speaker_offset[i])) { return 1; }
+                speaker_embd[i] += inp->speaker_offset[i];
+                if (!std::isfinite(speaker_embd[i])) { return 1; }
             }
         }
 
@@ -312,6 +323,8 @@ public:
 
         pos = 0;
         const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
+        if (!std::isfinite(inp->code_temperature) || inp->code_temperature < 0) { return 1; }
+        code_temperature = inp->code_temperature > 0 ? inp->code_temperature : def.temp;
         top_k = inp->top_k > 0 ? inp->top_k : def.top_k;
         top_p = inp->top_p > 0 ? inp->top_p : def.top_p;
         seed  = inp->seed;
@@ -400,6 +413,7 @@ public:
         inp.type  = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
         inp.code0 = sampled - codec_0;
         inp.embd  = const_cast<float *>(h_state_in);
+        inp.temp = code_temperature;
         inp.top_k = top_k;
         inp.top_p = top_p;
         inp.seed  = seed;
@@ -503,6 +517,17 @@ private:
 
     // runs the reference wav through the speaker encoder, returns one x-vector embedding row
     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
+        // Compare samples, not bitmap addresses: callers may replace or mutate a reference.
+        const size_t bytes = mtmd_bitmap_get_n_bytes(bitmap);
+        const auto * samples = mtmd_bitmap_get_data(bitmap);
+        if (!mtmd_bitmap_is_audio(bitmap) || !samples || !bytes || bytes > 16 * 1024 * 1024) {
+            return false;
+        }
+        if (cached_speaker_pcm.size() == bytes &&
+            std::memcmp(cached_speaker_pcm.data(), samples, bytes) == 0) {
+            out = cached_speaker_embd;
+            return true;
+        }
         if (!mtmd_support_audio(mctx)) {
             LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
             return false;
@@ -531,6 +556,13 @@ private:
             }
         }
         mtmd_input_chunks_free(chunks);
+        if (ok && out.size() == (size_t) n_embd &&
+            std::all_of(out.begin(), out.end(), [](float x) { return std::isfinite(x); })) {
+            cached_speaker_pcm.assign(samples, samples + bytes);
+            cached_speaker_embd = out;
+        } else {
+            ok = false;
+        }
         return ok;
     }
 
@@ -575,6 +607,8 @@ private:
     size_t window_frames = 72;
 
     std::vector<int32_t> cached_codes;
+    std::vector<unsigned char> cached_speaker_pcm;
+    std::vector<float> cached_speaker_embd;
     std::vector<float> cached_codec_rows;
     std::vector<uint8_t> cached_prime_state;
     size_t cached_prime_frames = 0;
@@ -588,6 +622,7 @@ private:
     std::unique_ptr<decode_embd_batch> prompt_batch;
     int n_prompt = 0;
     int prompt_pos = 0;
+    float    code_temperature = 1.0f;
     int32_t  top_k = 50;
     float    top_p = 1.0f;
     uint32_t seed  = UINT32_MAX;
@@ -669,7 +704,8 @@ public:
         pack = pockettts_pack(info.model_variant);
 
         if (inp->target_embd || inp->n_target_embd || inp->ref_text || inp->ref_text_len ||
-            inp->ref_codec_embd || inp->n_ref_codec_embd || inp->ref_codes || inp->n_ref_frames || inp->prime_frames) {
+            inp->ref_codec_embd || inp->n_ref_codec_embd || inp->ref_codes || inp->n_ref_frames || inp->prime_frames ||
+            inp->speaker_offset || inp->n_speaker_offset) {
             LOG_ERR("mtmd_helper_gen_audio: conditioning rows require Qwen3-TTS\n");
             return 1;
         }

@@ -846,6 +846,8 @@ bool is_websocket_upgrade(const Request &req) {
   return true;
 }
 
+bool write_data(Stream &strm, const char *data, size_t len);
+
 bool write_websocket_frame(Stream &strm, ws::Opcode opcode,
                                   const char *data, size_t len, bool fin,
                                   bool mask) {
@@ -858,25 +860,25 @@ bool write_websocket_frame(Stream &strm, ws::Opcode opcode,
   if (len < 126) {
     header[1] = static_cast<uint8_t>(len);
     if (mask) { header[1] |= 0x80; }
-    if (strm.write(reinterpret_cast<char *>(header), 2) < 0) { return false; }
+    if (!write_data(strm, reinterpret_cast<char *>(header), 2)) { return false; }
   } else if (len <= 0xFFFF) {
     header[1] = 126;
     if (mask) { header[1] |= 0x80; }
-    if (strm.write(reinterpret_cast<char *>(header), 2) < 0) { return false; }
+    if (!write_data(strm, reinterpret_cast<char *>(header), 2)) { return false; }
     uint8_t ext[2];
     ext[0] = static_cast<uint8_t>((len >> 8) & 0xFF);
     ext[1] = static_cast<uint8_t>(len & 0xFF);
-    if (strm.write(reinterpret_cast<char *>(ext), 2) < 0) { return false; }
+    if (!write_data(strm, reinterpret_cast<char *>(ext), 2)) { return false; }
   } else {
     header[1] = 127;
     if (mask) { header[1] |= 0x80; }
-    if (strm.write(reinterpret_cast<char *>(header), 2) < 0) { return false; }
+    if (!write_data(strm, reinterpret_cast<char *>(header), 2)) { return false; }
     uint8_t ext[8];
     for (int i = 7; i >= 0; i--) {
       ext[7 - i] =
           static_cast<uint8_t>((static_cast<uint64_t>(len) >> (i * 8)) & 0xFF);
     }
-    if (strm.write(reinterpret_cast<char *>(ext), 8) < 0) { return false; }
+    if (!write_data(strm, reinterpret_cast<char *>(ext), 8)) { return false; }
   }
 
   if (mask) {
@@ -885,7 +887,7 @@ bool write_websocket_frame(Stream &strm, ws::Opcode opcode,
     uint8_t mask_key[4];
     auto r = rng();
     std::memcpy(mask_key, &r, 4);
-    if (strm.write(reinterpret_cast<char *>(mask_key), 4) < 0) { return false; }
+    if (!write_data(strm, reinterpret_cast<char *>(mask_key), 4)) { return false; }
 
     // Write masked payload in chunks
     const size_t chunk_size = 4096;
@@ -896,11 +898,11 @@ bool write_websocket_frame(Stream &strm, ws::Opcode opcode,
         buf[i] =
             data[offset + i] ^ static_cast<char>(mask_key[(offset + i) % 4]);
       }
-      if (strm.write(buf.data(), n) < 0) { return false; }
+      if (!write_data(strm, buf.data(), n)) { return false; }
     }
   } else {
     if (len > 0) {
-      if (strm.write(data, len) < 0) { return false; }
+      if (!write_data(strm, data, len)) { return false; }
     }
   }
 
@@ -912,12 +914,24 @@ bool write_websocket_frame(Stream &strm, ws::Opcode opcode,
 namespace ws {
 namespace impl {
 
+// Stream::read may stop at a TCP or internal-buffer boundary, even within
+// the fixed header, extended length or mask. Consume exactly the field size.
+bool read_websocket_exact(Stream &strm, char *data, size_t len) {
+  size_t offset = 0;
+  while (offset < len) {
+    const auto n = strm.read(data + offset, len - offset);
+    if (n <= 0) { return false; }
+    offset += static_cast<size_t>(n);
+  }
+  return true;
+}
+
 bool read_websocket_frame(Stream &strm, Opcode &opcode,
                                  std::string &payload, bool &fin,
                                  bool expect_masked, size_t max_len) {
   // Read first 2 bytes
   uint8_t header[2];
-  if (strm.read(reinterpret_cast<char *>(header), 2) != 2) { return false; }
+  if (!read_websocket_exact(strm, reinterpret_cast<char *>(header), 2)) { return false; }
 
   fin = (header[0] & 0x80) != 0;
 
@@ -941,11 +955,11 @@ bool read_websocket_frame(Stream &strm, Opcode &opcode,
   // Extended payload length
   if (payload_len == 126) {
     uint8_t ext[2];
-    if (strm.read(reinterpret_cast<char *>(ext), 2) != 2) { return false; }
+    if (!read_websocket_exact(strm, reinterpret_cast<char *>(ext), 2)) { return false; }
     payload_len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
   } else if (payload_len == 127) {
     uint8_t ext[8];
-    if (strm.read(reinterpret_cast<char *>(ext), 8) != 8) { return false; }
+    if (!read_websocket_exact(strm, reinterpret_cast<char *>(ext), 8)) { return false; }
     // RFC 6455 Section 5.2: the most significant bit MUST be 0
     if (ext[0] & 0x80) { return false; }
     payload_len = 0;
@@ -959,19 +973,13 @@ bool read_websocket_frame(Stream &strm, Opcode &opcode,
   // Read mask key if present
   uint8_t mask_key[4] = {0};
   if (masked) {
-    if (strm.read(reinterpret_cast<char *>(mask_key), 4) != 4) { return false; }
+    if (!read_websocket_exact(strm, reinterpret_cast<char *>(mask_key), 4)) { return false; }
   }
 
   // Read payload
   payload.resize(static_cast<size_t>(payload_len));
   if (payload_len > 0) {
-    size_t total_read = 0;
-    while (total_read < payload_len) {
-      auto n = strm.read(&payload[total_read],
-                         static_cast<size_t>(payload_len - total_read));
-      if (n <= 0) { return false; }
-      total_read += static_cast<size_t>(n);
-    }
+    if (!read_websocket_exact(strm, &payload[0], payload.size())) { return false; }
   }
 
   // Unmask if needed
@@ -3847,7 +3855,7 @@ bool write_data(Stream &strm, const char *d, size_t l) {
   size_t offset = 0;
   while (offset < l) {
     auto length = strm.write(d + offset, l - offset);
-    if (length < 0) { return false; }
+    if (length <= 0) { return false; }
     offset += static_cast<size_t>(length);
   }
   return true;

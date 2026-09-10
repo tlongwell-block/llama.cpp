@@ -17,6 +17,7 @@ class component {
     };
 
     std::ifstream                                       file;
+    std::ifstream                                       standalone;
     std::vector<char>                                   header;
     std::vector<region>                                 regions;
     std::unique_ptr<gguf_context, decltype(&gguf_free)> parent{ nullptr, gguf_free };
@@ -34,7 +35,7 @@ class component {
         }
     }
   public:
-    component(const std::string & path, const std::string & name) : file(path, std::ios::binary | std::ios::ate) {
+    component(const std::string & path, const std::string & name, const std::string & override_path = "") : file(path, std::ios::binary | std::ios::ate) {
         if (!file || file.tellg() <= 0) {
             throw std::runtime_error("missing package");
         }
@@ -47,6 +48,23 @@ class component {
         if (version < 0 || gguf_get_kv_type(parent.get(), version) != GGUF_TYPE_UINT32 ||
             gguf_get_val_u32(parent.get(), version) != 1) {
             throw std::runtime_error("package version");
+        }
+        if (!override_path.empty()) {
+            standalone.open(override_path, std::ios::binary | std::ios::ate);
+            if (!standalone || standalone.tellg() <= 0) { throw std::runtime_error("missing component override"); }
+            size_ = standalone.tellg();
+            meta.reset(gguf_init_from_file(override_path.c_str(), {true, nullptr}));
+            if (!meta || gguf_get_data_offset(meta.get()) > size_ || gguf_get_data_offset(meta.get()) > 64 * 1024 * 1024) {
+                throw std::runtime_error("invalid component override");
+            }
+            for (int64_t i = 0; i < gguf_get_n_tensors(meta.get()); ++i) {
+                const uint64_t offset = gguf_get_tensor_offset(meta.get(), i);
+                const uint64_t extent = size_ - gguf_get_data_offset(meta.get());
+                if (offset > extent || gguf_get_tensor_size(meta.get(), i) > extent - offset) {
+                    throw std::runtime_error("component override tensor out of bounds");
+                }
+            }
+            return;
         }
         const std::string prefix   = "frankie." + name + ".";
         const auto        size_key = gguf_find_key(parent.get(), (prefix + "size").c_str());
@@ -95,13 +113,15 @@ class component {
         }
     }
 
-    std::vector<char> asset(const std::string & name) {
+    bool has_asset(const std::string & name) const { return gguf_find_tensor(parent.get(), name.c_str()) >= 0; }
+
+    std::vector<char> asset(const std::string & name, size_t limit = 16 * 1024 * 1024) {
         auto id = gguf_find_tensor(parent.get(), name.c_str());
         if (id < 0) {
             throw std::runtime_error("missing asset");
         }
         size_t n = gguf_get_tensor_size(parent.get(), id);
-        if (n > 16 * 1024 * 1024) {
+        if (n > limit) {
             throw std::runtime_error("asset too large");
         }
         std::vector<char> result(n);
@@ -127,6 +147,11 @@ class component {
     size_t read(void * out, uint64_t offset, size_t n) {
         if (offset > size_ || n > size_ - offset) {
             return 0;
+        }
+        if (standalone.is_open()) {
+            standalone.clear();
+            standalone.seekg(offset);
+            return standalone.read(static_cast<char *>(out), n) ? n : 0;
         }
         auto *       dst   = static_cast<char *>(out);
         const size_t total = n;

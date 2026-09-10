@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "mtmd-backend.h"
+#include "mtmd-graph.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -43,12 +44,7 @@ struct mtmd_vad::impl {
     }
 
     ggml_tensor * conv(ggml_tensor * x, ggml_tensor * w, int stride, int padding) {
-        auto * ctx = work.get();
-        // The generic conv helper lowers activations to F16. Keep reference parity in F32.
-        auto * col = ggml_im2col(ctx, w, x, stride, 0, padding, 0, 1, 0, false, GGML_TYPE_F32);
-        auto * y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, col, col->ne[0], col->ne[1] * col->ne[2]),
-                                    ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
-        return ggml_reshape_2d(ctx, y, col->ne[1], w->ne[2]);
+        return mtmd_conv_1d_f32(work.get(), x, w, stride, padding);
     }
 
     explicit impl(const std::string & path, bool use_gpu) {
@@ -126,13 +122,11 @@ struct mtmd_vad::impl {
             z = ggml_relu(ctx, ggml_add(ctx, z, bias));
         }
         z = ggml_reshape_1d(ctx, z, 128);
-        auto * gates = ggml_add(ctx, ggml_add(ctx,
-                ggml_mul_mat(ctx, weight("lstm_cell.Wx", 128, 512), z),
-                ggml_mul_mat(ctx, weight("lstm_cell.Wh", 128, 512), h_in)), weight("lstm_cell.bias", 512));
-        auto gate = [&](int index) { return ggml_view_1d(ctx, gates, 128, index * 128 * sizeof(float)); };
-        c_out = ggml_add(ctx, ggml_mul(ctx, ggml_sigmoid(ctx, gate(1)), c_in),
-                             ggml_mul(ctx, ggml_sigmoid(ctx, gate(0)), ggml_tanh(ctx, gate(2))));
-        h_out = ggml_mul(ctx, ggml_sigmoid(ctx, gate(3)), ggml_tanh(ctx, c_out));
+        auto * wx = ggml_add(ctx, ggml_mul_mat(ctx, weight("lstm_cell.Wx", 128, 512), z),
+                                 weight("lstm_cell.bias", 512));
+        const auto state = mtmd_lstm_step(ctx, wx, weight("lstm_cell.Wh", 128, 512), {h_in, c_in});
+        h_out = state.h;
+        c_out = state.c;
         probability = ggml_sigmoid(ctx, ggml_add(ctx,
                 ggml_mul_mat(ctx, ggml_reshape_2d(ctx, weight("final_conv.weight", 1, 128, 1), 128, 1), ggml_relu(ctx, h_out)),
                 weight("final_conv.bias", 1)));

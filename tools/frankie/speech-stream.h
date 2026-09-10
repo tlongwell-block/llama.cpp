@@ -3,6 +3,7 @@
 #include "speech-boundary.h"
 
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -19,6 +20,9 @@ class speech_stream {
     std::condition_variable changed;
     std::deque<brain_session::response> queue;
     bool finished = false;
+    bool speaking = false;
+    size_t audio_samples = 0;
+    std::chrono::steady_clock::time_point audio_clock;
     std::exception_ptr failure;
     std::thread worker;
     std::string committed;
@@ -35,9 +39,21 @@ class speech_stream {
                     }
                     phrase = std::move(queue.front());
                     queue.pop_front();
+                    speaking = true;
                     changed.notify_all();
                 }
-                mouth.speak(phrase, on_audio, on_stage);
+                mouth.speak(phrase, [&](const float * pcm, size_t samples) {
+                    if (on_audio) { on_audio(pcm, samples); }
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!audio_samples) { audio_clock = std::chrono::steady_clock::now(); }
+                    audio_samples += samples;
+                    changed.notify_all();
+                }, on_stage);
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    speaking = false;
+                    changed.notify_all();
+                }
                 if (on_phrase) { on_phrase(phrase.message.content); }
             }
         } catch (...) {
@@ -67,7 +83,14 @@ class speech_stream {
 
     void feed(const brain_session::response & response, bool last) {
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::unique_lock<std::mutex> lock(mutex);
+            // Give the mouth two frames of lead before another brain decode shares the device.
+            while (speaking && !brain.cancelled.load() && !failure) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - audio_clock).count();
+                if (audio_samples && int64_t(audio_samples / 24) - elapsed >= 160) { break; }
+                changed.wait_for(lock, std::chrono::milliseconds(5));
+            }
             if (failure) {
                 std::rethrow_exception(failure);
             }
@@ -81,8 +104,8 @@ class speech_stream {
             return;
         }
         auto phrase = response;
-        const size_t lead = response.raw.text.find(text);
-        if (lead == std::string::npos) {
+        const size_t lead = response.content_offset == std::string::npos ? response.raw.text.rfind(text) : response.content_offset;
+        if (lead == std::string::npos || response.raw.text.compare(lead, text.size(), text) != 0) {
             throw std::runtime_error("parsed speech is not a contiguous generated span");
         }
         phrase.content_offset = lead + committed.size();

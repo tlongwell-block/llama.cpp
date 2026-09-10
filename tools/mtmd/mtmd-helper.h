@@ -204,6 +204,7 @@ struct mtmd_helper_gen_audio_inp {
 
     int32_t  top_k;
     float    top_p;
+    float    code_temperature; // Qwen predictor: >0 overrides the model default; 0 keeps it
     uint32_t seed; // UINT32_MAX for random (default: random)
 
     enum mtmd_helper_gen_audio_outtype out_type;
@@ -222,6 +223,11 @@ struct mtmd_helper_gen_audio_inp {
     const int32_t * ref_codes;
     size_t          n_ref_frames;
     size_t          prime_frames; // last reference frames decoded silently before generated audio; requires ref_codes
+
+    // Qwen3-TTS only. Optional additive x-vector offset, applied after encoding speaker_ref.
+    // Copied during set_input(); exactly one embedding row. The cached reference remains unmodified.
+    const float * speaker_offset;
+    size_t        n_speaker_offset; // floats, must equal llama_model_n_embd_inp()
 };
 
 MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(

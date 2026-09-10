@@ -7,7 +7,9 @@
 
 // Media markers delimit independent text-tokenization segments.
 inline bool frankie_token_boundary(const llama_vocab * vocab, const std::string & prompt, size_t cut) {
-    if (cut > prompt.size() || prompt.size() > 128 * 1024) { return false; }
+    // Match the formatted-prompt limit. A byte limit of 128 KiB forced valid
+    // long contexts to replay even when their cached token prefix was identical.
+    if (cut > prompt.size() || prompt.size() > 4 * 1024 * 1024) { return false; }
     size_t begin = 0;
     for (size_t marker = prompt.find("[FRANKIE_"); marker != std::string::npos && marker < cut;
          marker = prompt.find("[FRANKIE_", begin)) {

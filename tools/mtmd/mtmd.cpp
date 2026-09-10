@@ -2736,6 +2736,15 @@ static void stub_log_callback(enum ggml_log_level, const char *, void *) {
     // do nothing
 }
 
+std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const mtmd_context * ctx) {
+    std::map<ggml_backend_dev_t, size_t> result;
+    if (!ctx) { return result; }
+    for (auto * clip : {ctx->ctx_v, ctx->ctx_a, ctx->ctx_gen_a}) {
+        if (clip) { for (const auto & [dev, size] : clip_get_mem_usage(clip)) { result[dev] += size; } }
+    }
+    return result;
+}
+
 std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_fname,
                                                             struct mtmd_context_params ctx_params) {
     mtmd::context_ptr ctx;
@@ -2748,19 +2757,7 @@ std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_f
         mtmd_log_set(stub_log_callback, nullptr); // suppress logging
         ctx.reset(new mtmd_context(mmproj_fname, nullptr, ctx_params, true));
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
-        std::map<ggml_backend_dev_t, size_t> total_mem;
-        auto merge = [&](const struct clip_ctx * c) {
-            for (auto & [dev, size] : clip_get_mem_usage(c)) {
-                total_mem[dev] += size;
-            }
-        };
-        if (ctx->ctx_v) {
-            merge(ctx->ctx_v);
-        }
-        if (ctx->ctx_a) {
-            merge(ctx->ctx_a);
-        }
-        return total_mem;
+        return mtmd_get_memory_usage(ctx.get());
     } catch (const std::exception & e) {
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
         LOG_ERR("%s: error: %s\n", __func__, e.what());

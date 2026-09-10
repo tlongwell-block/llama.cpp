@@ -6,6 +6,7 @@
 #include "llama-cpp.h"
 #include "mtmd-ear.h"
 #include "mtmd-helper.h"
+#include "runtime-options.h"
 
 #include <array>
 #include <atomic>
@@ -35,7 +36,12 @@ class brain_session {
 
     llama_context_ptr         ctx;
     common_chat_templates_ptr templates;
-    std::vector<uint8_t> checkpoint;
+    std::shared_ptr<const std::vector<uint8_t>> checkpoint;
+    // Only system/tool context may survive a connection; never cache user turns here.
+    std::shared_ptr<const std::vector<uint8_t>> warm_checkpoint;
+    std::string warm_prefix_text;
+    int warm_pos = 0;
+    size_t warm_used = 0;
     std::string checkpoint_prefix;
     int checkpoint_pos = 0;
     size_t checkpoint_used = 0;
@@ -43,6 +49,7 @@ class brain_session {
     int cached_pos = 0;
     size_t cached_used = 0;
     bool cache_valid = false;
+    frankie_options options;
     std::string partial_prefix, partial_marker;
     std::vector<float> partial_rows;
     int partial_pos = 0;
@@ -53,17 +60,21 @@ class brain_session {
     void save_checkpoint(const std::string & prefix, int pos, size_t used);
     void                      decode_text(const std::string & text, int & pos, size_t & used);
   public:
-    static constexpr size_t context_tokens = 200000;
+    size_t audio_row_limit() const { return (options.max_utterance_seconds * 1000 + 79) / 80 + 2; }
+    size_t context_tokens() const { return options.context_tokens; }
     static constexpr size_t max_messages = 4096;
     static constexpr size_t max_audio_segments = 128;
     std::atomic<bool> cancelled{ false };
-    explicit brain_session(const std::string & package);
+    explicit brain_session(const std::string & package, const frankie_options & options = {});
     std::vector<float> encode_audio(const std::vector<float> & pcm16k, std::string * transcript = nullptr);
 
     using image_ptr = std::shared_ptr<mtmd_bitmap>;
     image_ptr decode_image(const std::vector<unsigned char> & bytes);
 
     struct request {
+        int                                      reasoning_budget = 0;
+        uint32_t                                 answer_limit = 4096;
+        size_t generation_tokens() const { return std::min(answer_limit ? answer_limit : 512u, 512u) + (reasoning_budget ? reasoning_budget + 16 : 0); }
         common_chat_templates_inputs              chat;
         std::map<std::string, image_ptr>          images;
         std::map<std::string, std::vector<float>> audio_rows;
@@ -77,9 +88,11 @@ class brain_session {
 
     // Count formatted text and media rows before choosing a bounded history window.
     size_t prompt_tokens(const request & request, const std::map<std::string, size_t> & pending_audio) const;
-    void reset();
+    void reset(bool preserve_checkpoint = false);
+    void report_memory() const;
     struct saved_state {
-        std::vector<uint8_t> sequence, checkpoint;
+        std::vector<uint8_t> sequence;
+        std::shared_ptr<const std::vector<uint8_t>> checkpoint;
         std::string checkpoint_prefix, cached_prefix, partial_prefix, partial_marker;
         std::vector<float> partial_rows;
         int checkpoint_pos, cached_pos, partial_pos;
@@ -91,6 +104,8 @@ class brain_session {
 
     // Append older ear rows while capture is open. The final request keeps these exact rows.
     void precommit(const request & input, const std::string & marker, const std::vector<float> & rows, size_t count);
+    struct listener_reaction { int index = 4; std::array<float, 5> probabilities{}; };
+    listener_reaction probe_listener(const request & input);
     void finish_audio(const request & input, const std::string & marker, std::vector<float> & rows);
     // Prefill static system/tools without an assistant generation header.
     void warm_prefix(common_chat_templates_inputs input);

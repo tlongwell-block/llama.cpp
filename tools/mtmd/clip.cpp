@@ -6114,8 +6114,14 @@ const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx) {
 
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {
     std::map<ggml_backend_dev_t, size_t> result = ctx->mem_usage;
-    for (auto & [dev, size] : ctx->mem_compute) {
-        result[dev] += size;
+    if (ctx->no_alloc) {
+        for (const auto & [dev, size] : ctx->mem_compute) { result[dev] += size; }
+    } else {
+        // Runtime audio graphs grow with input length; the initial reserve is
+        // only an estimate. Query the scheduler's currently retained buffers.
+        for (auto * backend : ctx->backend_ptrs) {
+            result[ggml_backend_get_device(backend)] += ggml_backend_sched_get_buffer_size(ctx->sched.get(), backend);
+        }
     }
     return result;
 }

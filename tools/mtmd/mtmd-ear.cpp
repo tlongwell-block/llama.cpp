@@ -49,11 +49,12 @@ mtmd_ear::mtmd_ear(ggml_context * weights, bool use_gpu) : data(std::make_unique
 mtmd_ear::~mtmd_ear() = default;
 
 std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames, std::vector<int32_t> * ctc_ids) {
-    if (!frames || n_frames == 0 || n_frames > 1024) { throw std::runtime_error("ear requires 1..1024 frames"); }
+    if (!frames || n_frames == 0 || n_frames > 1502) { throw std::runtime_error("ear requires 1..1502 frames"); }
     if (!std::all_of(frames, frames + n_frames * 512, [](float x) { return std::isfinite(x); })) {
         throw std::runtime_error("non-finite ear input");
     }
-    const size_t mem_size = 2 * 1024 * 1024 + n_frames * 256 * 1024;
+    // Tensor data lives in the backend buffer; metadata does not grow with frame count.
+    const size_t mem_size = 2 * 1024 * 1024;
     const auto work = std::unique_ptr<ggml_context, decltype(&ggml_free)>(ggml_init({mem_size, nullptr, true}), ggml_free);
     if (!work) { throw std::runtime_error("cannot allocate ear graph"); }
     auto * ctx = work.get();

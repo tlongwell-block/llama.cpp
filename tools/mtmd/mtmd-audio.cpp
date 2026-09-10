@@ -1267,7 +1267,7 @@ void mtmd_audio_preprocessor_parakeet::initialize() {
 bool mtmd_audio_preprocessor_parakeet::preprocess_mlx(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) const {
     // This checkpoint uses a left-aligned window and L1 complex magnitude.
     constexpr size_t pad = 256;
-    if (!samples || n_samples <= pad || n_samples > 16000 * 80 ||
+    if (!samples || n_samples <= pad || n_samples > 16000 * 120 ||
         !std::all_of(samples, samples + n_samples, [](float x) { return std::isfinite(x); })) { return false; }
     std::vector<float> signal(samples, samples + n_samples);
     for (size_t i = n_samples - 1; i > 0; --i) { signal[i] -= 0.97f * signal[i - 1]; }

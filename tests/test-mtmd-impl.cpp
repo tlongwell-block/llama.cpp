@@ -1,12 +1,23 @@
 #include "testing.h"
 #ifdef LLAMA_TEST_FRANKIE
 #include "../tools/frankie/text-alignment.h"
+#include "../vendor/cpp-httplib/httplib.h"
+namespace httplib::ws::impl {
+    bool read_websocket_frame(Stream &, Opcode &, std::string &, bool &, bool, size_t);
+}
+namespace httplib::detail {
+    bool write_websocket_frame(Stream &, ws::Opcode, const char *, size_t, bool, bool);
+}
 #include "../tools/frankie/speech-boundary.h"
+#include "../tools/frankie/turn-session.h"
+#include "../tools/frankie/token-boundary.h"
+#include "llama-cpp.h"
 #endif
 
 #include "mtmd-image.h"
 #include "mtmd-vad.h"
 #include "mtmd-side.h"
+#include "mtmd-turn.h"
 #include "mtmd-ear.h"
 #include "mtmd-audio.h"
 #include "clip-impl.h"
@@ -55,6 +66,88 @@ struct test_registry {
 
 
 #ifdef LLAMA_TEST_FRANKIE
+MAKE_TEST(test_frankie_long_token_boundary) {
+    const char * package = std::getenv("FRANKIE_PACKAGE_FIXTURE");
+    if (!package) { std::cout << "SKIP long token boundary: set FRANKIE_PACKAGE_FIXTURE\n"; return; }
+    component source(package, "brain");
+    auto params = llama_model_default_params(); params.vocab_only = true;
+    llama_model_ptr model(llama_model_init_from_user(source.metadata(), component::set_tensor, &source, params));
+    if (!model) { throw std::runtime_error("missing brain vocabulary fixture"); }
+    const auto * vocab = llama_model_get_vocab(model.get());
+    std::string prefix = "<|im_start|>user\n";
+    for (int i = 0; i < 6000; ++i) { prefix += "abcdefghijklmnopqrstuvwxyz\n"; }
+    prefix += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nhello";
+    const std::string prompt = prefix + "<|im_end|>\n<|im_start|>user\nContinue.<|im_end|>\n";
+    t.assert_equal("long prompt crosses old byte limit", true, prompt.size() > 128 * 1024);
+    t.assert_equal("long cached token boundary is reusable", true, frankie_token_boundary(vocab, prompt, prefix.size()));
+    t.assert_equal("split inside a token remains rejected", false, frankie_token_boundary(vocab, prompt, prefix.size() - 2));
+    t.assert_equal("oversized formatted prompt remains bounded", false,
+        frankie_token_boundary(vocab, std::string(4 * 1024 * 1024 + 1, 'x'), 1));
+}
+
+MAKE_TEST(test_frankie_turn_queue_recovery) {
+    const char * package = std::getenv("FRANKIE_PACKAGE_FIXTURE");
+    if (!package) { std::cout << "SKIP queue recovery: set FRANKIE_PACKAGE_FIXTURE\n"; return; }
+    component source(package, "vad");
+    frankie_options options;
+    options.use_gpu = std::getenv("MTMD_COMPONENT_GPU") != nullptr;
+    frankie_turn_session turns(source, options);
+    t.assert_equal("package has VAP", true, turns.has_vap());
+    t.assert_equal("package has backchannels", true, turns.has_bc());
+    std::array<float, 512> silence{};
+    for (int i = 0; i < 1024; ++i) { turns.append(silence, silence); }
+    constexpr uint64_t end_ms = 1024 * 32;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!turns.current(end_ms).valid && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    t.assert_equal("burst backlog recovers current predictions", true, turns.current(end_ms).valid);
+    t.assert_equal("stale predictions fail open", false, turns.current(end_ms + 600).valid);
+    t.assert_equal("stale VAP releases", true, turns.release(end_ms + 600, 240));
+}
+
+struct frankie_fragmented_stream : httplib::Stream {
+    std::string data; size_t offset=0, chunk;
+    explicit frankie_fragmented_stream(size_t n):chunk(n){}
+    bool is_readable() const override{return offset<data.size();}
+    bool wait_readable() const override{return is_readable();}
+    bool wait_writable() const override{return true;}
+    ssize_t read(char *p,size_t n) override{n=std::min({n,chunk,data.size()-offset}); std::memcpy(p,data.data()+offset,n);offset+=n;return n;}
+    ssize_t write(const char *p,size_t n) override{n=std::min(n,chunk);data.append(p,n);return n;}
+    void get_remote_ip_and_port(std::string &,int &)const override{}
+    void get_local_ip_and_port(std::string &,int &)const override{}
+    socket_t socket()const override{return -1;}
+    time_t duration()const override{return 0;}
+};
+MAKE_TEST(test_frankie_websocket_fragments) {
+    // A microphone stream crossed a buffered-read boundary after ~43 seconds.
+    // Force every header/length/mask to split, independent of TCP packet timing.
+    for (size_t chunk : {size_t(1), size_t(3), size_t(4096)}) {
+        for (bool mask : {false, true}) {
+            for (size_t n : {size_t(0), size_t(1), size_t(125), size_t(126), size_t(65535), size_t(65536)}) {
+                std::string expected(n, 'x');
+                for (size_t i = 0; i < n; ++i) { expected[i] = char(32 + i % 95); }
+                frankie_fragmented_stream stream(chunk);
+                t.assert_equal("fragmented frame written", true, httplib::detail::write_websocket_frame(
+                    stream, httplib::ws::Opcode::Text, expected.data(), expected.size(), true, mask));
+                httplib::ws::Opcode opcode; std::string actual; bool fin = false;
+                const bool read = httplib::ws::impl::read_websocket_frame(stream, opcode, actual, fin, mask, 100000);
+                t.assert_equal("fragmented frame read", true, read);
+                t.assert_equal("fragmented payload unchanged", expected, actual);
+                t.assert_equal("final frame preserved", true, fin);
+            }
+        }
+    }
+    frankie_fragmented_stream eof(1);
+    eof.data = "\x81";
+    httplib::ws::Opcode opcode; std::string actual; bool fin;
+    t.assert_equal("truncated header rejected", false,
+        httplib::ws::impl::read_websocket_frame(eof, opcode, actual, fin, false, 1000));
+    frankie_fragmented_stream stalled(0);
+    t.assert_equal("zero-byte writer fails", false, httplib::detail::write_websocket_frame(
+        stalled, httplib::ws::Opcode::Text, "hello", 5, true, false));
+}
+
 MAKE_TEST(test_frankie_speech_boundary) {
     t.assert_equal("no three-word opener", size_t(0), frankie_speech_boundary("Let me check the machine", 0, false));
     t.assert_equal("no clause cut", size_t(0), frankie_speech_boundary("Let me check, then answer", 0, false));
@@ -464,6 +557,96 @@ MAKE_TEST(test_side_reference) {
     try { side.process(hidden); } catch (const std::runtime_error &) { rejected = true; }
     t.assert_equal("side rejects non-finite", true, rejected);
     std::cout << "Side rows=" << rows << " max_abs_error=" << worst << "\n";
+}
+
+MAKE_TEST(test_turn_reference) {
+    const char * root = std::getenv("MTMD_TURN_FIXTURE");
+    if (!root) { std::cout << "SKIP turn parity: set MTMD_TURN_FIXTURE\n"; return; }
+    const std::string dir(root);
+    for (const std::string mode : {"vap", "bc"}) {
+        ggml_context * raw = nullptr;
+        std::unique_ptr<gguf_context, decltype(&gguf_free)> meta(
+            gguf_init_from_file((dir + "/" + mode + ".gguf").c_str(), {false, &raw}), gguf_free);
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(raw, ggml_free);
+        if (!meta || !weights) { throw std::runtime_error("missing turn fixture"); }
+        mtmd_turn model(raw, mode == "vap" ? mtmd_turn::mode::vap : mtmd_turn::mode::backchannel,
+                        std::getenv("MTMD_COMPONENT_GPU"));
+        std::ifstream input(dir + "/input.f32", std::ios::binary);
+        std::ifstream output(dir + "/" + mode + "-output.f32", std::ios::binary);
+        std::ifstream encoder(dir + "/" + mode + "-encoder.f32", std::ios::binary);
+        std::ifstream hidden(dir + "/" + mode + "-hidden.f32", std::ios::binary);
+        if (!input || !output || !encoder || !hidden) { throw std::runtime_error("missing turn reference data"); }
+        float worst_p = 0, worst_e = 0, worst_h = 0;
+        std::array<float, 1600> user{}, system{};
+        auto compare = [](std::ifstream & in, const std::vector<float> & actual, float & worst) {
+            std::vector<float> expected(actual.size());
+            if (!in.read(reinterpret_cast<char *>(expected.data()), expected.size() * sizeof(float))) {
+                throw std::runtime_error("short turn fixture");
+            }
+            for (size_t i = 0; i < expected.size(); ++i) { worst = std::max(worst, std::abs(expected[i] - actual[i])); }
+        };
+        mtmd_turn::result first{};
+        for (int i = 0; i < 250; ++i) {
+            if (!input.read(reinterpret_cast<char *>(user.data()), sizeof(user)) ||
+                !input.read(reinterpret_cast<char *>(system.data()), sizeof(system))) { throw std::runtime_error("short turn audio"); }
+            const auto r = model.process(user, system);
+            if (!i) { first = r; }
+            compare(output, mode == "vap" ? std::vector<float>{r.next_speaker[0], r.next_speaker[1]} :
+                                            std::vector<float>{r.backchannel}, worst_p);
+            compare(encoder, model.encoded(), worst_e);
+            compare(hidden, model.hidden(), worst_h);
+            if (i == 0 || i == 69 || i == 200) {
+                std::cout << mode << " frame=" << i << " error p=" << worst_p << " encoder=" << worst_e << " hidden=" << worst_h << "\n";
+            }
+        }
+        std::cout << mode << " reference max error p=" << worst_p << " encoder=" << worst_e << " hidden=" << worst_h << "\n";
+        t.assert_equal(mode + " probability", true, worst_p < 2e-4f);
+        t.assert_equal(mode + " encoder", true, worst_e < 2e-4f);
+        t.assert_equal(mode + " hidden", true, worst_h < 2e-3f);
+        model.reset();
+        user.fill(0); system.fill(0);
+        const auto again = model.process(user, system);
+        t.assert_equal(mode + " reset VAP", true, std::abs(again.next_speaker[0] - first.next_speaker[0]) < 1e-6f);
+        t.assert_equal(mode + " reset BC", true, std::abs(again.backchannel - first.backchannel) < 1e-6f);
+    }
+}
+
+MAKE_TEST(test_expression_reference) {
+    const char * root = std::getenv("MTMD_EXPRESSION_FIXTURE");
+    if (!root) {
+        std::cout << "SKIP expression parity: set MTMD_EXPRESSION_FIXTURE\n";
+        return;
+    }
+    const std::string dir(root);
+    ggml_context * raw = nullptr;
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> meta(
+        gguf_init_from_file((dir + "/expression.gguf").c_str(), {false, &raw}), gguf_free);
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(raw, ggml_free);
+    if (!meta || !weights) { throw std::runtime_error("missing expression fixture"); }
+    mtmd_expression head(raw, std::getenv("MTMD_COMPONENT_GPU"));
+    std::ifstream input(dir + "/expression-inputs.f32", std::ios::binary);
+    std::ifstream expected(dir + "/expression-outputs.f32", std::ios::binary);
+    if (!input || !expected) { throw std::runtime_error("missing expression outputs"); }
+    std::array<float, 5120> hidden{};
+    mtmd_expression::result target;
+    float worst = 0;
+    for (int row = 0; row < 16; ++row) {
+        if (!input.read(reinterpret_cast<char *>(hidden.data()), sizeof(hidden)) ||
+            !expected.read(reinterpret_cast<char *>(target.probabilities.data()), sizeof(target.probabilities)) ||
+            !expected.read(reinterpret_cast<char *>(target.offset.data()), sizeof(target.offset))) {
+            throw std::runtime_error("short expression fixture");
+        }
+        const auto actual = head.process(hidden);
+        for (size_t i = 0; i < 4; ++i) { worst = std::max(worst, std::abs(actual.probabilities[i] - target.probabilities[i])); }
+        for (size_t i = 0; i < 2048; ++i) { worst = std::max(worst, std::abs(actual.offset[i] - target.offset[i])); }
+        t.assert_equal("expression reference row " + std::to_string(row), true, worst < 1e-4f);
+    }
+    t.assert_equal("expression fixture extent", true, input.peek() == EOF && expected.peek() == EOF);
+    hidden[0] = std::numeric_limits<float>::quiet_NaN();
+    bool rejected = false;
+    try { head.process(hidden); } catch (const std::runtime_error &) { rejected = true; }
+    t.assert_equal("expression rejects nonfinite", true, rejected);
+    std::cout << "Expression max_abs_error=" << worst << "\n";
 }
 
 MAKE_TEST(test_qwen3tts_icl_body) {
