@@ -124,7 +124,7 @@ The Qwen3-TTS path does not yet encode arbitrary WAVs into ICL codec IDs. WAV-on
 
 ## Quantization and package assembly
 
-The current package retains the custom Q4_1 brain and uses Q8_0 for supported Parakeet and Qwen3-TTS matrices. Spatial convolutions, normalization and other unsupported or sensitive tensors retain their original types. Vision remains F16. Q8 describes the quantized matrices, not every tensor in the file.
+Each component can use the quantization supported by its existing converter and runtime. For example, a Q4 brain can be packaged with Q8_0 Parakeet, voice and vision matrices. Spatial convolutions, normalization and other unsupported or sensitive tensors retain their original types. Q8 describes the quantized matrices, not every tensor in the file; retain the package manifest to identify the exact types.
 
 Use the existing `llama-quantize` for the Qwen talker backbone. `tools/mtmd/quantize-audio.py` uses gguf-py's Q8 implementation for the audio projectors:
 
@@ -142,14 +142,21 @@ python tools/frankie/pack.py --output frankie.gguf \
   --component talker=talker-q8.gguf --component mouth=mouth-q8.gguf \
   --component side=side-f32.gguf --component vad=vad-f32.gguf \
   --voice voice.wav --voice-text-file voice.txt --voice-codes voice.i32 \
-  --expression expression.gguf --vap vap.gguf --bc bc.gguf
+  --expression expression.gguf --turn turn.gguf
 ```
 
 The custom MLX brain, vision and Parakeet exporters are in `examples/model-conversion/convert_frankie_{brain,vision,ear}.py`. The ear exporter accepts `MODEL OUTPUT` and uses the installed `parakeet_mlx` frontend; its optional middle `FIXTURE` argument preserves frozen filter/window exports. Use the existing `convert_hf_to_gguf.py` for Qwen3-TTS, once for the talker and once with `--mmproj` for the speaker/code/codec component. These source conversions need the Python dependencies of their reference models; native inference does not.
 
 Bridge, tone, optional Side, VAD, expression, turn checkpoints and matching reference codes must come from the same source configuration. In particular, tone's emotion rows come from the original brain embedding. Do not substitute unrelated adapters or reference codec IDs.
 
-To update an existing package, pass `--base existing.gguf` and only the replacement components/assets. The packer preserves unchanged tensors and metadata, verifies every written tensor against its input and writes a manifest. Failed assembly leaves an `.incomplete` file rather than a final GGUF.
+Turn projection and backchannel prediction share one VAP-BC checkpoint and one encoder/attention pass. Convert the complete `maai-kyoto/vap_bc_en` state dictionary with both its VAP and BC heads; its five-sample downsampling kernel differs from plain VAP. The verified MIT checkpoint revision is `3ff203ce14de279045eb1b145a1dd24caa8f1c9d`, with SHA256 `54e5d19456c0ec7a6fb54ebbbceca837257d827bc86fd7820b0669f961cd11bc`. Keep its MIT license with the package. The converter requires PyTorch for `.pt` input and also accepts a complete F32 NPZ state dictionary.
+
+```sh
+python tools/frankie/convert-turn.py vap-bc_state_dict_en_10hz_20000msec.pt turn.gguf
+python tools/frankie/pack.py --base existing.gguf --turn turn.gguf --output updated.gguf
+```
+
+The packer removes both legacy split turn assets when replacing them with `assets.turn.gguf`; it refuses to carry them into a new package without a combined replacement. The runtime can still read old packages, but those weights are not a source for new turn assets. To replace other components, pass `--base existing.gguf` and their replacement paths. The packer preserves unchanged tensors and metadata, verifies every written tensor against its input and writes a manifest. Failed assembly leaves an `.incomplete` file rather than a final GGUF.
 
 ### Breeze components
 
@@ -168,9 +175,7 @@ python tools/frankie/pack.py --base frankie.gguf --output frankie-breeze.gguf \
 
 The NPZ contains the source model's `voice_prefix` array with shape `[rows, 2048]`; `reference_rms` is the measured linear RMS of that reference, in `(0, 1]`. These are model-building inputs, not requirements for a user supplying `--voice`. The converter includes the WAV encoder, codebooks and reference EOS embedding needed to replace that cached default. Eligible matrices use Q8_0; codec tensors retain source precision. Keep Breeze and Qwen-TTS packages separate and retain the source checkpoint's model license with the artifact.
 
-The September 10 package is 20,326,799,488 bytes (18.93 GiB). That is slightly above 20 decimal GB. File size alone cannot establish whether the complete system fits a 24 GiB GPU: KV/recurrent state, compute buffers, vision, audio and turn models must be counted together during execution.
-
-Do not substitute a stock Qwen GGUF without validating the trained bridge seams. This brain was converted from the custom MLX affine-four-bit checkpoint into Q4_1, including a requantization step.
+File size alone cannot establish whether the complete system fits a 24 GiB GPU: KV/recurrent state, compute buffers, vision, audio and turn models must be counted together during execution. Validate the trained bridge seams when replacing the brain, including raw audio and image inputs, expression and MTP acceptance.
 
 ## Runtime behavior and tuning
 
@@ -184,7 +189,7 @@ During speech, the existing phrase worker gives the mouth priority when emitted 
 
 The phrase queue copies only the token states for each spoken span. Side conditioning adds offsets through the existing Qwen TTS embedding cache, without a second vocabulary matrix. Small component graphs validate backend support once when allocated, and release their host weight copies after loading.
 
-Input uses VAD, in-speech ear prefill with a 20-frame lag, and speculative generation after short silence. VAP gates publication, with a 1500 ms silence ceiling and stale-prediction fallback. Resumed speech restores recurrent state. Short heard false starts can merge within 700 ms, without crossing published tool calls. Interruption history retains completed heard phrases rather than claiming exact word alignment.
+Input uses VAD, in-speech ear prefill with a 20-frame lag, and speculative generation after short silence. VAP gates publication, with a 1500 ms silence ceiling and stale-prediction fallback. Resumed speech restores recurrent state. False-start recovery can merge speech only when the input pause, reply age and heard audio are each below 700 ms, without crossing published tool calls. A later utterance stays separate even if the previous reply just began. Interruption history retains completed heard phrases rather than claiming exact word alignment.
 
 Backchannels use the shared MaAI graph at 10 Hz, the actual rendered speaker PCM, and a temporary brain probe restricted to listener reactions. They have separate bounded audio events and never create an assistant turn or execute a tool. The probe uses an existing llama.cpp device checkpoint and attention-suffix rollback, then restores it after selection. Normal speech supersedes listener audio.
 

@@ -4831,6 +4831,21 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_f32 : public test_mul_mat {
+    test_mul_mat_f32(int64_t n, std::array<int64_t, 2> bs)
+        : test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, n, 256, bs, {1, 1}) {}
+
+    std::string vars() override { return test_mul_mat::vars() + ",full_f32=1"; }
+    double max_nmse_err() override { return 1e-10; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_mul_mat::build_graph(ctx);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_prec_set_src(out, GGML_PREC_F32, 1);
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9622,6 +9637,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
+
+    // Full F32 inputs and accumulation across vector, small-matrix, and batched paths.
+    for (int64_t n : {1, 8, 16, 32}) {
+        test_cases.emplace_back(new test_mul_mat_f32(n, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_f32(n, {4, 1}));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

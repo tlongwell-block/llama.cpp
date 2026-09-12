@@ -10,7 +10,7 @@ struct ggml_context;
 // Each step consumes 100 ms of aligned user and actually played system audio at 16 kHz.
 class mtmd_turn {
 public:
-    enum class mode { vap, backchannel };
+    enum class mode { vap, backchannel, duplex };
     struct result {
         std::array<float, 2> next_speaker{}; // user, system (VAP)
         float backchannel = 0;

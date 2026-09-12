@@ -93,6 +93,7 @@ struct realtime_session {
         bool ready = false, committed = false, authorized = false, abandoned = false;
         int resumed_frames = 0;
         std::vector<char> capture;
+        uint64_t speech_end_samples = 0;
         size_t user_index = 0;
         std::string output;
         bool tool_released = false, merge_requested = false;
@@ -114,6 +115,8 @@ struct realtime_session {
         if (!turn || turn->output != id || turn->tool_released || turn->merge_requested ||
             samples >= 24000 * 700 / 1000 ||
             std::chrono::steady_clock::now() - turn->released >= std::chrono::milliseconds(700) ||
+            speech_start_samples < turn->speech_end_samples ||
+            speech_start_samples - turn->speech_end_samples >= 24000 * 700 / 1000 ||
             !speaking || input_busy.load() || !unencoded.empty() || turn->user_index >= request.chat.messages.size()) { return; }
         if (audio.size() + turn->capture.size() > 24000 * 2 * (max_utterance_seconds - 1)) { return; }
         // A published call cannot be undone. Never merge across any call/result pair.
@@ -1041,6 +1044,7 @@ struct realtime_session {
         if (speculate) {
             turn = std::make_shared<speculative_turn>();
             turn->input = input_id;
+            turn->speech_end_samples = input_samples - uint64_t(silence_frames) * 768;
             turn->user_index = request.chat.messages.size();
             const auto marker = "[FRANKIE_AUDIO_" + input_id + "]";
             common_chat_msg user;

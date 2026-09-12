@@ -600,9 +600,11 @@ MAKE_TEST(test_turn_reference) {
     const char * root = std::getenv("MTMD_TURN_FIXTURE");
     if (!root) { std::cout << "SKIP turn parity: set MTMD_TURN_FIXTURE\n"; return; }
     const std::string dir(root);
-    for (const std::string mode : {"vap", "bc"}) {
+    for (const std::string mode : {"vap", "bc", "duplex"}) {
+        if (mode == "duplex" && !std::ifstream(dir + "/duplex.gguf")) { continue; }
         const auto weights = load_component_fixture(dir + "/" + mode + ".gguf");
-        mtmd_turn model(weights.get(), mode == "vap" ? mtmd_turn::mode::vap : mtmd_turn::mode::backchannel,
+        mtmd_turn model(weights.get(), mode == "vap" ? mtmd_turn::mode::vap :
+                                      mode == "bc" ? mtmd_turn::mode::backchannel : mtmd_turn::mode::duplex,
                         std::getenv("MTMD_COMPONENT_GPU"));
         std::ifstream input(dir + "/input.f32", std::ios::binary);
         std::ifstream output(dir + "/" + mode + "-output.f32", std::ios::binary);
@@ -624,7 +626,8 @@ MAKE_TEST(test_turn_reference) {
                 !input.read(reinterpret_cast<char *>(system.data()), sizeof(system))) { throw std::runtime_error("short turn audio"); }
             const auto r = model.process(user, system);
             if (!i) { first = r; }
-            compare(output, mode == "vap" ? std::vector<float>{r.next_speaker[0], r.next_speaker[1]} :
+            compare(output, mode == "duplex" ? std::vector<float>{r.next_speaker[0], r.next_speaker[1], r.backchannel} :
+                            mode == "vap" ? std::vector<float>{r.next_speaker[0], r.next_speaker[1]} :
                                             std::vector<float>{r.backchannel}, worst_p);
             compare(encoder, model.encoded(), worst_e);
             compare(hidden, model.hidden(), worst_h);
@@ -640,6 +643,7 @@ MAKE_TEST(test_turn_reference) {
         user.fill(0); system.fill(0);
         const auto again = model.process(user, system);
         t.assert_equal(mode + " reset VAP", true, std::abs(again.next_speaker[0] - first.next_speaker[0]) < 1e-6f);
+        t.assert_equal(mode + " reset system", true, std::abs(again.next_speaker[1] - first.next_speaker[1]) < 1e-6f);
         t.assert_equal(mode + " reset BC", true, std::abs(again.backchannel - first.backchannel) < 1e-6f);
     }
 }

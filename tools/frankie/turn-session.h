@@ -15,7 +15,7 @@
 class frankie_turn_session {
     using context_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
     struct frame { std::array<float, 1600> user{}, system{}; uint64_t end = 0; bool reset = false; };
-    std::unique_ptr<mtmd_turn> vap, bc;
+    std::unique_ptr<mtmd_turn> turn, vap, bc;
     std::thread worker;
     std::mutex mutex;
     std::condition_variable changed;
@@ -45,9 +45,12 @@ private:
     }
 public:
     frankie_turn_session(component & source, const frankie_options & options) {
-        vap = load(source, options.vap_model, "vap", mtmd_turn::mode::vap, options.use_gpu);
-        bc = load(source, options.bc_model, "bc", mtmd_turn::mode::backchannel, options.use_gpu);
-        if (!vap && !bc) { return; }
+        if (options.vap_model.empty() || options.bc_model.empty()) {
+            turn = load(source, "", "turn", mtmd_turn::mode::duplex, options.use_gpu);
+        }
+        if (!turn || !options.vap_model.empty()) { vap = load(source, options.vap_model, "vap", mtmd_turn::mode::vap, options.use_gpu); }
+        if (!turn || !options.bc_model.empty()) { bc = load(source, options.bc_model, "bc", mtmd_turn::mode::backchannel, options.use_gpu); }
+        if (!turn && !vap && !bc) { return; }
         worker = std::thread([this] {
             for (;;) {
                 frame current;
@@ -58,8 +61,12 @@ public:
                     current = std::move(queue.front()); queue.pop_front();
                 }
                 try {
-                    if (current.reset) { if (vap) { vap->reset(); } if (bc) { bc->reset(); } }
+                    if (current.reset) { for (auto * model : {turn.get(), vap.get(), bc.get()}) { if (model) { model->reset(); } } }
                     reading r;
+                    if (turn) {
+                        const auto prediction = turn->process(current.user, current.system);
+                        r.next_system = prediction.next_speaker[1]; r.backchannel = prediction.backchannel;
+                    }
                     if (vap) { r.next_system = vap->process(current.user, current.system).next_speaker[1]; }
                     if (bc) { r.backchannel = bc->process(current.user, current.system).backchannel; }
                     r.end = current.end; r.valid = true;
@@ -78,8 +85,8 @@ public:
         { std::lock_guard<std::mutex> lock(mutex); stopping = true; changed.notify_all(); }
         if (worker.joinable()) { worker.join(); }
     }
-    bool has_vap() const { return bool(vap); }
-    bool has_bc() const { return bool(bc); }
+    bool has_vap() const { return bool(turn) || bool(vap); }
+    bool has_bc() const { return bool(turn) || bool(bc); }
     void append(const std::array<float, 512> & user, const std::array<float, 512> & system) {
         if (!worker.joinable()) { return; }
         std::lock_guard<std::mutex> lock(mutex);
@@ -104,6 +111,6 @@ public:
     }
     bool release(uint64_t input_ms, int silence_ms) {
         const auto r = current(input_ms);
-        return !vap || silence_ms >= 1500 || !r.valid || r.next_system >= 0.4f;
+        return !has_vap() || silence_ms >= 1500 || !r.valid || r.next_system >= 0.4f;
     }
 };

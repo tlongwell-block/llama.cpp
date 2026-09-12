@@ -15,7 +15,7 @@ constexpr int dim = 256, heads = 4, retained = 199;
 
 struct mtmd_turn::impl {
     mode kind;
-    int frames;
+    int frames, kernel;
     int valid = 0;
     mtmd_backend backend;
     ggml_context_ptr work;
@@ -26,6 +26,7 @@ struct mtmd_turn::impl {
     std::array<std::array<float, 320>, 2> previous{};
     ggml_tensor * combined = nullptr;
     ggml_tensor * probabilities = nullptr;
+    ggml_tensor * backchannel = nullptr;
     ggml_tensor * mask = nullptr;
     struct cache_pair { ggml_tensor * in; ggml_tensor * out; };
     std::vector<cache_pair> caches;
@@ -39,8 +40,13 @@ struct mtmd_turn::impl {
         return t;
     }
 
-    explicit impl(ggml_context * weights, mode kind, bool gpu) : kind(kind),
-        frames(kind == mode::vap ? 1 : 3), backend(weights, gpu, "turn.") {
+    explicit impl(ggml_context * weights, mode kind, bool gpu) : kind(kind), backend(weights, gpu, "turn.") {
+        auto * downsample = ggml_get_tensor(backend.context(), "turn.encoder.downsample.1.weight");
+        if (!downsample || (downsample->ne[0] != 5 && downsample->ne[0] != 10)) {
+            throw std::runtime_error("unsupported turn downsampling kernel");
+        }
+        kernel = downsample->ne[0];
+        frames = (10 - kernel) / 2 + 1;
         work.reset(ggml_init({16 * 1024 * 1024, nullptr, true}));
         if (!work) { throw std::runtime_error("cannot allocate turn graph"); }
         auto * ctx = work.get();
@@ -62,14 +68,14 @@ struct mtmd_turn::impl {
         combined = ggml_add(ctx,
             ggml_gelu_erf(ctx, norm(linear(a, "ar.combinator.h0_a", dim, dim), "ar.combinator.ln")),
             ggml_gelu_erf(ctx, norm(linear(b, "ar.combinator.h0_b", dim, dim), "ar.combinator.ln")));
-        const auto head = kind == mode::vap ? "vap_head" : "bc_head";
-        const int classes = kind == mode::vap ? 256 : 1;
-        auto * logits = ggml_add(ctx, linear(combined, head, dim, classes), w(std::string(head) + ".bias", classes));
-        probabilities = kind == mode::vap ? ggml_soft_max(ctx, logits) : ggml_sigmoid(ctx, logits);
-        if (kind == mode::vap) {
+        if (kind != mode::backchannel) {
+            auto * logits = ggml_add(ctx, linear(combined, "vap_head", dim, 256), w("vap_head.bias", 256));
             // Expected occupancy in the first two future bins, normalized across speakers.
-            auto * now = ggml_mul_mat(ctx, w("now.weight", 256, 2), probabilities);
+            auto * now = ggml_mul_mat(ctx, w("now.weight", 256, 2), ggml_soft_max(ctx, logits));
             probabilities = ggml_div(ctx, now, ggml_scale_bias(ctx, ggml_sum_rows(ctx, now), 1.0f, 1e-5f));
+        }
+        if (kind != mode::vap) {
+            backchannel = ggml_sigmoid(ctx, ggml_add(ctx, linear(combined, "bc_head", dim, 1), w("bc_head.bias", 1)));
         }
         ggml_set_input(mask);
         for (int channel = 0; channel < 2; ++channel) {
@@ -78,10 +84,16 @@ struct mtmd_turn::impl {
             for (auto * tensor : {final[channel].h, final[channel].c, features[channel]}) { ggml_set_output(tensor); }
         }
         ggml_set_output(combined);
-        ggml_set_output(probabilities);
         graph = ggml_new_graph_custom(ctx, 4096, false);
-        ggml_build_forward_expand(graph, probabilities);
+        for (auto * output : {probabilities, backchannel}) {
+            if (output) { ggml_set_output(output); ggml_build_forward_expand(graph, output); }
+        }
         for (const auto & cache : caches) { ggml_build_forward_expand(graph, cache.out); }
+        // Recurrent turn features need full precision on every backend.
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            auto * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_MUL_MAT) { ggml_prec_set_acc(node, GGML_PREC_F32); }
+        }
         allocator = backend.allocate(graph);
     }
 
@@ -128,7 +140,7 @@ struct mtmd_turn::impl {
         }
         final[channel] = state;
         x = mtmd_conv_1d_f32(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)),
-                            w("encoder.downsample.1.weight", kind == mode::vap ? 10 : 5, dim, dim), 2, 0);
+                            w("encoder.downsample.1.weight", kernel, dim, dim), 2, 0);
         x = ggml_cont(ctx, ggml_transpose(ctx, x));
         x = ggml_add(ctx, x, w("encoder.downsample.1.bias", dim));
         return ggml_gelu_erf(ctx, norm(x, "encoder.downsample.2.ln"));
@@ -210,11 +222,16 @@ mtmd_turn::result mtmd_turn::process(const std::array<float, 1600> & user, const
     ggml_backend_tensor_set(data->mask, mask.data(), 0, mask.size() * sizeof(float));
     data->backend.compute(data->graph);
     result r;
-    const int columns = data->kind == mode::vap ? 2 : 1;
-    float * out = columns == 2 ? r.next_speaker.data() : &r.backchannel;
-    ggml_backend_tensor_get(data->probabilities, out, (data->frames - 1) * columns * sizeof(float), columns * sizeof(float));
-    for (int i = 0; i < columns; ++i) {
-        if (!std::isfinite(out[i]) || out[i] < 0 || out[i] > 1.00001f) { throw std::runtime_error("invalid turn probability"); }
+    if (data->probabilities) {
+        ggml_backend_tensor_get(data->probabilities, r.next_speaker.data(), (data->frames - 1) * 2 * sizeof(float), 2 * sizeof(float));
+        // The BC checkpoint encodes (system, user); public results use (user, system).
+        if (data->kind == mode::duplex) { std::swap(r.next_speaker[0], r.next_speaker[1]); }
+    }
+    if (data->backchannel) {
+        ggml_backend_tensor_get(data->backchannel, &r.backchannel, (data->frames - 1) * sizeof(float), sizeof(float));
+    }
+    for (float out : {r.next_speaker[0], r.next_speaker[1], r.backchannel}) {
+        if (!std::isfinite(out) || out < 0 || out > 1.00001f) { throw std::runtime_error("invalid turn probability"); }
     }
     for (int ch = 0; ch < 2; ++ch) {
         std::copy(audio[ch]->end() - 320, audio[ch]->end(), data->previous[ch].begin());

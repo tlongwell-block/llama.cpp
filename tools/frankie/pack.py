@@ -27,7 +27,7 @@ def main():
     parser.add_argument('--voice', type=Path)
     parser.add_argument('--voice-text-file', type=Path)
     parser.add_argument('--voice-codes', type=Path, help='frame-major little-endian I32, 16 codebooks')
-    for name in ('expression', 'vap', 'bc', 'breeze'):
+    for name in ('expression', 'turn', 'breeze'):
         parser.add_argument('--' + name, type=Path)
     args = parser.parse_args()
     temporary = args.output.with_name(args.output.name + '.incomplete')
@@ -38,6 +38,16 @@ def main():
     base = gguf.GGUFReader(args.base) if args.base else None
     if base is not None and (base.get_field('general.architecture').contents() != 'frankie' or base.get_field('frankie.version').contents() != 1):
         raise ValueError('unsupported base package')
+    if not args.turn and (base is None or not any(t.name == 'assets.turn.gguf' for t in base.tensors)):
+        raise ValueError('supply --turn with a combined VAP-BC asset; split legacy turn assets are not repackaged')
+    if args.turn:
+        turn = gguf.GGUFReader(args.turn)
+        field = turn.get_field('turn.mode')
+        tensors = {t.name: t for t in turn.tensors}
+        if (field is None or field.contents() != 'duplex' or
+                not {'turn.vap_head.weight', 'turn.bc_head.weight', 'turn.now.weight'} <= tensors.keys() or
+                tensors['turn.encoder.downsample.1.weight'].shape.tolist() != [5, 256, 256]):
+            raise ValueError('--turn must be a combined VAP-BC checkpoint from convert-turn.py')
     replacements = {}
     for item in args.component:
         name, path = item.split('=', 1)
@@ -47,8 +57,8 @@ def main():
     if base is None:
         missing = [name for name in COMPONENTS if name not in replacements]
         if missing: raise ValueError('missing components: ' + ', '.join(missing))
-        if not all((args.voice, args.voice_text_file, args.voice_codes, args.expression, args.vap, args.bc)):
-            raise ValueError('a new package requires voice WAV/text/codes, expression, VAP and BC assets')
+        if not all((args.voice, args.voice_text_file, args.voice_codes, args.expression)):
+            raise ValueError('a new package requires voice WAV/text/codes, expression and turn assets')
     source = {name: gguf.GGUFReader(path) for name, path in replacements.items()}
     tensor_map = {}
     source_shapes = {}
@@ -67,11 +77,13 @@ def main():
             if field is None: raise ValueError('base package is missing ' + name)
             sizes[name] = field.contents()
     for tensor in base.tensors if base is not None else ():
+        if tensor.name in ('assets.vap.gguf', 'assets.bc.gguf'):
+            continue
         if any(tensor.name.startswith(f'frankie.{name}.') or tensor.name == f'assets.{name}.header' for name in replacements):
             continue
         tensor_map[tensor.name] = (tensor.data, tensor.tensor_type)
         source_shapes[tensor.name] = tensor.shape.tolist()
-    for name in ('expression', 'vap', 'bc', 'breeze'):
+    for name in ('expression', 'turn', 'breeze'):
         path = getattr(args, name)
         if path:
             if path.stat().st_size > 64 * 1024 * 1024: raise ValueError(name + ' asset too large')
