@@ -28,6 +28,7 @@ class speech_stream {
     std::string committed;
 
     void consume() {
+        mouth.reset_speech_context();
         try {
             for (;;) {
                 brain_session::response phrase;
@@ -35,7 +36,7 @@ class speech_stream {
                     std::unique_lock<std::mutex> lock(mutex);
                     changed.wait(lock, [&] { return finished || !queue.empty() || brain.cancelled.load(); });
                     if (brain.cancelled.load() || (finished && queue.empty())) {
-                        return;
+                        break;
                     }
                     phrase = std::move(queue.front());
                     queue.pop_front();
@@ -61,6 +62,7 @@ class speech_stream {
             failure = std::current_exception();
             changed.notify_all();
         }
+        mouth.reset_speech_context();
     }
 
   public:

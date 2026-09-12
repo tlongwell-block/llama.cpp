@@ -19,6 +19,7 @@ struct frankie_options {
     uint32_t max_utterance_seconds = 90;
     uint32_t max_output_audio_seconds = 300;
     uint32_t max_output_tokens = 4096;
+    uint32_t speech_context_words = 100;
     std::string cache_type = "q4_0";
     std::string thinking = "none";
     float side_scale = 0.0f;

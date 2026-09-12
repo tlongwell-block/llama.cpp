@@ -63,6 +63,8 @@ struct frankie_normalized_text {
     std::vector<std::pair<size_t, size_t>> spans(const std::vector<size_t> & token_ends) const;
 };
 
+std::string frankie_spoken_numbers(const std::string & text);
+
 // Match HF character offsets, including tokens that split a UTF-8 code point.
 inline std::vector<size_t> frankie_align_text(const std::string & brain, const std::vector<size_t> & brain_ends,
                                             size_t lead, const std::string & spoken, const std::vector<size_t> & talker_ends,

@@ -1468,7 +1468,7 @@ int main(int argc, char ** argv) {
             std::cerr << "Usage: llama-frankie-realtime PACKAGE PORT [--device cpu|gpu] [--threads N]\n"
                          "  [--text-encoder-device cpu|gpu]\n"
                          "  [--ctx-size N] [--cache-type q4_0|q8_0|f16] [--batch-size N] [--ubatch-size N]\n"
-                         "  [--thinking none|minimal|low|medium|high|xhigh|max]\n"
+                         "  [--thinking none|minimal|low|medium|high|xhigh|max] [--speech-context-words N]\n"
                          "  [--mtp-tokens 0..4]\n"
                          "  [--max-utterance-seconds N] [--max-output-audio-seconds N] [--max-output-tokens N|inf]\n"
                          "  [--voice WAV] [--voice-text-file TXT --voice-codes I32]\n"
@@ -1511,6 +1511,7 @@ int main(int argc, char ** argv) {
             else if (key == "--max-output-tokens") { options.max_output_tokens = value == "inf" ? 0 : frankie_unsigned(value); }
             else if (key == "--cache-type") { options.cache_type = value; }
             else if (key == "--thinking") { options.thinking = value; }
+            else if (key == "--speech-context-words") { options.speech_context_words = frankie_unsigned(value); }
             else if (key == "--mtp-tokens") { options.mtp_tokens = frankie_unsigned(value); }
             else if (key == "--ear-model") { options.ear_model = value; }
             else if (key == "--talker-model") { options.talker_model = value; }

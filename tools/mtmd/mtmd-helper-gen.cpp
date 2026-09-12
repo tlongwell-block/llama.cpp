@@ -193,9 +193,11 @@ public:
         reset();
         seq_id = inp->seq_id;
         const bool breeze = info.model_variant && std::string(info.model_variant) == "breeze";
+        if (inp->n_past < 0 || (!breeze && inp->n_past) || uint32_t(inp->n_past) >= llama_n_ctx(lctx)) { return 1; }
+        pos = inp->n_past;
         if (breeze || inp->prompt_embd || inp->n_prompt_embd) {
             if (!breeze || !inp->prompt_embd || !inp->n_prompt_embd ||
-                inp->n_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx), 32768) ||
+                inp->n_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx) - pos, 32768) ||
                 inp->prompt_len || inp->speaker_ref || inp->target_offset || inp->ref_text ||
                 inp->ref_codes || inp->ref_codec_embd || inp->speaker_offset) {
                 LOG_ERR("mtmd_helper_gen_audio: invalid continuous speech prompt\n");
@@ -400,9 +402,9 @@ public:
         mrope = llama_model_rope_type(model) == LLAMA_ROPE_TYPE_MROPE ||
                 llama_model_rope_type(model) == LLAMA_ROPE_TYPE_IMROPE;
         prompt_batch.reset(new decode_embd_batch(prompt_embd_buf.data(), n_prompt, mrope ? 4 : 1, n_embd));
-        if (mrope) prompt_batch->set_position_mrope_1d(0, seq_id);
-        else       prompt_batch->set_position_normal(0, seq_id);
-        prompt_pos = pos = 0;
+        if (mrope) prompt_batch->set_position_mrope_1d(pos, seq_id);
+        else       prompt_batch->set_position_normal(pos, seq_id);
+        prompt_pos = 0;
         const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
         if (!std::isfinite(inp->code_temperature) || inp->code_temperature < 0) { return 1; }
         code_temperature = inp->code_temperature > 0 ? inp->code_temperature : def.temp;
@@ -723,7 +725,7 @@ public:
 
         pack = pockettts_pack(info.model_variant);
 
-        if (inp->target_offset || inp->n_target_offset || inp->ref_text || inp->ref_text_len ||
+        if (inp->n_past || inp->target_offset || inp->n_target_offset || inp->ref_text || inp->ref_text_len ||
             inp->ref_codec_embd || inp->n_ref_codec_embd || inp->ref_codes || inp->n_ref_frames || inp->prime_frames ||
             inp->speaker_offset || inp->n_speaker_offset) {
             LOG_ERR("mtmd_helper_gen_audio: conditioning rows require Qwen3-TTS\n");

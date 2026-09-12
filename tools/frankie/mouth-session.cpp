@@ -13,6 +13,7 @@ mouth_session::mouth_session(const std::string & package, const frankie_options 
     talker_source(package, "talker", config.talker_model),
     mouth_source(package, "mouth", config.mouth_model),
     side_source(package, "side"), options(config) {
+    if (options.speech_context_words > 1000) { throw std::runtime_error("speech context must be zero to 1000 words"); }
     auto mp         = llama_model_default_params();
     mp.n_gpu_layers = options.use_gpu ? 99 : 0;
     model.reset(llama_model_init_from_user(talker_source.metadata(), component::set_tensor, &talker_source, mp));
@@ -52,6 +53,10 @@ mouth_session::mouth_session(const std::string & package, const frankie_options 
     const bool is_breeze = variant >= 0 && gguf_get_kv_type(metadata, variant) == GGUF_TYPE_STRING &&
         std::string(gguf_get_val_str(metadata, variant)) == "breeze";
     if (is_breeze) {
+        const auto key = gguf_find_key(talker_source.metadata(), "qwen3.attention.key_length");
+        const auto head_dim = key >= 0 ? gguf_get_val_u32(talker_source.metadata(), key) :
+            llama_model_n_embd(model.get()) / llama_model_n_head(model.get());
+        speech_row_bytes = size_t(4) * head_dim * llama_model_n_head_kv(model.get()) * llama_model_n_layer(model.get());
         if (!options.voice_codes.empty()) { throw std::runtime_error("Breeze encodes its reference WAV directly; omit --voice-codes"); }
         breeze = std::make_unique<breeze_mouth>(side_source, mouth_source, options, cancelled);
         reference_rms = breeze->reference_rms;
@@ -151,7 +156,18 @@ mouth_session::mouth_session(const std::string & package, const frankie_options 
 std::vector<float> mouth_session::speak(const brain_session::response & response, const audio_callback & on_audio, const brain_session::stage_callback & on_stage) {
     aside_cancelled = true;
     std::lock_guard<std::mutex> lock(execution);
-    return speak_impl(response, on_audio, on_stage, nullptr);
+    try { return speak_impl(response, on_audio, on_stage, nullptr); }
+    catch (...) { clear_speech_context(); throw; }
+}
+
+void mouth_session::clear_speech_context() {
+    speech_words = 0;
+    llama_memory_clear(llama_get_memory(ctx.get()), true);
+}
+
+void mouth_session::reset_speech_context() {
+    std::lock_guard<std::mutex> lock(execution);
+    clear_speech_context();
 }
 
 void mouth_session::warmup() {
@@ -224,7 +240,14 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         if (on_stage) { on_stage("mouth_expression_done"); }
     }
     std::vector<float> target;
-    if (breeze) { target = breeze->conditioning(normalized.text, emotion); }
+    size_t words = 0;
+    if (breeze) {
+        const auto text = frankie_spoken_numbers(normalized.text);
+        const frankie_text_offsets offsets(text);
+        bool space = true;
+        for (bool next : offsets.whitespace) { words += space && !next; space = next; }
+        target = breeze->conditioning(text, emotion);
+    }
     if (side && !style) {
     auto * vocab = llama_model_get_vocab(model.get());
     std::vector<llama_token> ids(normalized.text.size() + 16);
@@ -254,10 +277,17 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         }
     }
     }
-    llama_memory_clear(llama_get_memory(ctx.get()), true);
+    const llama_pos past = llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) + 1;
+    const bool continuing = breeze && !style && options.speech_context_words && speech_words &&
+        words <= options.speech_context_words && speech_words <= options.speech_context_words - words &&
+        breeze->supports_context() && past + target.size() / 2048 + 1 + 512 <= llama_n_ctx(ctx.get());
+    if (!continuing) { clear_speech_context(); }
+    if (breeze) { breeze->prepend_reference(target, continuing); }
+    if (on_stage) { on_stage(continuing ? "mouth_context_reused" : "mouth_context_reset"); }
     auto & gen = *generator;
     mtmd_helper_gen_audio_inp input{};
     input.seq_id        = 0;
+    input.n_past        = continuing ? past : 0;
     if (breeze) {
         input.prompt_embd = target.data();
         input.n_prompt_embd = target.size() / 2048;
@@ -382,6 +412,17 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         throw std::runtime_error("mouth output bounds or unfinished");
     }
     if (rendered.size() != size_t(samples)) { throw std::runtime_error("incomplete rendered PCM"); }
+    const size_t used = llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) + 1;
+    if (breeze && !style && options.speech_context_words && words <= options.speech_context_words &&
+        speech_row_bytes && used <= 100000000 / speech_row_bytes) {
+        speech_words += words;
+    } else {
+        clear_speech_context();
+    }
+    if (breeze && !style && options.speech_context_words) {
+        std::cerr << "Breeze context: rows=" << (speech_words ? used : 0) << " words=" << speech_words
+                  << " bytes=" << (speech_words ? used * speech_row_bytes : 0) << "\n";
+    }
     return rendered;
 }
 

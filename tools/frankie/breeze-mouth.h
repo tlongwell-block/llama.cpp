@@ -78,12 +78,11 @@ class breeze_mouth {
         auto * prefix = tensor("voice.prefix", 2048, 0);
         const auto * values = static_cast<const float *>(prefix->data);
         voice.assign(values, values + ggml_nelements(prefix));
-        if (!options.voice.empty()) {
-            if (!ggml_get_tensor(raw, "voice.eos")) {
-                throw std::runtime_error("Breeze package lacks WAV conditioning assets; rebuild it with convert-breeze.py");
-            }
+        if (ggml_get_tensor(raw, "voice.eos")) {
             const auto * eos = static_cast<const float *>(tensor("voice.eos", 2048, 1)->data);
             voice_eos.assign(eos, eos + 2048);
+        } else if (!options.voice.empty()) {
+            throw std::runtime_error("Breeze package lacks WAV conditioning assets; rebuild it with convert-breeze.py");
         }
         reference_rms = *static_cast<const float *>(tensor("voice.rms", 1, 1)->data);
         if (reference_rms <= 0.0f || reference_rms > 1.0f) { throw std::runtime_error("Breeze voice RMS"); }
@@ -129,11 +128,13 @@ class breeze_mouth {
             instruction += std::string(" with a ") + names[emotion] + " tone";
         }
         const auto prompt = "[S0]<ins_bos>" + instruction + ".<ins_eos>" + text;
-        auto target = encode_text(prompt);
-        std::vector<float> result;
-        result.reserve(voice.size() + target.size());
-        result.insert(result.end(), voice.begin(), voice.end());
-        result.insert(result.end(), target.begin(), target.end());
-        return result;
+        return encode_text(prompt);
+    }
+
+    bool supports_context() const { return voice_eos.size() == 2048; }
+
+    void prepend_reference(std::vector<float> & target, bool continuing) const {
+        const auto & prefix = continuing ? voice_eos : voice;
+        target.insert(target.begin(), prefix.begin(), prefix.end());
     }
 };

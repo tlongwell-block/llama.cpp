@@ -179,6 +179,9 @@ MAKE_TEST(test_frankie_speech_boundary) {
 }
 
 MAKE_TEST(test_frankie_unicode_alignment) {
+    t.assert_equal("bare spoken digit", std::string("four"), frankie_spoken_numbers("4"));
+    t.assert_equal("spoken number in text", std::string("It is fifty-six."), frankie_spoken_numbers("It is 56."));
+    t.assert_equal("preserve identifiers and long digit strings", std::string("Q4 model 123456789012345"), frankie_spoken_numbers("Q4 model 123456789012345"));
     struct fixture {
         std::string text, normalized;
         std::vector<size_t> brain_ends, talker_ends, indices;

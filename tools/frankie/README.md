@@ -4,7 +4,7 @@ This opt-in server runs Frankie's Qwen brain, Parakeet ear, bridges, Qwen3-TTS o
 
 ## Build
 
-ICU development headers are required for NFC speech alignment. No model assets are downloaded by the build.
+ICU development headers and the i18n, uc and data libraries are required for NFC speech alignment and spoken-number normalization. No model assets are downloaded by the build.
 
 ```sh
 # Metal on macOS; use -DICU_ROOT=<prefix> if ICU is outside CMake's search paths.
@@ -121,6 +121,14 @@ For Qwen3-TTS reference-text/codec conditioning as well as the speaker embedding
 ```
 
 The Qwen3-TTS path does not yet encode arbitrary WAVs into ICL codec IDs. WAV-only speaker conditioning is supported; automatic generation of those optional Qwen ICL codes is separate work. Speaker caching uses exact PCM bytes, and expression offsets do not mutate the cached base voice.
+
+### Breeze sentence continuity
+
+Breeze retains the acoustic backbone's evaluated text/audio KV rows between completed speech chunks in one response. Each continuation appends an end-of-speech row and the new text, then uses the existing depth decoder and streaming codec. Previous speech is neither re-encoded nor replayed. This is a runtime change; compatible GGUF weights and custom voice references work without conversion. Qwen3-TTS keeps its existing behavior.
+
+The default `--speech-context-words 100` bounds the retained speech history. Set it to `0` to disable reuse, or choose up to `1000` words. Before a chunk would exceed that word count or the existing 2048-row mouth context, the runtime starts again from the voice reference. It reserves room for the current chunk's maximum audio length. This refreshes whole chunks of history rather than shifting old KV rows. Completed history above 100,000,000 bytes of logical KV state is discarded. The native mouth reuses its fixed KV allocation, so enabling continuity does not allocate another cache; temporary inference buffers are separate from this retained-state limit.
+
+New responses, interruptions, errors and backchannels clear the history. Packages without the Breeze end-of-speech conditioning row use independent chunks. Breeze expands short integer text into English words before its text encoder; conversation transcripts and interruption offsets retain the brain's original text.
 
 ## Quantization and package assembly
 

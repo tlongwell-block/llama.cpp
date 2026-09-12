@@ -240,6 +240,9 @@ struct mtmd_helper_gen_audio_inp {
     // Copied during set_input(); exactly one embedding row. The cached reference remains unmodified.
     const float * speaker_offset;
     size_t        n_speaker_offset; // floats, must equal llama_model_n_embd_inp()
+
+    // Breeze continuous prompts can follow an existing sequence without replaying its KV.
+    llama_pos n_past;
 };
 
 MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(

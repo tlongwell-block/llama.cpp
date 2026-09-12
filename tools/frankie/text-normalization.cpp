@@ -1,8 +1,33 @@
 #include "text-alignment.h"
 
 #include <unicode/normalizer2.h>
+#include <unicode/rbnf.h>
 #include <unicode/uchar.h>
 #include <unicode/unistr.h>
+#include <memory>
+#include <regex>
+
+std::string frankie_spoken_numbers(const std::string & text) {
+    static const std::regex digits("\\b[0-9]{1,14}\\b");
+    std::string result;
+    size_t previous = 0;
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), digits); it != std::sregex_iterator(); ++it) {
+        static thread_local const auto numbers = [] {
+            UErrorCode error = U_ZERO_ERROR;
+            auto value = std::make_unique<icu::RuleBasedNumberFormat>(icu::URBNF_SPELLOUT, icu::Locale::getEnglish(), error);
+            if (U_FAILURE(error)) { throw std::runtime_error("speech number formatter initialization failed"); }
+            return value;
+        }();
+        result.append(text, previous, it->position() - previous);
+        icu::UnicodeString words;
+        icu::FieldPosition position(0);
+        numbers->format(int64_t(std::stoll(it->str())), words, position);
+        words.toUTF8String(result);
+        previous = it->position() + it->length();
+    }
+    result.append(text, previous, text.size() - previous);
+    return result;
+}
 
 frankie_normalized_text::frankie_normalized_text(const std::string & original) {
     const frankie_text_offsets source(original);

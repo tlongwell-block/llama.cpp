@@ -24,12 +24,16 @@ class mouth_session {
     frankie_options                                     options;
     float                                               reference_rms = 0.0f;
     std::mutex execution;
+    size_t speech_words = 0;
+    size_t speech_row_bytes = 0;
+    void clear_speech_context();
     struct plain_style { float gain; float rms_db; int frames; int emotion; bool aside; };
     std::vector<float> speak_impl(const brain_session::response &, const std::function<void(const float *, size_t)> &,
                                   const brain_session::stage_callback &, const plain_style *);
   public:
     std::atomic<bool> aside_cancelled{false};
     void warmup();
+    void reset_speech_context();
     void report_memory() const;
     void speak_backchannel(int reaction, bool strong, const std::function<void(const float *, size_t)> & on_audio);
     std::atomic<bool> cancelled{ false };

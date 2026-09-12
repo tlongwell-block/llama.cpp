@@ -1,6 +1,6 @@
-find_package(ICU REQUIRED COMPONENTS uc)
+find_package(ICU REQUIRED COMPONENTS i18n uc data)
 add_library(frankie-text STATIC text-normalization.cpp)
-target_link_libraries(frankie-text PUBLIC ICU::uc)
+target_link_libraries(frankie-text PUBLIC ICU::i18n ICU::uc ICU::data)
 target_compile_features(frankie-text PRIVATE cxx_std_17)
 if (TARGET test-mtmd-impl)
     target_link_libraries(test-mtmd-impl PRIVATE frankie-text)
