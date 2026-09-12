@@ -7,6 +7,7 @@
 #include "mtmd-ear.h"
 #include "mtmd-helper.h"
 #include "runtime-options.h"
+#include "speculative.h"
 
 #include <array>
 #include <atomic>
@@ -27,17 +28,29 @@ class brain_session {
     llama_model_ptr                                     model;
     mtmd::context_ptr                                   vision;
 
-    struct capture {
-        bool                    enabled = false;
-        size_t                  calls   = 0;
-        std::array<float, 5120> row{};
-    } tap;
-
     llama_context_ptr         ctx;
+    llama_context_ptr         draft_ctx;
+    common_speculative_ptr    speculative;
     common_chat_templates_ptr templates;
-    std::shared_ptr<const std::vector<uint8_t>> checkpoint;
+    struct sequence_state {
+        std::vector<uint8_t> target, draft, boundary;
+        size_t size() const { return target.size() + draft.size() + boundary.size(); }
+    };
+    static constexpr llama_state_seq_flags branch_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    // Device storage is reused: one active branch, with its prefix retained.
+    struct branch_state {
+        std::vector<uint8_t> recurrent, boundary;
+        int pos = 0;
+    };
+    void capture_branch(branch_state & state, int pos);
+    void restore_branch(const branch_state & state);
+    sequence_state capture_sequence();
+    void restore_sequence(const sequence_state & state);
+    void clear_sequence();
+    int decode(const llama_batch & batch);
+    std::shared_ptr<const sequence_state> checkpoint;
     // Only system/tool context may survive a connection; never cache user turns here.
-    std::shared_ptr<const std::vector<uint8_t>> warm_checkpoint;
+    std::shared_ptr<const sequence_state> warm_checkpoint;
     std::string warm_prefix_text;
     int warm_pos = 0;
     size_t warm_used = 0;
@@ -90,8 +103,8 @@ class brain_session {
     void reset(bool preserve_checkpoint = false);
     void report_memory() const;
     struct saved_state {
-        std::vector<uint8_t> sequence;
-        std::shared_ptr<const std::vector<uint8_t>> checkpoint;
+        sequence_state sequence;
+        std::shared_ptr<const sequence_state> checkpoint;
         std::string checkpoint_prefix, cached_prefix, partial_prefix, partial_marker;
         std::vector<float> partial_rows;
         int checkpoint_pos, cached_pos, partial_pos;

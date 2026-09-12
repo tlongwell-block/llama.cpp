@@ -119,6 +119,14 @@ MTMD_API int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
 
 typedef int32_t (*mtmd_helper_post_decode_callback)(struct llama_batch batch, void * user_data);
 
+// As eval_chunks, calling callback after every successful text or media decode.
+// A nonzero callback result stops evaluation and is returned to the caller.
+MTMD_API int32_t mtmd_helper_eval_chunks_with_callback(mtmd_context * ctx,
+        struct llama_context * lctx, const mtmd_input_chunks * chunks,
+        llama_pos n_past, llama_seq_id seq_id, int32_t n_batch, bool logits_last,
+        llama_pos * new_n_past, mtmd_helper_post_decode_callback callback, void * user_data);
+
+
 // helper function to decode an image whose embeddings have already been calculated
 // this helper will handle batching and pre/post decoding setup (for ex. gemma 3 requires non-causal attention)
 // ret 0 on success, -1 on chunk not being a valid image chunk, 1 on decode failure
@@ -199,6 +207,10 @@ struct mtmd_helper_gen_audio_inp {
     const char * prompt;
     size_t       prompt_len;
 
+    // Complete continuous backbone prompt, including reference and control rows.
+    const float * prompt_embd;
+    size_t        n_prompt_embd; // rows of llama_model_n_embd_inp() floats
+
     mtmd_bitmap * speaker_ref; // optional, can be NULL
     const char * lang; // optional, can be NULL
 
@@ -276,6 +288,10 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
 #include <set>
 #include <memory>
 #include <vector>
+
+// Encode an audio reference into conditioning rows. Output is unchanged on failure.
+bool mtmd_helper_encode_audio(mtmd_context * ctx, const mtmd_bitmap * bitmap,
+                              int32_t n_embd, std::vector<float> & output);
 
 // Qwen3-TTS non-streaming ICL body: reference text, target text, EOS, codec BOS, reference codes.
 // Returns false for malformed/non-finite rows or a body exceeding max_rows. Output is unchanged on failure.

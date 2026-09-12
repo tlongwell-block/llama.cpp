@@ -529,6 +529,10 @@ MAKE_TEST(test_ear_reference) {
     std::cout << "ear reference max abs error: " << worst << "\n";
     t.assert_equal("ear frozen reference", true, worst < 1e-4f);
     t.assert_equal("ear repeat", true, output == ear.process(input.data(), 26));
+    std::vector<int32_t> ids;
+    t.assert_equal("ear CTC preserves embeddings", true, output == ear.process(input.data(), 26, &ids));
+    t.assert_equal("ear CTC frame count", size_t(26), ids.size());
+    t.assert_equal("ear CTC ids", true, std::all_of(ids.begin(), ids.end(), [](int32_t id) { return id >= 0 && id < 1025; }));
     const auto single = ear.process(input.data(), 1);
     const auto single_tone = read("tone_single", 5120);
     float single_worst = 0.0f;
@@ -538,13 +542,14 @@ MAKE_TEST(test_ear_reference) {
     }
     std::cout << "ear single-frame max abs error: " << single_worst << "\n";
     t.assert_equal("ear single frame", true, single_worst < 1e-4f);
-    std::vector<float> long_input(1024 * 512);
-    for (size_t i = 0; i < 1024; ++i) { std::copy_n(input.data(), 512, long_input.data() + i * 512); }
-    const auto long_output = ear.process(long_input.data(), 1024);
+    std::vector<float> long_input(1502 * 512);
+    for (size_t i = 0; i < 1502; ++i) { std::copy_n(input.data(), 512, long_input.data() + i * 512); }
+    const auto long_output = ear.process(long_input.data(), 1502);
     float long_worst = 0.0f;
-    for (size_t i = 0; i < 1024 * 5120; ++i) { long_worst = std::max(long_worst, std::abs(long_output[i] - single[i % 5120])); }
+    for (size_t i = 0; i < 1502 * 5120; ++i) { long_worst = std::max(long_worst, std::abs(long_output[i] - single[i % 5120])); }
     t.assert_equal("ear maximum frame batch", true, long_worst < 1e-4f);
-    for (size_t n : {size_t(0), size_t(1025)}) {
+    t.assert_equal("ear short replay after long input", true, output == ear.process(input.data(), 26, &ids));
+    for (size_t n : {size_t(0), size_t(1503)}) {
         bool rejected = false;
         try { ear.process(input.data(), n); } catch (const std::runtime_error &) { rejected = true; }
         t.assert_equal("ear frame bounds", true, rejected);

@@ -156,6 +156,10 @@ MTMD_API bool mtmd_support_vision(const mtmd_context * ctx);
 // whether the current model supports audio input
 MTMD_API bool mtmd_support_audio(const mtmd_context * ctx);
 
+// Release audio-input weights and buffers when no encoding is in flight.
+// Audio generation remains available; subsequent audio-input calls are unsupported.
+MTMD_API void mtmd_release_audio_encoder(mtmd_context * ctx);
+
 // get audio sample rate in Hz, for example 16000 for Whisper
 // return -1 if audio is not supported
 MTMD_API int mtmd_get_audio_sample_rate(const mtmd_context * ctx);

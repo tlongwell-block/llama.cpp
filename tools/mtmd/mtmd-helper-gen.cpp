@@ -21,6 +21,33 @@
 // Audio generation helpers
 //
 
+bool mtmd_helper_encode_audio(mtmd_context * ctx, const mtmd_bitmap * bitmap,
+                              int32_t n_embd, std::vector<float> & output) {
+    if (!ctx || !bitmap || !mtmd_bitmap_is_audio(bitmap) || !mtmd_support_audio(ctx) || n_embd <= 0) {
+        return false;
+    }
+    const std::string marker = mtmd_default_marker();
+    mtmd_input_text text{marker.c_str(), marker.size(), false, true};
+    std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(
+        mtmd_input_chunks_init(), mtmd_input_chunks_free);
+    if (!chunks || mtmd_tokenize(ctx, chunks.get(), &text, &bitmap, 1) != 0) { return false; }
+    std::vector<float> result;
+    for (size_t i = 0; i < mtmd_input_chunks_size(chunks.get()); ++i) {
+        const auto * chunk = mtmd_input_chunks_get(chunks.get(), i);
+        if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) { continue; }
+        if (mtmd_encode_chunk(ctx, chunk) != 0) { return false; }
+        const auto * rows = mtmd_get_output_embd(ctx);
+        const size_t count = size_t(n_embd) * mtmd_input_chunk_get_n_tokens(chunk);
+        if (!rows || !count || !std::all_of(rows, rows + count, [](float x) { return std::isfinite(x); })) {
+            return false;
+        }
+        result.insert(result.end(), rows, rows + count);
+    }
+    if (result.empty()) { return false; }
+    output = std::move(result);
+    return true;
+}
+
 // --tts-lang codes -> language names used by the codec_language special tokens
 static const std::unordered_map<std::string, std::string> tts_lang_codes = {
     { "zh", "chinese"    },
@@ -165,6 +192,26 @@ public:
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
         reset();
         seq_id = inp->seq_id;
+        const bool breeze = info.model_variant && std::string(info.model_variant) == "breeze";
+        if (breeze || inp->prompt_embd || inp->n_prompt_embd) {
+            if (!breeze || !inp->prompt_embd || !inp->n_prompt_embd ||
+                inp->n_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx), 32768) ||
+                inp->prompt_len || inp->speaker_ref || inp->target_offset || inp->ref_text ||
+                inp->ref_codes || inp->ref_codec_embd || inp->speaker_offset) {
+                LOG_ERR("mtmd_helper_gen_audio: invalid continuous speech prompt\n");
+                return 1;
+            }
+            const size_t count = inp->n_prompt_embd * n_embd;
+            if (!std::all_of(inp->prompt_embd, inp->prompt_embd + count, [](float x) { return std::isfinite(x); })) {
+                return 1;
+            }
+            prompt_embd_buf.assign(inp->prompt_embd, inp->prompt_embd + count);
+            n_prompt = inp->n_prompt_embd;
+            codec_0 = 0;
+            codec_eos = 2051;
+            overlay.assign(n_embd, 0.0f);
+            return prepare_prompt(inp);
+        }
         if (!inp->prompt || inp->prompt_len > 131072 || inp->ref_text_len > 131072 ||
             (inp->target_offset == nullptr) != (inp->n_target_offset == 0) ||
             (inp->ref_codec_embd == nullptr) != (inp->n_ref_codec_embd == 0) ||
@@ -305,29 +352,12 @@ public:
 
         n_prompt = (int) prompt.size();
 
-        // the talker uses the qwen3vl interleaved mrope, all sections are equal for a text/codec stream
-        mrope = llama_model_rope_type(model) == LLAMA_ROPE_TYPE_MROPE ||
-                llama_model_rope_type(model) == LLAMA_ROPE_TYPE_IMROPE;
-        const int n_pos_per_embd = mrope ? 4 : 1;
-
         prompt_embd_buf.resize((size_t) n_prompt * (size_t) n_e);
         for (int i = 0; i < n_prompt; i++) {
             memcpy(prompt_embd_buf.data() + (size_t) i * n_e, prompt[(size_t) i].data(), (size_t) n_e * sizeof(float));
         }
 
-        prompt_batch.reset(new decode_embd_batch(prompt_embd_buf.data(), n_prompt, n_pos_per_embd, n_e));
-        if (mrope) prompt_batch->set_position_mrope_1d(0, seq_id);
-        else       prompt_batch->set_position_normal  (0, seq_id);
-        prompt_pos = 0;
-
-        pos = 0;
-        const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
-        if (!std::isfinite(inp->code_temperature) || inp->code_temperature < 0) { return 1; }
-        code_temperature = inp->code_temperature > 0 ? inp->code_temperature : def.temp;
-        top_k = inp->top_k > 0 ? inp->top_k : def.top_k;
-        top_p = inp->top_p > 0 ? inp->top_p : def.top_p;
-        seed  = inp->seed;
-        out_type = inp->out_type;
+        if (prepare_prompt(inp)) { return 1; }
 
         // the prompt above holds the whole text stream up to tts_eos, so every generated
         // frame adds tts_pad on top of the codes embedding
@@ -337,7 +367,8 @@ public:
         if (same_prime) { c2w_state = cached_prime_state; }
         for (size_t start = same_prime ? inp->n_ref_frames : inp->n_ref_frames - inp->prime_frames;
              start < inp->n_ref_frames;) {
-            const size_t frames = std::min(window_frames, inp->n_ref_frames - start);
+            // Bound priming scratch; c2w_state retains the full decoder history.
+            const size_t frames = std::min(size_t(8), inp->n_ref_frames - start);
             std::vector<int32_t> codes(inp->ref_codes + start * 16, inp->ref_codes + (start + frames) * 16);
             auto request = mtmd_gen_inp_default(mctx);
             request.type = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
@@ -362,6 +393,23 @@ public:
             cached_codec_rows.clear();
             cached_prime_state.clear();
         }
+        return 0;
+    }
+
+    int32_t prepare_prompt(const mtmd_helper_gen_audio_inp * inp) {
+        mrope = llama_model_rope_type(model) == LLAMA_ROPE_TYPE_MROPE ||
+                llama_model_rope_type(model) == LLAMA_ROPE_TYPE_IMROPE;
+        prompt_batch.reset(new decode_embd_batch(prompt_embd_buf.data(), n_prompt, mrope ? 4 : 1, n_embd));
+        if (mrope) prompt_batch->set_position_mrope_1d(0, seq_id);
+        else       prompt_batch->set_position_normal(0, seq_id);
+        prompt_pos = pos = 0;
+        const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
+        if (!std::isfinite(inp->code_temperature) || inp->code_temperature < 0) { return 1; }
+        code_temperature = inp->code_temperature > 0 ? inp->code_temperature : def.temp;
+        top_k = inp->top_k > 0 ? inp->top_k : def.top_k;
+        top_p = inp->top_p > 0 ? inp->top_p : def.top_p;
+        seed = inp->seed;
+        out_type = inp->out_type;
         return 0;
     }
 
@@ -527,34 +575,7 @@ private:
             out = cached_speaker_embd;
             return true;
         }
-        if (!mtmd_support_audio(mctx)) {
-            LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
-            return false;
-        }
-        const std::string  marker = mtmd_default_marker();
-        mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
-        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-        const mtmd_bitmap * bptr = bitmap;
-        bool ok = mtmd_tokenize(mctx, chunks, &text, &bptr, 1) == 0;
-        if (ok) {
-            ok = false;
-            for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
-                const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
-                if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-                    continue;
-                }
-                if (mtmd_encode_chunk(mctx, chunk) != 0) {
-                    LOG_ERR("mtmd_helper_gen_audio: speaker encode failed\n");
-                    break;
-                }
-                const float * embd = mtmd_get_output_embd(mctx);
-                const size_t  n = (size_t) llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk);
-                out.assign(embd, embd + n);
-                ok = true;
-                break;
-            }
-        }
-        mtmd_input_chunks_free(chunks);
+        bool ok = mtmd_helper_encode_audio(mctx, bitmap, llama_model_n_embd_inp(model), out);
         if (ok && out.size() == (size_t) n_embd &&
             std::all_of(out.begin(), out.end(), [](float x) { return std::isfinite(x); })) {
             cached_speaker_pcm.assign(samples, samples + bytes);
@@ -1088,35 +1109,7 @@ private:
 
     // runs the reference wav through the mimi encoder, returns one row per 12.5Hz frame
     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
-        if (!mtmd_support_audio(mctx)) {
-            LOG_ERR("mtmd_helper_gen_audio: mmproj has no voice encoder\n");
-            return false;
-        }
-        const std::string  marker = mtmd_default_marker();
-        mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
-        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-        const mtmd_bitmap * bptr = bitmap;
-        bool ok = mtmd_tokenize(mctx, chunks, &text, &bptr, 1) == 0;
-        if (ok) {
-            ok = false;
-            for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
-                const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
-                if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-                    continue;
-                }
-                if (mtmd_encode_chunk(mctx, chunk) != 0) {
-                    LOG_ERR("mtmd_helper_gen_audio: voice encode failed\n");
-                    break;
-                }
-                const float * embd = mtmd_get_output_embd(mctx);
-                const size_t  n = (size_t) llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk);
-                out.assign(embd, embd + n);
-                ok = true;
-                break;
-            }
-        }
-        mtmd_input_chunks_free(chunks);
-        return ok;
+        return mtmd_helper_encode_audio(mctx, bitmap, llama_model_n_embd_inp(model), out);
     }
 
     // decodes the buffered latents, the mimi decoder state carries over between calls

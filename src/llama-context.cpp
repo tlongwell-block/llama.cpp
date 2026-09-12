@@ -1641,7 +1641,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
+int llama_context::decode(const llama_batch & batch_inp, const float * embd_h) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1702,7 +1702,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (embd_h && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || hparams.n_embd_inp() != hparams.n_embd_out())) {
+        LLAMA_LOG_ERROR("%s: separate hidden input requires an MTP context with matching embedding widths\n", __func__);
+        return -1;
+    }
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all, embd_h)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -4253,6 +4257,13 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_mtp(llama_context * ctx, llama_batch batch, const float * hidden) {
+    if (!hidden) {
+        return -1;
+    }
+    return ctx->decode(batch, hidden);
 }
 
 //

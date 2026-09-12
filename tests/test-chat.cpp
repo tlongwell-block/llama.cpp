@@ -3705,6 +3705,23 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // Optional arguments may appear before or between required arguments.
+        tst.test(
+               "<tool_call>\n"
+               "<function=tool_2req_4opt>\n"
+               "<parameter=opt4>\n100\n</parameter>\n"
+               "<parameter=req2>\n42\n</parameter>\n"
+               "<parameter=opt2>\n200\n</parameter>\n"
+               "<parameter=req1>\nhello\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ tool_2req_4opt })
+            .expect_tool_calls({
+                { "tool_2req_4opt", R"({"opt4": 100, "req2": 42, "opt2": 200, "req1": "hello"})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
         // Test flexible optional argument ordering (2 required + 4 optional, reversed optional order)
         tst.test(
                "<tool_call>\n"

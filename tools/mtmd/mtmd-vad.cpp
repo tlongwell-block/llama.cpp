@@ -15,7 +15,7 @@ struct mtmd_vad::impl {
     ggml_context_ptr work;
     ggml_cgraph * graph = nullptr;
     std::unique_ptr<mtmd_backend> backend;
-    ggml_backend_buffer_ptr buffer;
+    ggml_gallocr_ptr allocator;
     ggml_tensor * input = nullptr;
     ggml_tensor * h_in = nullptr;
     ggml_tensor * c_in = nullptr;
@@ -74,9 +74,12 @@ struct mtmd_vad::impl {
         probability = ggml_sigmoid(ctx, ggml_add(ctx,
                 ggml_mul_mat(ctx, ggml_reshape_2d(ctx, weight("final_conv.weight", 1, 128, 1), 128, 1), ggml_relu(ctx, h_out)),
                 weight("final_conv.bias", 1)));
+        ggml_set_input(input);
+        for (auto * tensor : {h_in, c_in}) { ggml_set_input(tensor); ggml_set_output(tensor); }
+        for (auto * tensor : {h_out, c_out, probability}) { ggml_set_output(tensor); }
         graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, probability);
-        buffer = backend->allocate(ctx, graph);
+        allocator = backend->allocate(graph);
     }
 };
 

@@ -447,7 +447,28 @@ static void test_complete_tensor_inventory(const size_t seed) {
             GGML_ASSERT(loaded.saw_bias == (scenario == 3 || scenario == 4));
         }
     }
-    printf("complete tensor inventory: optional, required, type, absent and false cases passed\n");
+    auto mtp_metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    llama_model_saver(LLM_ARCH_QWEN35, mtp_metadata.get()).add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    gguf_context_ptr mtp_inventory(gguf_init_empty());
+    gguf_set_kv(mtp_inventory.get(), mtp_metadata.get());
+    capture mtp_source{mtp_inventory.get(), seed};
+    params.load_mtp = true;
+    baseline.reset(llama_model_init_from_user(mtp_metadata.get(), collect, &mtp_source, params));
+    GGML_ASSERT(baseline && gguf_find_tensor(mtp_inventory.get(), "blk.1.attn_norm.weight") >= 0);
+    baseline.reset();
+    gguf_set_val_bool(mtp_inventory.get(), "general.tensor_inventory_complete", true);
+    gguf_context_ptr loaded_inventory(gguf_init_empty());
+    capture skipped{loaded_inventory.get(), seed};
+    params.load_mtp = false;
+    baseline.reset(llama_model_init_from_user(mtp_inventory.get(), collect, &skipped, params));
+    GGML_ASSERT(baseline);
+    for (int64_t i = 0; i < gguf_get_n_tensors(mtp_inventory.get()); ++i) {
+        const char * name = gguf_get_tensor_name(mtp_inventory.get(), i);
+        if (strncmp(name, "blk.1.", 6) == 0) {
+            GGML_ASSERT(gguf_find_tensor(loaded_inventory.get(), name) < 0);
+        }
+    }
+    printf("complete tensor inventory: optional, required, type, absent, false and skipped MTP cases passed\n");
 }
 
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {

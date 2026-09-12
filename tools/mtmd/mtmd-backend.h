@@ -43,7 +43,8 @@ public:
             if (std::string(t->name).rfind(prefix, 0) != 0) { continue; }
             ggml_set_name(ggml_dup_tensor(weights.get(), t), t->name);
         }
-        buffer = allocate(weights.get());
+        buffer.reset(ggml_backend_alloc_ctx_tensors(weights.get(), backend.get()));
+        if (!buffer) { throw std::runtime_error("cannot allocate component weights"); }
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::fprintf(stderr, "memory component=%s backend=%s weights=%zu\n", name.c_str(), ggml_backend_name(backend.get()), ggml_backend_buffer_get_size(buffer.get()));
         for (auto * t = ggml_get_first_tensor(source); t; t = ggml_get_next_tensor(source, t)) {
@@ -54,22 +55,22 @@ public:
 
     ggml_context * context() const { return weights.get(); }
 
-    ggml_backend_buffer_ptr allocate(ggml_context * ctx, ggml_cgraph * graph = nullptr) {
-        ggml_backend_buffer_ptr result(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
-        if (!result) { throw std::runtime_error("cannot allocate component tensors"); }
-        if (ctx != weights.get()) {
-            const auto bytes = ggml_backend_buffer_get_size(result.get());
-            if (bytes > peak_graph_bytes) {
-                peak_graph_bytes = bytes;
-                std::fprintf(stderr, "memory component=%s backend=%s peak_graph_buffer=%zu\n", name.c_str(), ggml_backend_name(backend.get()), bytes);
-            }
-        }
-        for (int i = 0; graph && i < ggml_graph_n_nodes(graph); ++i) {
+    ggml_gallocr_ptr allocate(ggml_cgraph * graph) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             auto * node = ggml_graph_node(graph, i);
             if (node->op == GGML_OP_MUL_MAT) { ggml_prec_set_src(node, GGML_PREC_F32, 1); }
             if (!ggml_backend_supports_op(backend.get(), node)) {
                 throw std::runtime_error(std::string("component backend does not support ") + ggml_op_name(node->op));
             }
+        }
+        ggml_gallocr_ptr result(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())));
+        if (!result || !ggml_gallocr_alloc_graph(result.get(), graph)) {
+            throw std::runtime_error("cannot allocate component graph");
+        }
+        const auto bytes = ggml_gallocr_get_buffer_size(result.get(), 0);
+        if (bytes > peak_graph_bytes) {
+            peak_graph_bytes = bytes;
+            std::fprintf(stderr, "memory component=%s backend=%s peak_graph_buffer=%zu\n", name.c_str(), ggml_backend_name(backend.get()), bytes);
         }
         return result;
     }

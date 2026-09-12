@@ -59,6 +59,7 @@ std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames, std:
     if (!work) { throw std::runtime_error("cannot allocate ear graph"); }
     auto * ctx = work.get();
     auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n_frames);
+    ggml_set_input(input);
     auto * probs = ggml_soft_max(ctx, data->linear(ctx, "ear.ctc", input, 1025));
     auto * ids = ctc_ids ? ggml_argmax(ctx, probs) : nullptr;
     auto * rows = ggml_add(ctx, ggml_mul_mat(ctx, data->weight("ear.proj.weight", 1025, 5120), probs), data->residual(ctx, "ear", input));
@@ -74,10 +75,12 @@ std::vector<float> mtmd_ear::process(const float * frames, size_t n_frames, std:
     auto * word = ggml_cont(ctx, ggml_transpose(ctx, data->weight("ear_tone.word_emb", 5120, 6)));
     auto * tone = ggml_add(ctx, ggml_mul_mat(ctx, word, tone_probs), data->residual(ctx, "ear_tone", pool));
     auto * output = ggml_concat(ctx, rows, ggml_reshape_2d(ctx, tone, 5120, 1), 1);
+    ggml_set_output(output);
+    if (ids) { ggml_set_output(ids); }
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
     if (ids) { ggml_build_forward_expand(graph, ids); }
-    auto buffer = data->backend.allocate(ctx, graph);
+    auto allocator = data->backend.allocate(graph);
     ggml_backend_tensor_set(input, frames, 0, n_frames * 512 * sizeof(float));
     data->backend.compute(graph);
     if (ids) { ctc_ids->resize(n_frames); ggml_backend_tensor_get(ids, ctc_ids->data(), 0, n_frames * sizeof(int32_t)); }

@@ -6,6 +6,10 @@
 ggml_tensor * clip_graph_qwen3tts_gen::code_gen::do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const {
     logits = ggml_reshape_1d(ctx0, logits, ggml_nelements(logits));
     const int64_t n_vocab = logits->ne[0];
+    if (hparams.gen_model_variant == "breeze") {
+        auto * keep = ggml_step(ctx0, ggml_arange(ctx0, 0, (float) n_vocab, 1));
+        logits = ggml_add(ctx0, logits, ggml_log(ctx0, keep));
+    }
 
     // sort a's rows by idx
     auto sort_by = [this](ggml_tensor * a, ggml_tensor * idx) {
@@ -152,14 +156,16 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::layer_forward(
     q = ggml_reshape_3d(ctx0, q, d_head, n_head, 1);
     k = ggml_reshape_3d(ctx0, k, d_head, n_head_kv, 1);
 
-    q = ggml_rms_norm(ctx0, q, hparams.eps);
-    q = ggml_mul(ctx0, q, layer.q_norm);
-    k = ggml_rms_norm(ctx0, k, hparams.eps);
-    k = ggml_mul(ctx0, k, layer.k_norm);
+    if (layer.q_norm) {
+        q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, hparams.eps), layer.q_norm);
+    }
+    if (layer.k_norm) {
+        k = ggml_mul(ctx0, ggml_rms_norm(ctx0, k, hparams.eps), layer.k_norm);
+    }
 
-    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
+    q = ggml_rope_ext(ctx0, q, inp_pos, model.gen_code_rope_freqs, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    k = ggml_rope_ext(ctx0, k, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
+    k = ggml_rope_ext(ctx0, k, inp_pos, model.gen_code_rope_freqs, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
     // write k/v into the cache at row pos, flat layout

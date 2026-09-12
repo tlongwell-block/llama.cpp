@@ -19,7 +19,7 @@ struct mtmd_turn::impl {
     int valid = 0;
     mtmd_backend backend;
     ggml_context_ptr work;
-    ggml_backend_buffer_ptr buffer;
+    ggml_gallocr_ptr allocator;
     ggml_cgraph * graph = nullptr;
     std::array<ggml_tensor *, 2> input{}, features{};
     std::array<mtmd_lstm_state, 2> initial{}, final{};
@@ -71,9 +71,18 @@ struct mtmd_turn::impl {
             auto * now = ggml_mul_mat(ctx, w("now.weight", 256, 2), probabilities);
             probabilities = ggml_div(ctx, now, ggml_scale_bias(ctx, ggml_sum_rows(ctx, now), 1.0f, 1e-5f));
         }
+        ggml_set_input(mask);
+        for (int channel = 0; channel < 2; ++channel) {
+            ggml_set_input(input[channel]);
+            for (auto * tensor : {initial[channel].h, initial[channel].c}) { ggml_set_input(tensor); ggml_set_output(tensor); }
+            for (auto * tensor : {final[channel].h, final[channel].c, features[channel]}) { ggml_set_output(tensor); }
+        }
+        ggml_set_output(combined);
+        ggml_set_output(probabilities);
         graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_build_forward_expand(graph, probabilities);
-        buffer = backend.allocate(ctx, graph);
+        for (const auto & cache : caches) { ggml_build_forward_expand(graph, cache.out); }
+        allocator = backend.allocate(graph);
     }
 
     ggml_tensor * linear(ggml_tensor * x, const std::string & prefix, int in, int out) {
@@ -128,8 +137,12 @@ struct mtmd_turn::impl {
     ggml_tensor * remember(ggml_tensor * current) {
         auto * ctx = work.get();
         auto * past = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, retained);
+        ggml_set_input(past);
+        ggml_set_output(past);
         auto * joined = ggml_concat(ctx, past, current, 1);
+        ggml_set_output(joined);
         auto * kept = ggml_view_2d(ctx, joined, dim, retained, joined->nb[1], frames * joined->nb[1]);
+        ggml_set_output(kept);
         caches.push_back({past, kept});
         return joined;
     }

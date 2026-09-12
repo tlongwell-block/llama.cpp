@@ -1020,6 +1020,39 @@ static void test_permute(testing & t) {
         }
     });
 
+    t.test("optional arguments interleave required arguments", [&](testing & t) {
+        auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+            return p.permute("ab", { p.literal("a"), p.literal("b") }, { p.literal("x"), p.literal("y") }) + p.end();
+        });
+        for (const std::string input : { "ab", "ba", "xayb", "ybxa", "abxy", "xyab" }) {
+            t.assert_true("accepts " + input, accepts(parser, input));
+        }
+        for (const std::string input : { "", "x", "ax", "yb", "xaaby", "abz" }) {
+            t.assert_true("rejects missing, duplicate or unknown required argument " + input, !accepts(parser, input));
+        }
+    });
+
+    t.test("tagged arguments reject duplicate names", [&](testing & t) {
+        auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+            auto arg = p.tool_arg(p.tool_arg_name(p.literal("x")) + p.tool_arg_string_value(p.literal("v")));
+            return p.tool_open(p.literal("(")) + p.tool_name(p.literal("f")) +
+                   p.zero_or_more(arg) + p.tool_close(p.literal(")")) + p.end();
+        });
+        for (const std::string input : { "(fxv)", "(fxvxv)" }) {
+            common_peg_parse_context ctx(input);
+            auto result = parser.parse(ctx);
+            t.assert_true("syntax parsed", result.success());
+            common_chat_msg msg;
+            bool rejected = false;
+            try {
+                common_chat_peg_mapper(msg).from_ast(ctx.ast, result);
+            } catch (const std::runtime_error & e) {
+                rejected = std::string(e.what()).find("duplicate tool argument") != std::string::npos;
+            }
+            t.assert_equal("only duplicates rejected", input == "(fxvxv)", rejected);
+        }
+    });
+
     t.test("single element", [&](testing & t) {
         auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
             return p.permute("a", { p.literal("a") }) + p.end();

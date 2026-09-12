@@ -99,7 +99,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     constexpr uint32_t  n_seqs     = 2;
     constexpr uint32_t  n_ubatch   = 16;
     constexpr uint32_t  n_prompt   = 19;
-    constexpr uint32_t  n_rollback = 3;
+    constexpr uint32_t  n_rollback = 4;
     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
     constexpr llama_pos p0         = n_prompt - n_rollback;
 
@@ -138,18 +138,23 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
     bool ok = true;
 
-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
-    // the tail, which is then rolled back so its restore is pending at replay
+    // Even batch sizes keep both contexts on the same vector dot kernels.
+    // The branch batch includes retained tokens before the rejected tail.
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
+        for (llama_pos pos = 0; pos < (llama_pos) p0 - 4; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         ok = ok && llama_decode(ctx_ref,  batch) == 0;
 
         common_batch_clear(batch);
-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
+        for (llama_pos pos = p0 - 4; pos < p0; ++pos) {
+            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+        }
+        ok = ok && llama_decode(ctx_ref, batch) == 0;
+        common_batch_clear(batch);
+        for (llama_pos pos = p0 - 4; pos < (llama_pos) n_prompt; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
@@ -353,6 +358,13 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         return 1;
     }
 
+    // Rebuild one full batch; snapshots do not span separate decode calls.
+    llama_memory_clear(llama_get_memory(ctx_src), true);
+    llama_memory_clear(llama_get_memory(ctx_dst), true);
+    if (!decode_tokens(ctx_src, tokens, n_tokens) || !decode_tokens(ctx_dst, tokens, n_tokens)) {
+        fprintf(stderr, "prompt rebuild failed\n");
+        return 1;
+    }
     if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
         !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
         fprintf(stderr, "%s : partial rollback failed\n", __func__);

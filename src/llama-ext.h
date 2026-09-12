@@ -107,6 +107,11 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Decode an MTP batch with separate preceding target hidden states. Unlike the
+// legacy token+embd convention, batch.embd remains the actual multimodal input.
+// hidden contains n_tokens rows of llama_model_n_embd_out(model) floats, in batch order.
+LLAMA_API int32_t llama_decode_mtp(struct llama_context * ctx, struct llama_batch batch, const float * hidden);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

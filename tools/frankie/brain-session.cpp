@@ -42,13 +42,15 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     weights.reset();
     auto mp         = llama_model_default_params();
     mp.n_gpu_layers = options.use_gpu ? 99 : 0;
+    mp.load_mtp = options.mtp_tokens != 0;
     model.reset(llama_model_init_from_user(brain_source.metadata(), component::set_tensor, &brain_source, mp));
     if (!model) {
         throw std::runtime_error("brain load failed");
     }
     auto cp              = llama_context_default_params();
     cp.n_ctx             = context_tokens();
-    cp.n_seq_max         = 2;
+    cp.n_seq_max         = 1;
+    cp.n_rs_seq          = options.mtp_tokens;
     cp.kv_unified        = true;
     cp.type_k            = options.cache_type == "q4_0" ? GGML_TYPE_Q4_0 : options.cache_type == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
     cp.type_v            = cp.type_k;
@@ -59,22 +61,9 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     cp.n_ubatch          = options.ubatch_size ? options.ubatch_size : std::min(cp.n_batch, options.use_gpu ? 512u : 128u);
     cp.n_threads         = options.threads;
     cp.n_threads_batch   = options.threads;
-    cp.cb_eval_user_data = &tap;
-    cp.cb_eval           = [](ggml_tensor * t, bool ask, void * user) {
-        auto & tap    = *static_cast<capture *>(user);
-        bool   wanted = tap.enabled && std::strcmp(ggml_get_name(t), "l_out-16") == 0;
-        if (ask) {
-            return wanted;
-        }
-        if (wanted) {
-            if (t->type != GGML_TYPE_F32 || ggml_nelements(t) != 5120 || !ggml_is_contiguous(t)) {
-                return false;
-            }
-            ggml_backend_tensor_get(t, tap.row.data(), 0, sizeof(tap.row));
-            ++tap.calls;
-        }
-        return true;
-    };
+    if (options.mtp_tokens && (cp.n_batch <= options.mtp_tokens || cp.n_ubatch <= options.mtp_tokens)) {
+        throw std::runtime_error("MTP requires batch and ubatch larger than the draft length");
+    }
     cp.abort_callback = [](void * user) {
         return static_cast<brain_session *>(user)->cancelled.load();
     };
@@ -85,6 +74,27 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     if (!ctx) {
         throw std::runtime_error("brain context failed");
     }
+    if (options.mtp_tokens) {
+        if (!llama_model_n_layer_nextn(model.get())) {
+            throw std::runtime_error("MTP requested but the brain component contains no MTP head");
+        }
+        auto dp = cp;
+        dp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        dp.ctx_other = ctx.get();
+        dp.n_rs_seq = 0;
+        draft_ctx.reset(llama_init_from_model(model.get(), dp));
+        if (!draft_ctx) { throw std::runtime_error("MTP context failed"); }
+        common_params_speculative sp;
+        sp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        sp.draft.ctx_tgt = ctx.get();
+        sp.draft.ctx_dft = draft_ctx.get();
+        sp.draft.n_max = options.mtp_tokens;
+        sp.draft.n_min = 1;
+        sp.draft.p_min = 0.0f;
+        speculative.reset(common_speculative_init(sp, 1));
+        if (!speculative) { throw std::runtime_error("MTP initialization failed"); }
+    }
+    llama_set_embeddings_layer_inp(ctx.get(), 17, true);
     auto vp                   = mtmd_context_params_default();
     vp.use_gpu                = options.use_gpu;
     vp.n_threads              = options.threads;
@@ -190,7 +200,7 @@ void brain_session::decode_text(const std::string & text, int & pos, size_t & us
             batch.seq_id[i][0] = 0;
             batch.logits[i]    = (start + i == n - 1);
         }
-        int rc = llama_decode(ctx.get(), batch);
+        int rc = decode(batch);
         llama_batch_free(batch);
         if (rc) {
             throw std::runtime_error("text decode failed");
@@ -216,35 +226,102 @@ void brain_session::reset(bool preserve_checkpoint) {
         checkpoint.reset();
         checkpoint_prefix.clear();
     }
+    clear_sequence();
+}
+
+int brain_session::decode(const llama_batch & batch) {
+    const int rc = llama_decode(ctx.get(), batch);
+    if (!rc && speculative && !common_speculative_process(speculative.get(), batch)) {
+        return -1;
+    }
+    return rc;
+}
+
+void brain_session::capture_branch(branch_state & state, int pos) {
+    const size_t size = llama_state_seq_get_size_ext(ctx.get(), 0, branch_flags);
+    state.recurrent.resize(size);
+    if (!size || llama_state_seq_get_data_ext(ctx.get(), state.recurrent.data(), size, 0, branch_flags) != size ||
+        (speculative && !common_speculative_get_state(speculative.get(), 0, state.boundary))) {
+        throw std::runtime_error("branch checkpoint capture failed");
+    }
+    state.pos = pos;
+}
+
+void brain_session::restore_branch(const branch_state & state) {
+    // Restore recurrent state before removing the branch's attention suffix.
+    if (llama_state_seq_set_data_ext(ctx.get(), state.recurrent.data(), state.recurrent.size(), 0, branch_flags) != state.recurrent.size() ||
+        !llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, state.pos, -1)) {
+        throw std::runtime_error("branch checkpoint restore failed");
+    }
+    if (speculative) {
+        if (!llama_memory_seq_rm(llama_get_memory(draft_ctx.get()), 0, state.pos, -1)) {
+            throw std::runtime_error("branch draft rollback failed");
+        }
+        common_speculative_set_state(speculative.get(), 0, state.boundary);
+    }
+}
+
+brain_session::sequence_state brain_session::capture_sequence() {
+    sequence_state state;
+    auto capture = [](llama_context * context, std::vector<uint8_t> & bytes) {
+        const size_t size = llama_state_seq_get_size(context, 0);
+        if (!size || size > size_t(16) * 1024 * 1024 * 1024) {
+            throw std::runtime_error("sequence checkpoint size limit");
+        }
+        bytes.resize(size);
+        if (llama_state_seq_get_data(context, bytes.data(), size, 0) != size) {
+            throw std::runtime_error("sequence checkpoint capture failed");
+        }
+    };
+    capture(ctx.get(), state.target);
+    if (speculative) {
+        capture(draft_ctx.get(), state.draft);
+        if (!common_speculative_get_state(speculative.get(), 0, state.boundary)) {
+            throw std::runtime_error("MTP checkpoint capture failed");
+        }
+    }
+    return state;
+}
+
+void brain_session::clear_sequence() {
     llama_memory_clear(llama_get_memory(ctx.get()), true);
+    if (speculative) {
+        llama_memory_clear(llama_get_memory(draft_ctx.get()), true);
+        common_speculative_set_state(speculative.get(), 0, {});
+    }
+}
+
+void brain_session::restore_sequence(const sequence_state & state) {
+    clear_sequence();
+    auto restore = [](llama_context * context, const std::vector<uint8_t> & bytes) {
+        if (llama_state_seq_set_data(context, bytes.data(), bytes.size(), 0) != bytes.size()) {
+            throw std::runtime_error("sequence checkpoint restore failed");
+        }
+    };
+    restore(ctx.get(), state.target);
+    if (speculative) {
+        restore(draft_ctx.get(), state.draft);
+        common_speculative_set_state(speculative.get(), 0, state.boundary);
+    }
+    if (std::getenv("FRANKIE_VERIFY_ROLLBACK")) {
+        const auto actual = capture_sequence();
+        if (actual.target != state.target || actual.draft != state.draft || actual.boundary != state.boundary) {
+            throw std::runtime_error("sequence checkpoint readback mismatch");
+        }
+        std::cerr << "recurrent_rollback_verified bytes=" << state.size() << "\n";
+    }
 }
 
 void brain_session::save_checkpoint(const std::string & prefix, int pos, size_t used) {
-    const size_t checkpoint_size = llama_state_seq_get_size(ctx.get(), 0);
-    if (checkpoint_size == 0 || checkpoint_size > size_t(16) * 1024 * 1024 * 1024) {
-        throw std::runtime_error("recurrent checkpoint size limit");
-    }
-    std::vector<uint8_t> next_checkpoint(checkpoint_size);
-    if (llama_state_seq_get_data(ctx.get(), next_checkpoint.data(), next_checkpoint.size(), 0) != checkpoint_size) {
-        throw std::runtime_error("recurrent checkpoint capture failed");
-    }
-    checkpoint = std::make_shared<const std::vector<uint8_t>>(std::move(next_checkpoint));
+    checkpoint = std::make_shared<const sequence_state>(capture_sequence());
     checkpoint_prefix = prefix;
     checkpoint_pos = pos;
     checkpoint_used = used;
 }
 
 brain_session::saved_state brain_session::suspend_state() {
-    llama_synchronize(ctx.get());
-    const size_t size = llama_state_seq_get_size(ctx.get(), 0);
-    if (!size || size > size_t(16) * 1024 * 1024 * 1024) {
-        throw std::runtime_error("speculative checkpoint size limit");
-    }
     saved_state saved;
-    saved.sequence.resize(size);
-    if (llama_state_seq_get_data(ctx.get(), saved.sequence.data(), size, 0) != size) {
-        throw std::runtime_error("speculative checkpoint capture failed");
-    }
+    saved.sequence = capture_sequence();
     // Speculation also needs this immutable prefix; sharing avoids a large copy.
     saved.checkpoint = checkpoint;
     saved.checkpoint_prefix = checkpoint_prefix;
@@ -271,27 +348,15 @@ brain_session::listener_reaction brain_session::probe_listener(const request & i
     const auto marker = formatted.prompt.find(partial_marker);
     if (marker == std::string::npos) { throw std::runtime_error("listener probe has no active audio marker"); }
     const std::string ask = "\n(You are listening while the user is still talking. Which one-word listener reaction fits what they have said so far? Answer with exactly one of: Hmm, Yeah, Wow, Aw, Nothing.)";
-    auto memory = llama_get_memory(ctx.get());
-    llama_synchronize(ctx.get());
-    std::vector<uint8_t> expected;
-    if (std::getenv("FRANKIE_VERIFY_ROLLBACK")) {
-        expected.resize(llama_state_seq_get_size(ctx.get(), 0));
-        if (llama_state_seq_get_data(ctx.get(), expected.data(), expected.size(), 0) != expected.size()) {
-            throw std::runtime_error("listener rollback capture failed");
-        }
-    }
-    // Unified KV shares the prefix cells. The recurrent backend preserves the
-    // second sequence's state when sequence zero advances, without host copies.
-    llama_memory_seq_rm(memory, 1, -1, -1);
-    llama_memory_seq_cp(memory, 0, 1, -1, -1);
+    const bool verify = std::getenv("FRANKIE_VERIFY_ROLLBACK") != nullptr;
+    const auto expected = verify ? capture_sequence() : sequence_state{};
+    branch_state branch;
+    capture_branch(branch, partial_pos);
     auto restore = [&] {
-        llama_synchronize(ctx.get());
-        if (!llama_memory_seq_rm(memory, 0, -1, -1)) { throw std::runtime_error("listener branch removal failed"); }
-        llama_memory_seq_cp(memory, 1, 0, -1, -1);
-        llama_memory_seq_rm(memory, 1, -1, -1);
-        if (!expected.empty()) {
-            std::vector<uint8_t> actual(expected.size());
-            if (llama_state_seq_get_data(ctx.get(), actual.data(), actual.size(), 0) != actual.size() || actual != expected) {
+        restore_branch(branch);
+        if (verify) {
+            const auto actual = capture_sequence();
+            if (actual.target != expected.target || actual.draft != expected.draft || actual.boundary != expected.boundary) {
                 throw std::runtime_error("listener sequence rollback mismatch");
             }
             std::cerr << "listener_rollback_verified bytes=" << actual.size() << "\n";
@@ -301,7 +366,6 @@ brain_session::listener_reaction brain_session::probe_listener(const request & i
     try {
         int pos = partial_pos;
         size_t used = partial_used;
-        tap.enabled = false;
         decode_text(ask + formatted.prompt.substr(marker + partial_marker.size()), pos, used);
         const char * words[] = {"Hmm", "Yeah", "Wow", "Aw", "Nothing"};
         const auto * logits = llama_get_logits_ith(ctx.get(), -1);
@@ -328,19 +392,7 @@ brain_session::listener_reaction brain_session::probe_listener(const request & i
 }
 
 void brain_session::restore_state(saved_state saved) {
-    llama_memory_clear(llama_get_memory(ctx.get()), true);
-    if (llama_state_seq_set_data(ctx.get(), saved.sequence.data(), saved.sequence.size(), 0) != saved.sequence.size()) {
-        reset();
-        throw std::runtime_error("speculative recurrent restore failed");
-    }
-    if (std::getenv("FRANKIE_VERIFY_ROLLBACK")) {
-        std::vector<uint8_t> observed(saved.sequence.size());
-        if (llama_state_seq_get_data(ctx.get(), observed.data(), observed.size(), 0) != observed.size() || observed != saved.sequence) {
-            reset();
-            throw std::runtime_error("recurrent rollback readback mismatch");
-        }
-        std::cerr << "recurrent_rollback_verified bytes=" << observed.size() << "\n";
-    }
+    restore_sequence(saved.sequence);
     checkpoint = std::move(saved.checkpoint);
     checkpoint_prefix = std::move(saved.checkpoint_prefix);
     checkpoint_pos = saved.checkpoint_pos;
@@ -375,13 +427,10 @@ void brain_session::warm_prefix(common_chat_templates_inputs input) {
         throw std::runtime_error("formatted prefix too large");
     }
     reset();
-    tap.enabled = false;
     int pos = 0;
     size_t used = 0;
     if (warm_checkpoint && warm_prefix_text == formatted.prompt) {
-        if (llama_state_seq_set_data(ctx.get(), warm_checkpoint->data(), warm_checkpoint->size(), 0) != warm_checkpoint->size()) {
-            throw std::runtime_error("system prefix cache restore failed");
-        }
+        restore_sequence(*warm_checkpoint);
         pos = warm_pos; used = warm_used;
         checkpoint = warm_checkpoint;
         checkpoint_prefix = formatted.prompt; checkpoint_pos = pos; checkpoint_used = used;
@@ -445,19 +494,23 @@ void brain_session::decode_rows(const std::vector<float> & rows, size_t start, s
         throw std::runtime_error("audio context/row bounds");
     }
     used += end - start;
-    for (; start < end; start += 128) {
+    const size_t batch_size = std::min(128u, llama_n_batch(ctx.get()));
+    for (; start < end; start += batch_size) {
         if (cancelled.load()) { throw std::runtime_error("cancelled"); }
-        const int count = std::min(size_t(128), end - start);
+        const int count = std::min(batch_size, end - start);
         auto batch = llama_batch_init(count, 5120, 1);
         batch.n_tokens = count;
+        std::free(batch.pos);
+        batch.pos = static_cast<llama_pos *>(std::malloc(4 * count * sizeof(llama_pos)));
         std::memcpy(batch.embd, rows.data() + start * 5120, count * 5120 * sizeof(float));
         for (int i = 0; i < count; ++i) {
-            batch.pos[i] = pos++;
+            for (int axis = 0; axis < 4; ++axis) { batch.pos[axis * count + i] = pos; }
+            ++pos;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
             batch.logits[i] = false;
         }
-        const int rc = llama_decode(ctx.get(), batch);
+        const int rc = decode(batch);
         llama_batch_free(batch);
         if (rc) { throw std::runtime_error("audio decode failed"); }
     }
@@ -465,7 +518,6 @@ void brain_session::decode_rows(const std::vector<float> & rows, size_t start, s
 
 void brain_session::prefill(const request & request, const std::string & prompt, int & pos, size_t & used,
                             const std::string & stop_marker, size_t stop_rows, const stage_callback & on_stage) {
-    tap.enabled = false;
     size_t offset = 0;
     const auto & audio_rows = request.audio_rows;
     const bool partial = !partial_marker.empty() && prompt.compare(0, partial_prefix.size(), partial_prefix) == 0 &&
@@ -485,16 +537,13 @@ void brain_session::prefill(const request & request, const std::string & prompt,
         used = cached_used;
     } else if (checkpoint && prompt.compare(0, checkpoint_prefix.size(), checkpoint_prefix) == 0 &&
                frankie_token_boundary(vocab, prompt, checkpoint_prefix.size())) {
-        llama_memory_clear(llama_get_memory(ctx.get()), true);
-        if (llama_state_seq_set_data(ctx.get(), checkpoint->data(), checkpoint->size(), 0) != checkpoint->size()) {
-            throw std::runtime_error("recurrent checkpoint restore failed");
-        }
+        restore_sequence(*checkpoint);
         if (on_stage) { on_stage("cache_checkpoint_restore"); }
         offset = checkpoint_prefix.size();
         pos = checkpoint_pos;
         used = checkpoint_used;
     } else {
-        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        clear_sequence();
         if (on_stage) { on_stage("cache_replay"); }
     }
     cache_valid = false;
@@ -523,7 +572,12 @@ void brain_session::prefill(const request & request, const std::string & prompt,
             if (used + 512 > context_tokens()) {
                 throw std::runtime_error("image context exhausted");
             }
-            if (mtmd_helper_eval_chunks(vision.get(), ctx.get(), chunks.get(), pos, 0, 128, false, &pos)) {
+            if (mtmd_helper_eval_chunks_with_callback(vision.get(), ctx.get(), chunks.get(), pos, 0,
+                    std::min(128u, llama_n_batch(ctx.get())), false, &pos,
+                    [](llama_batch batch, void * user) {
+                        auto * self = static_cast<brain_session *>(user);
+                        return self->speculative && !common_speculative_process(self->speculative.get(), batch) ? -1 : 0;
+                    }, this)) {
                 throw std::runtime_error("image evaluation failed");
             }
             offset = end + 1;
@@ -567,7 +621,6 @@ void brain_session::precommit(const request & input, const std::string & marker,
     int pos = 0;
     size_t used = 0;
     try {
-        tap.enabled = false;
         prefill(snapshot, formatted.prompt, pos, used, marker, count, {});
         llama_synchronize(ctx.get());
         partial_rows.resize(count * 5120);
@@ -666,62 +719,91 @@ brain_session::response brain_session::generate(const request & request, const s
         parser.parser.load(formatted.parser);
     }
     bool finished = false;
-    size_t answer_tokens = 0, generated_tokens = 0;
+    size_t answer_tokens = 0, generated_tokens = 0, drafted_tokens = 0, accepted_tokens = 0;
     const size_t maximum = std::min(context_tokens() - used,
         request.answer_limit ? size_t(request.answer_limit) + request.reasoning_budget + 16 : context_tokens());
-    for (size_t i = 0; i < maximum; ++i) {
-        if (cancelled.load()) {
-            throw std::runtime_error("cancelled");
-        }
-        llama_token token = common_sampler_sample(sampler.get(), ctx.get(), -1);
-        common_sampler_accept(sampler.get(), token, true);
-        if (i == 0 && on_stage) { on_stage("brain_first_token"); }
-        auto * vocab = llama_model_get_vocab(model.get());
-        if (llama_vocab_is_eog(vocab, token)) {
-            finished = true;
-            break;
-        }
-        char buf[512];
-        int  n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
-        if (n < 0) {
-            throw std::runtime_error("token piece overflow");
-        }
-        tap.enabled        = true;
-        tap.calls          = 0;
-        auto batch         = llama_batch_init(1, 0, 1);
-        batch.n_tokens     = 1;
-        batch.token[0]     = token;
-        batch.pos[0]       = pos++;
-        batch.n_seq_id[0]  = 1;
-        batch.seq_id[0][0] = 0;
-        batch.logits[0]    = true;
-        int rc             = llama_decode(ctx.get(), batch);
-        llama_batch_free(batch);
-        llama_synchronize(ctx.get());
-        tap.enabled = false;
-        if (rc || tap.calls != 1) {
-            throw std::runtime_error("generation/tap failed");
-        }
-        for (float v : tap.row) {
-            if (!std::isfinite(v)) {
-                throw std::runtime_error("nonfinite hidden state");
+    const auto * vocab = llama_model_get_vocab(model.get());
+    llama_token pending = common_sampler_sample(sampler.get(), ctx.get(), -1);
+    common_sampler_accept(sampler.get(), pending, true);
+    if (on_stage) { on_stage("brain_first_token"); }
+    const llama_tokens prompt_unused;
+    while (generated_tokens < maximum) {
+        if (cancelled.load()) { throw std::runtime_error("cancelled"); }
+        if (llama_vocab_is_eog(vocab, pending)) { finished = true; break; }
+        llama_tokens draft;
+        if (speculative && generated_tokens + 1 < maximum) {
+            common_speculative_get_draft_params(speculative.get(), 0) = {
+                true, int32_t(std::min<size_t>(options.mtp_tokens, maximum - generated_tokens - 1)),
+                pos, pending, &prompt_unused, &draft,
+            };
+            common_speculative_draft(speculative.get());
+            // An EOG is sampled by the target, never committed as a speech row.
+            draft.erase(std::find_if(draft.begin(), draft.end(), [&](llama_token t) {
+                return llama_vocab_is_eog(vocab, t);
+            }), draft.end());
+            if (!llama_memory_seq_rm(llama_get_memory(draft_ctx.get()), 0, pos, -1)) {
+                throw std::runtime_error("MTP draft rollback failed");
             }
         }
-        result.raw.text.append(buf, n);
-        ++generated_tokens;
-        result.message = common_chat_parse(result.raw.text, true, parser);
-        result.message.role = "assistant";
-        if (!result.message.content.empty() || !result.message.tool_calls.empty()) {
-            if (++answer_tokens > request.answer_limit && request.answer_limit) { throw output_limit("max_output_tokens"); }
-            // Reasoning never feeds the voice bridge. Retain only audible/answer rows.
-            result.raw.ends.push_back(result.raw.text.size());
-            result.raw.hidden.push_back(tap.row);
+        auto batch = llama_batch_init(1 + draft.size(), 0, 1);
+        common_batch_add(batch, pending, pos, { 0 }, true);
+        for (size_t j = 0; j < draft.size(); ++j) {
+            common_batch_add(batch, draft[j], pos + 1 + j, { 0 }, true);
         }
-        if (!result.message.content.empty() && (result.content_offset == std::string::npos ||
-            result.raw.text.compare(result.content_offset, result.message.content.size(), result.message.content) != 0)) {
-            result.content_offset = result.raw.text.rfind(result.message.content);
+        const int rc = decode(batch);
+        llama_batch_free(batch);
+        if (rc) { throw std::runtime_error("generation decode failed"); }
+        // The last sampled token has not executed. It becomes the next anchor;
+        // only the current anchor and verified draft rows can feed the voice bridge.
+        auto ids = common_sampler_sample_and_accept_n(sampler.get(), ctx.get(), draft);
+        const size_t committed = ids.size();
+        if (speculative) {
+            common_speculative_accept(speculative.get(), 0, committed - 1);
+            if (committed <= draft.size()) {
+                // The retained anchor keeps rollback inside this verification batch.
+                if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos + committed, -1) ||
+                    !llama_memory_seq_rm(llama_get_memory(draft_ctx.get()), 0, pos + committed, -1)) {
+                    throw std::runtime_error("MTP accepted-prefix rollback failed");
+                }
+            }
         }
-        if (on_text) { on_text(result, false); }
+        pos += committed;
+        drafted_tokens += draft.size();
+        accepted_tokens += committed - 1;
+        const float * rows = llama_get_embeddings_layer_inp(ctx.get(), 17);
+        for (size_t j = 0; j < committed; ++j) {
+            const llama_token token = j ? ids[j - 1] : pending;
+            std::array<float, 5120> row;
+            std::copy_n(rows + j * row.size(), row.size(), row.begin());
+            for (float v : row) {
+                if (!std::isfinite(v)) { throw std::runtime_error("nonfinite hidden state"); }
+            }
+            result.raw.text += common_token_to_piece(vocab, token, true);
+            ++generated_tokens;
+            result.message = common_chat_parse(result.raw.text, true, parser);
+            result.message.role = "assistant";
+            if (!result.message.content.empty() || !result.message.tool_calls.empty()) {
+                if (++answer_tokens > request.answer_limit && request.answer_limit) {
+                    if (speculative && std::getenv("FRANKIE_PROFILE")) {
+                        std::cerr << "brain_mtp output_limit row=" << j << " committed=" << committed
+                                  << " drafted=" << drafted_tokens << " accepted=" << accepted_tokens << "\n";
+                    }
+                    throw output_limit("max_output_tokens");
+                }
+                // Reasoning never feeds the voice bridge. Retain only audible/answer rows.
+                result.raw.ends.push_back(result.raw.text.size());
+                result.raw.hidden.push_back(row);
+            }
+            if (!result.message.content.empty() && (result.content_offset == std::string::npos ||
+                result.raw.text.compare(result.content_offset, result.message.content.size(), result.message.content) != 0)) {
+                result.content_offset = result.raw.text.rfind(result.message.content);
+            }
+            if (on_text) { on_text(result, false); }
+        }
+        pending = ids.back();
+    }
+    if (speculative) {
+        std::cerr << "brain_mtp drafted=" << drafted_tokens << " accepted=" << accepted_tokens << "\n";
     }
     if (!finished) {
         throw output_limit("max_output_tokens");
@@ -758,9 +840,13 @@ brain_session::response brain_session::generate(const request & request, const s
 }
 
 void brain_session::report_memory() const {
-    for (const auto & [type, bytes] : llama_get_memory_breakdown(ctx.get())) {
-        std::cerr << "memory brain backend=" << ggml_backend_buft_name(type) << " weights=" << bytes.model
-                  << " context=" << bytes.context << " compute=" << bytes.compute << "\n";
+    for (const auto & entry : {std::make_pair("brain", ctx.get()), std::make_pair("mtp", draft_ctx.get())}) {
+        if (!entry.second) { continue; }
+        for (const auto & [type, bytes] : llama_get_memory_breakdown(entry.second)) {
+            const size_t weights = entry.second == ctx.get() ? bytes.model : 0;
+            std::cerr << "memory " << entry.first << " backend=" << ggml_backend_buft_name(type) << " weights=" << weights
+                      << " context=" << bytes.context << " compute=" << bytes.compute << "\n";
+        }
     }
     for (const auto & [device, bytes] : clip_get_mem_usage(encoder.get())) {
         std::cerr << "memory parakeet backend=" << ggml_backend_dev_name(device) << " bytes=" << bytes << "\n";

@@ -27,6 +27,7 @@ using json = nlohmann::ordered_json;
 
 // Realtime owns items; model objects only execute requests.
 struct realtime_session {
+    static constexpr size_t max_item_ids = 65536;
     brain_session &             brain;
     mouth_session &             mouth;
     httplib::ws::WebSocket &    socket;
@@ -35,6 +36,12 @@ struct realtime_session {
     json                        config;
     std::vector<char>           audio;
     std::map<std::string, bool> pending_calls;
+    struct history_item { size_t message, order; json item; };
+    std::map<std::string, history_item> items;
+    std::set<std::string> item_ids;
+    std::set<std::string> call_ids;
+    size_t item_order = 0;
+    std::string last_item_id;
     std::thread                 worker;
     std::thread                 input_worker, bc_worker;
     std::atomic<bool>           bc_busy{false};
@@ -48,6 +55,7 @@ struct realtime_session {
     bool                        busy = false, connected = true;
     size_t                      serial = 0;
     std::string                 response_id;
+    std::string                 active_item_id;
     component vad_source;
     std::unique_ptr<mtmd_vad> vad;
     std::vector<char> vad_frame, playback_frame;
@@ -116,6 +124,11 @@ struct realtime_session {
         brain.cancelled = true;
         mouth.cancelled = true;
         request.chat.messages.resize(turn->user_index);
+        for (auto it = items.begin(); it != items.end();) {
+            if (it->second.message >= turn->user_index) { it = items.erase(it); }
+            else { ++it; }
+        }
+        refresh_last_item();
         request.audio_rows.erase("[FRANKIE_AUDIO_" + turn->input + "]");
         send({{"type", "conversation.item.deleted"}, {"item_id", turn->input}});
         audio_messages.erase(id);
@@ -170,7 +183,61 @@ struct realtime_session {
     }
 
 
-    std::string next_id(const char * prefix) { return std::string(prefix) + std::to_string(++serial); }
+    std::string next_id(const char * prefix) {
+        std::string id;
+        do { id = std::string(prefix) + std::to_string(++serial); } while (item_ids.count(id) || call_ids.count(id));
+        return id;
+    }
+
+    static bool valid_id(const std::string & id) {
+        return !id.empty() && id.size() <= 256 && std::all_of(id.begin(), id.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        });
+    }
+
+    void remember_item(const json & item, size_t message) {
+        const auto id = item.at("id").get<std::string>();
+        item_ids.insert(id);
+        items.insert_or_assign(id, history_item{message, ++item_order, item});
+        last_item_id = id;
+    }
+
+    void refresh_last_item() {
+        last_item_id.clear();
+        size_t order = 0;
+        for (const auto & item : items) {
+            if (item.second.order > order) { last_item_id = item.first; order = item.second.order; }
+        }
+    }
+
+    void retrieve_item(const json & event) {
+        const auto id = event.at("item_id").get<std::string>();
+        if (!valid_id(id) || (released_turn && released_turn->merge_requested && released_turn->output == id)) {
+            throw std::runtime_error("unknown conversation item");
+        }
+        const auto found = items.find(id);
+        json item;
+        if (found != items.end()) {
+            item = found->second.item;
+            const auto & message = request.chat.messages.at(found->second.message);
+            if (item.at("type") == "message" && item.at("role") == "assistant") {
+                const bool audio = item.at("content").at(0).at("type") == "output_audio";
+                item["content"] = json::array({{{"type", audio ? "output_audio" : "output_text"},
+                                               {audio ? "transcript" : "text", message.content}}});
+            } else if (item.at("type") == "function_call_output") {
+                item["output"] = message.content;
+            }
+        } else if (id == active_item_id && emitted_samples.count(id)) {
+            std::string transcript;
+            if (truncated.count(id)) { transcript = heard_text(id); }
+            else { for (const auto & phrase : phrase_history[id]) { transcript += phrase.text; } }
+            item = {{"id", id}, {"type", "message"}, {"role", "assistant"}, {"status", "in_progress"},
+                    {"content", json::array({{{"type", "output_audio"}, {"transcript", transcript}}})}};
+        } else {
+            throw std::runtime_error("unknown conversation item");
+        }
+        send({{"type", "conversation.item.retrieved"}, {"item", item}});
+    }
 
     void send(json event) {
         event["event_id"] = next_id("event_");
@@ -231,6 +298,7 @@ struct realtime_session {
             { "instructions",      system.content                                                              },
             { "output_modalities", json::array({ "audio" })                                                    },
             { "tools",             json::array()                                                               },
+            { "truncation",        "auto"                                                                     },
             { "audio",
              { { "input",
                   { { "format", { { "type", "audio/pcm" }, { "rate", 24000 } } }, { "turn_detection", nullptr } } },
@@ -371,12 +439,15 @@ struct realtime_session {
         }
         for (auto it = value.begin(); it != value.end(); ++it) {
             if (it.key() != "type" && it.key() != "model" && it.key() != "instructions" && it.key() != "tools" &&
-                it.key() != "output_modalities" && it.key() != "audio" && it.key() != "reasoning" && it.key() != "max_output_tokens") {
+                it.key() != "output_modalities" && it.key() != "audio" && it.key() != "reasoning" && it.key() != "max_output_tokens" && it.key() != "truncation") {
                 throw std::runtime_error("unsupported session field: " + it.key());
             }
         }
         if (merged.value("model", "") != "frankie") {
             throw std::runtime_error("unknown model");
+        }
+        if (merged.value("truncation", "") != "auto" && merged.value("truncation", "") != "disabled") {
+            throw std::runtime_error("truncation must be auto or disabled");
         }
         const auto & output_limit = merged.at("max_output_tokens");
         const bool unlimited = output_limit == "inf";
@@ -470,7 +541,9 @@ struct realtime_session {
             }
             tools.push_back({ name, t.value("description", ""), t.at("parameters").dump() });
         }
-        if (!audio.empty() || speaking || dropping_input) {
+        // Idle server VAD retains prefix audio; keep it across settings changes.
+        const bool idle_vad = server_vad && !detection.is_null() && !speaking && !speech_frames && !dropping_input;
+        if (!idle_vad && (!audio.empty() || !vad_frame.empty() || speaking || dropping_input)) {
             throw std::runtime_error("cannot reconfigure during capture");
         }
         server_vad = !detection.is_null();
@@ -480,19 +553,28 @@ struct realtime_session {
             auto_response = detection["create_response"];
             auto_interrupt = detection["interrupt_response"];
         }
+        const bool changed_prefix = instructions != request.chat.messages[0].content || merged["tools"] != config["tools"] ||
+                                    request.chat.enable_thinking != (reasoning_budget > 0);
         config                           = std::move(merged);
         request.answer_limit             = answer_limit;
         request.reasoning_budget         = reasoning_budget;
         request.chat.enable_thinking     = reasoning_budget > 0;
         request.chat.tools               = std::move(tools);
         request.chat.messages[0].content = instructions;
-        if (request.chat.messages.size() == 1) {
+        if (request.chat.messages.size() == 1 || changed_prefix) {
             if (worker.joinable()) {
                 worker.join();
             }
+            if (changed_prefix) {
+                // Old false-start checkpoints must not replace the new prefix.
+                merge_restore.reset();
+                released_turn.reset();
+            }
+            auto input = request.chat;
+            input.messages.resize(1);
             busy = true;
             brain.cancelled = false;
-            worker = std::thread([this, input = request.chat, event_id]() {
+            worker = std::thread([this, input = std::move(input), event_id]() {
                 const auto start = std::chrono::steady_clock::now();
                 std::string failure;
                 try {
@@ -533,6 +615,9 @@ struct realtime_session {
             if (tokens + request.generation_tokens() <= brain.context_tokens() &&
                 request.chat.messages.size() < brain_session::max_messages - 2 &&
                 request.audio_rows.size() + unencoded.size() < brain_session::max_audio_segments - 1) { return; }
+            if (config.at("truncation") == "disabled") {
+                throw std::runtime_error("conversation capacity exceeded with truncation disabled");
+            }
             if (cut == 0) {
                 // Preserve the active tool call/result pair, but cap oversized output visibly.
                 auto largest = request.chat.messages.end();
@@ -570,13 +655,18 @@ struct realtime_session {
             if (it->second < cut) { emitted_samples.erase(it->first); truncated.erase(it->first); phrase_history.erase(it->first); heard_samples.erase(it->first); it = audio_messages.erase(it); }
             else { it->second -= cut - 1; ++it; }
         }
+        for (auto it = items.begin(); it != items.end();) {
+            if (it->second.message < cut) { it = items.erase(it); }
+            else { it->second.message -= cut - 1; ++it; }
+        }
+        if (!items.count(last_item_id)) { refresh_last_item(); }
         request.chat.messages.erase(request.chat.messages.begin() + 1, request.chat.messages.begin() + cut);
         std::cerr << "history_rollover removed_messages=" << cut - 1 << " \n";
     }
 
     void commit_audio() {
         if (server_vad && speech_end_bytes) { audio.resize(speech_end_bytes); }
-        if (audio.size() < 4800 || request.audio_rows.size() + unencoded.size() >= brain_session::max_audio_segments || request.chat.messages.size() >= brain_session::max_messages) {
+        if (audio.size() < 4800 || request.audio_rows.size() + unencoded.size() >= brain_session::max_audio_segments || request.chat.messages.size() >= brain_session::max_messages || item_ids.size() >= max_item_ids - (busy ? 2 : 0)) {
             throw std::runtime_error("audio/history bounds");
         }
         std::vector<float> pcm(audio.size() / 3 + 64);
@@ -596,23 +686,22 @@ struct realtime_session {
         common_chat_msg message;
         message.role    = "user";
         message.content = marker;
+        const auto previous = last_item_id.empty() ? json(nullptr) : json(last_item_id);
         request.chat.messages.push_back(message);
+        const json item = {{"id", id}, {"type", "message"}, {"role", "user"}, {"status", "completed"},
+                           {"content", json::array({{{"type", "input_audio"}, {"transcript", nullptr}}})}};
+        remember_item(item, request.chat.messages.size() - 1);
         audio.clear();
         speech_end_bytes = 0;
         send({
             { "type",             "input_audio_buffer.committed" },
             { "item_id",          id                             },
-            { "previous_item_id", nullptr                        }
+            { "previous_item_id", previous                       }
         });
         send({
             { "type",             "conversation.item.created"                                              },
-            { "previous_item_id", nullptr                                                                  },
-            { "item",
-             { { "id", id },
-                { "type", "message" },
-                { "role", "user" },
-                { "status", "completed" },
-                { "content", json::array({ { { "type", "input_audio" }, { "transcript", nullptr } } }) } } }
+            { "previous_item_id", previous },
+            { "item", item }
         });
     }
 
@@ -793,12 +882,21 @@ struct realtime_session {
         send({{"type", "conversation.item.truncated"}, {"item_id", id}, {"content_index", 0}, {"audio_end_ms", end}});
     }
 
-    void create_item(json item) {
-        if (request.chat.messages.size() >= brain_session::max_messages) {
+    void create_item(const json & event) {
+        if (request.chat.messages.size() >= brain_session::max_messages || item_ids.size() >= max_item_ids) {
             throw std::runtime_error("history full");
+        }
+        if (event.contains("previous_item_id") && !event["previous_item_id"].is_null() && event["previous_item_id"] != last_item_id) {
+            throw std::runtime_error("conversation items must be appended in order");
+        }
+        json item = event.at("item");
+        const auto item_id = item.value("id", next_id("item_"));
+        if (!valid_id(item_id) || item_ids.count(item_id) || item.value("status", "completed") != "completed") {
+            throw std::runtime_error("invalid or duplicate item id or status");
         }
         common_chat_msg message;
         auto            type = item.at("type").get<std::string>();
+        std::string completed_call, imported_call;
         if (type == "function_call_output") {
             auto id    = item.at("call_id").get<std::string>();
             auto found = pending_calls.find(id);
@@ -823,22 +921,52 @@ struct realtime_session {
                 message.content.replace(offset, 9, "[FRANKIE-");
                 offset += 9;
             }
-            found->second = true;
-        } else if (type == "message" && item.value("role", "") == "user") {
-            message.role = "user";
+            completed_call = id;
+            item = {{"type", type}, {"call_id", id}, {"output", message.content}};
+        } else if (type == "function_call") {
+            for (const auto & call : pending_calls) {
+                if (!call.second && request.chat.messages.back().role != "assistant") {
+                    throw std::runtime_error("tool results must precede the next call group");
+                }
+            }
+            const auto call_id = item.at("call_id").get<std::string>();
+            const auto name = item.at("name").get<std::string>();
+            const auto arguments = item.at("arguments").get<std::string>();
+            if (!valid_id(call_id) || call_ids.count(call_id) || name.empty() || name.size() > 256 ||
+                name.find("[FRANKIE_") != std::string::npos ||
+                arguments.size() > 256 * 1024 || !json::parse(arguments).is_object() ||
+                arguments.find("[FRANKIE_") != std::string::npos) {
+                throw std::runtime_error("invalid or duplicate historical function call");
+            }
+            message.role = "assistant";
+            message.tool_calls.push_back({name, arguments, call_id});
+            imported_call = call_id;
+            item = {{"type", type}, {"call_id", call_id}, {"name", name}, {"arguments", arguments}};
+        } else if (type == "message" && (item.value("role", "") == "user" || item.value("role", "") == "assistant")) {
+            for (const auto & call : pending_calls) {
+                if (!call.second) { throw std::runtime_error("tool results must precede the next message"); }
+            }
+            message.role = item.at("role").get<std::string>();
+            const bool assistant = message.role == "assistant";
             std::map<std::string, brain_session::image_ptr> images;
             if (!item.at("content").is_array() || item["content"].empty() || item["content"].size() > 16) {
                 throw std::runtime_error("content bounds");
             }
+            json content = json::array();
             for (auto & part : item.at("content")) {
                 const auto kind = part.value("type", "");
-                if (kind == "input_text") {
-                    auto text = part.at("text").get<std::string>();
+                if ((!assistant && kind == "input_text") || (assistant && (kind == "output_text" || kind == "output_audio"))) {
+                    const char * field = kind == "output_audio" ? "transcript" : "text";
+                    auto text = part.at(field).get<std::string>();
+                    if (kind == "output_audio" && part.contains("audio")) {
+                        throw std::runtime_error("historical assistant audio must contain only its transcript");
+                    }
                     if (text.find("[FRANKIE_") != std::string::npos) {
                         throw std::runtime_error("reserved media marker");
                     }
                     message.content += text;
-                } else if (kind == "input_image") {
+                    content.push_back({{"type", kind}, {field, text}});
+                } else if (!assistant && kind == "input_image") {
                     if (request.images.size() + images.size() >= 4) {
                         throw std::runtime_error("image history full");
                     }
@@ -854,6 +982,7 @@ struct realtime_session {
                     auto marker = "[FRANKIE_IMAGE_" + next_id("image_") + "]";
                     images.emplace(marker, std::move(image));
                     message.content += marker;
+                    content.push_back({{"type", kind}, {"image_url", url}});
                 } else {
                     throw std::runtime_error("unsupported content; use input_audio_buffer for audio");
                 }
@@ -862,20 +991,36 @@ struct realtime_session {
                 }
             }
             request.images.insert(images.begin(), images.end());
+            if (assistant) {
+                const bool output_audio = content[0]["type"] == "output_audio";
+                content = json::array({{{"type", output_audio ? "output_audio" : "output_text"},
+                                       {output_audio ? "transcript" : "text", message.content}}});
+            }
+            item = {{"type", type}, {"role", message.role}, {"content", content}};
         } else {
             throw std::runtime_error("unsupported conversation item");
         }
-        item["id"]     = next_id("item_");
+        item["id"]     = item_id;
         item["status"] = "completed";
-        request.chat.messages.push_back(message);
+        const auto previous = last_item_id.empty() ? json(nullptr) : json(last_item_id);
+        const bool append_call = !imported_call.empty() && request.chat.messages.back().role == "assistant";
+        if (append_call && request.chat.messages.back().tool_calls.size() >= 32) {
+            throw std::runtime_error("historical parallel tool call bounds");
+        }
+        if (!completed_call.empty()) { pending_calls.at(completed_call) = true; }
+        if (!imported_call.empty()) { pending_calls.emplace(imported_call, false); call_ids.insert(imported_call); }
+        if (append_call) { request.chat.messages.back().tool_calls.push_back(message.tool_calls.front()); }
+        else { request.chat.messages.push_back(message); }
+        remember_item(item, request.chat.messages.size() - 1);
         send({
             { "type",             "conversation.item.created" },
-            { "previous_item_id", nullptr                     },
+            { "previous_item_id", previous                    },
             { "item",             item                        }
         });
     }
 
     void respond(const json & event, bool speculate = false) {
+        if (item_ids.size() > max_item_ids - (speculate ? 3 : 2)) { throw std::runtime_error("session item limit"); }
         if (event.contains("response") && !event["response"].empty()) {
             throw std::runtime_error("response overrides not implemented in prototype");
         }
@@ -888,6 +1033,7 @@ struct realtime_session {
             worker.join();
         }
         response_id             = next_id("resp_");
+        active_item_id.clear();
         const auto id           = response_id;
         auto       snapshot     = request;
         auto       captured     = unencoded;
@@ -932,6 +1078,8 @@ struct realtime_session {
                     unencoded.erase(input.first);
                     const std::string prefix = "[FRANKIE_AUDIO_";
                     const auto user_id = input.first.substr(prefix.size(), input.first.size() - prefix.size() - 1);
+                    const auto item = items.find(user_id);
+                    if (item != items.end()) { item->second.item["content"][0]["transcript"] = transcripts.at(input.first); }
                     send({{"type", "conversation.item.input_audio_transcription.completed"}, {"item_id", user_id},
                           {"content_index", 0}, {"transcript", transcripts.at(input.first)}});
                 }
@@ -1009,6 +1157,7 @@ struct realtime_session {
                 {
                     std::lock_guard<std::mutex> lock(state);
                     item_id = next_id("item_");
+                    active_item_id = item_id;
                 }
                 json fields = {{"response_id", id}, {"item_id", item_id}, {"output_index", 0}, {"content_index", 0}};
                 bool audio_started = false;
@@ -1132,6 +1281,7 @@ struct realtime_session {
                     auto & call = result.message.tool_calls[0];
                     call.id = next_id("call_");
                     pending_calls.emplace(call.id, false);
+                    call_ids.insert(call.id);
                     const auto tool_item = output.empty() ? item_id : next_id("item_");
                     const size_t index = output.size();
                     output.push_back({{"id", tool_item}, {"type", "function_call"}, {"status", "completed"},
@@ -1146,6 +1296,7 @@ struct realtime_session {
                           {"output_index", index}, {"call_id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
                 }
                 request.chat.messages.push_back(result.message);
+                for (const auto & item : output) { remember_item(item, request.chat.messages.size() - 1); }
                 history_saved = true;
                 for (size_t i = 0; i < output.size(); ++i) {
                     send({{"type", "response.output_item.done"}, {"response_id", id}, {"output_index", i}, {"item", output[i]}});
@@ -1191,6 +1342,12 @@ struct realtime_session {
                 interrupted.content = status == "incomplete" ? "[Response stopped at its output limit; no tool call was executed.]" : heard_text(item_id);
                 if (emitted_samples.count(item_id)) { audio_messages[item_id] = request.chat.messages.size(); }
                 request.chat.messages.push_back(interrupted);
+                if (!item_id.empty()) {
+                    remember_item({{"id", item_id}, {"type", "message"}, {"role", "assistant"}, {"status", "completed"},
+                                   {"content", json::array({{{"type", audio_output ? "output_audio" : "output_text"},
+                                                          {audio_output ? "transcript" : "text", interrupted.content}}})}},
+                                  request.chat.messages.size() - 1);
+                }
             }
             json                        response = {
                 { "id",     id                                             },
@@ -1212,6 +1369,7 @@ struct realtime_session {
                 { "type",     "response.done" },
                 { "response", response        }
             });
+            active_item_id.clear();
             busy = false;
         });
     }
@@ -1256,6 +1414,10 @@ struct realtime_session {
                     truncate_audio(event);
                     continue;
                 }
+                if (type == "conversation.item.retrieve") {
+                    retrieve_item(event);
+                    continue;
+                }
                 if (type == "input_audio_buffer.commit" && tentative) {
                     throw std::runtime_error("cannot manually commit a speculative capture");
                 }
@@ -1283,7 +1445,7 @@ struct realtime_session {
                 } else if (type == "input_audio_buffer.commit") {
                     commit_audio();
                 } else if (type == "conversation.item.create") {
-                    create_item(event.at("item"));
+                    create_item(event);
                 } else if (type == "response.create") {
                     respond(event);
                 } else {
@@ -1300,14 +1462,17 @@ int main(int argc, char ** argv) {
     try {
         if (argc < 3 || std::strcmp(argv[1], "--help") == 0) {
             std::cerr << "Usage: llama-frankie-realtime PACKAGE PORT [--device cpu|gpu] [--threads N]\n"
+                         "  [--text-encoder-device cpu|gpu]\n"
                          "  [--ctx-size N] [--cache-type q4_0|q8_0|f16] [--batch-size N] [--ubatch-size N]\n"
                          "  [--thinking none|minimal|low|medium|high|xhigh|max]\n"
+                         "  [--mtp-tokens 0..4]\n"
                          "  [--max-utterance-seconds N] [--max-output-audio-seconds N] [--max-output-tokens N|inf]\n"
                          "  [--voice WAV] [--voice-text-file TXT --voice-codes I32]\n"
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
                          "  [--vap-model GGUF] [--bc-model GGUF]\n"
                          "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF]\n"
-                         "WAV alone uses the native speaker encoder. Optional ICL text and frame-major codes must match that WAV.\n";
+                         "WAV alone uses the native reference encoder. Breeze transcribes it with the packaged ear.\n"
+                         "Breeze accepts optional --voice-text-file; Qwen ICL requires matching text and frame-major codes.\n";
             return argc == 2 && std::strcmp(argv[1], "--help") == 0 ? 0 : 1;
         }
         frankie_options options;
@@ -1318,6 +1483,9 @@ int main(int argc, char ** argv) {
             if (key == "--device") {
                 if (value != "cpu" && value != "gpu") { throw std::runtime_error("device must be cpu or gpu (Metal/CUDA)"); }
                 options.use_gpu = value == "gpu";
+            } else if (key == "--text-encoder-device") {
+                if (value != "cpu" && value != "gpu") { throw std::runtime_error("text encoder device must be cpu or gpu"); }
+                options.text_encoder_gpu = value == "gpu";
             } else if (key == "--threads") { options.threads = int(frankie_unsigned(value)); }
             else if (key == "--voice") { options.voice = value; }
             else if (key == "--voice-text-file") { options.voice_text = value; }
@@ -1339,6 +1507,7 @@ int main(int argc, char ** argv) {
             else if (key == "--max-output-tokens") { options.max_output_tokens = value == "inf" ? 0 : frankie_unsigned(value); }
             else if (key == "--cache-type") { options.cache_type = value; }
             else if (key == "--thinking") { options.thinking = value; }
+            else if (key == "--mtp-tokens") { options.mtp_tokens = frankie_unsigned(value); }
             else if (key == "--ear-model") { options.ear_model = value; }
             else if (key == "--talker-model") { options.talker_model = value; }
             else if (key == "--mouth-model") { options.mouth_model = value; }
@@ -1348,16 +1517,16 @@ int main(int argc, char ** argv) {
         }
         const auto port = frankie_unsigned(argv[2]);
         if (!port || port > 65535) { throw std::runtime_error("port must be 1..65535"); }
-        if (options.batch_size > 8192 || options.ubatch_size > (options.batch_size ? options.batch_size : (options.use_gpu ? 512u : 128u)) ||
+        if (options.mtp_tokens > 4 || options.batch_size > 8192 || options.ubatch_size > (options.batch_size ? options.batch_size : (options.use_gpu ? 512u : 128u)) ||
             options.max_utterance_seconds < 2 || options.max_utterance_seconds > 120 ||
             !options.max_output_audio_seconds || options.max_output_audio_seconds > 3600 ||
             options.max_output_tokens > options.context_tokens || options.threads < 1 || options.threads > 256 || options.context_tokens < 4096 || options.context_tokens > 262144 ||
             (options.cache_type != "q4_0" && options.cache_type != "q8_0" && options.cache_type != "f16") || !std::isfinite(options.side_scale) ||
             options.side_scale < 0 || options.side_scale > 2 || !std::isfinite(options.presence_penalty) ||
             options.presence_penalty < 0 || options.presence_penalty > 2 ||
-            options.voice_text.empty() != options.voice_codes.empty() ||
+            (!options.voice_codes.empty() && options.voice_text.empty()) ||
             (options.voice.empty() && (!options.voice_text.empty() || !options.voice_codes.empty()))) {
-            throw std::runtime_error("invalid runtime options; voice text and codes require --voice and each other");
+            throw std::runtime_error("invalid runtime options; voice text/codes require --voice, and codes require text");
         }
         frankie_thinking_budget(options.thinking);
         const char * token = std::getenv("FRANKIE_REALTIME_TOKEN");
@@ -1367,9 +1536,19 @@ int main(int argc, char ** argv) {
         std::string auth = "Bearer " + std::string(token);
         common_init();
         brain_session     brain(argv[1], options);
-        mouth_session     mouth(argv[1], options);
+        brain.report_memory();
+        mouth_session     mouth(argv[1], options, [&](const std::vector<float> & pcm24) {
+            std::vector<float> pcm16(pcm24.size() * 2 / 3 + 16);
+            const auto n = ma_convert_frames(pcm16.data(), pcm16.size(), ma_format_f32, 1, 16000,
+                                             pcm24.data(), pcm24.size(), ma_format_f32, 1, 24000);
+            if (!n || n > 16000 * 20) { throw std::runtime_error("reference resampling failed"); }
+            pcm16.resize(n);
+            std::string transcript;
+            brain.encode_audio(pcm16, &transcript);
+            return transcript;
+        });
         mouth.warmup();
-        brain.report_memory(); mouth.report_memory();
+        mouth.report_memory();
         httplib::Server   server;
         std::atomic<bool> occupied{ false };
         server.set_payload_max_length(1024 * 1024);

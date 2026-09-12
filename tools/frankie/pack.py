@@ -27,7 +27,7 @@ def main():
     parser.add_argument('--voice', type=Path)
     parser.add_argument('--voice-text-file', type=Path)
     parser.add_argument('--voice-codes', type=Path, help='frame-major little-endian I32, 16 codebooks')
-    for name in ('expression', 'vap', 'bc'):
+    for name in ('expression', 'vap', 'bc', 'breeze'):
         parser.add_argument('--' + name, type=Path)
     args = parser.parse_args()
     temporary = args.output.with_name(args.output.name + '.incomplete')
@@ -71,7 +71,7 @@ def main():
             continue
         tensor_map[tensor.name] = (tensor.data, tensor.tensor_type)
         source_shapes[tensor.name] = tensor.shape.tolist()
-    for name in ('expression', 'vap', 'bc'):
+    for name in ('expression', 'vap', 'bc', 'breeze'):
         path = getattr(args, name)
         if path:
             if path.stat().st_size > 64 * 1024 * 1024: raise ValueError(name + ' asset too large')

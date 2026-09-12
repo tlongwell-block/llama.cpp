@@ -199,14 +199,14 @@ int32_t mtmd_helper_decode_image_chunk(
     return 0;
 }
 
-int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
+static int32_t eval_chunk_single(mtmd_context * ctx,
         struct llama_context * lctx,
         const mtmd_input_chunk * chunk,
         llama_pos n_past,
         llama_seq_id seq_id,
         int32_t n_batch,
         bool logits_last,
-        llama_pos * new_n_past) {
+        llama_pos * new_n_past, mtmd_helper_post_decode_callback callback, void * user_data) {
     GGML_ASSERT(n_batch > 0);
     int32_t ret;
     llama_batch text_batch = llama_batch_init(n_batch, 0, 1);
@@ -234,6 +234,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
                 text_batch.logits[text_batch.n_tokens - 1] = true;
             }
             ret = llama_decode(lctx, text_batch);
+            if (!ret && callback) { ret = callback(text_batch, user_data); }
             if (ret != 0) {
                 LOG_ERR("failed to decode text\n");
                 llama_batch_free(text_batch);
@@ -258,7 +259,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         LOG_INF("%s slice encoded in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
 
         float * embd = mtmd_get_output_embd(ctx);
-        ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past, nullptr, nullptr);
+        ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past, callback, user_data);
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
             llama_batch_free(text_batch);
@@ -272,14 +273,15 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
     return 0;
 }
 
-int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
+int32_t mtmd_helper_eval_chunks_with_callback(mtmd_context * ctx,
                                 struct llama_context * lctx,
                                 const mtmd_input_chunks * chunks,
                                 llama_pos n_past,
                                 llama_seq_id seq_id,
                                 int32_t n_batch,
                                 bool logits_last,
-                                llama_pos * new_n_past) {
+                                llama_pos * new_n_past,
+                                mtmd_helper_post_decode_callback callback, void * user_data) {
     size_t n_chunks = mtmd_input_chunks_size(chunks);
     if (n_chunks == 0) {
         LOG_WRN("no chunks to eval\n");
@@ -290,7 +292,7 @@ int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
         bool chunk_logits_last = (i == n_chunks - 1) && logits_last;
         auto chunk = mtmd_input_chunks_get(chunks, i);
 
-        int32_t res = mtmd_helper_eval_chunk_single(ctx, lctx, chunk, n_past, seq_id, n_batch, chunk_logits_last, &n_past);
+        int32_t res = eval_chunk_single(ctx, lctx, chunk, n_past, seq_id, n_batch, chunk_logits_last, &n_past, callback, user_data);
         if (res != 0) {
             LOG_ERR("failed to eval chunk %zu\n", i);
             return res;
@@ -299,6 +301,19 @@ int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
     }
 
     return 0;
+}
+
+int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx, llama_context * lctx,
+        const mtmd_input_chunk * chunk, llama_pos n_past, llama_seq_id seq_id,
+        int32_t n_batch, bool logits_last, llama_pos * new_n_past) {
+    return eval_chunk_single(ctx, lctx, chunk, n_past, seq_id, n_batch, logits_last, new_n_past, nullptr, nullptr);
+}
+
+int32_t mtmd_helper_eval_chunks(mtmd_context * ctx, llama_context * lctx,
+        const mtmd_input_chunks * chunks, llama_pos n_past, llama_seq_id seq_id,
+        int32_t n_batch, bool logits_last, llama_pos * new_n_past) {
+    return mtmd_helper_eval_chunks_with_callback(ctx, lctx, chunks, n_past, seq_id, n_batch,
+                                               logits_last, new_n_past, nullptr, nullptr);
 }
 
 namespace audio_helpers {

@@ -162,6 +162,11 @@ struct clip_hparams {
     std::vector<int32_t> seanet_ratios; // encoder order (reversed compared to the config)
     int32_t mimi_downsample   = 0;      // encoder frame rate / model frame rate
     int32_t mimi_tfm_context  = 0;      // attention window of the mimi transformers, in frames
+    int32_t mimi_encoder_hop() const {
+        int32_t hop = 1;
+        for (auto ratio : seanet_ratios) { hop *= ratio; }
+        return hop;
+    }
     int32_t flow_n_step       = 1;      // lsd_decode steps
 
     // qwen3tts code2wav
@@ -787,6 +792,7 @@ struct clip_model {
     ggml_tensor * gen_code_head_w     = nullptr; // per-codebook output head, merged 3D
     ggml_tensor * gen_code_out_embd_w = nullptr; // codebook-0 embedding, fed back into the talker
     ggml_tensor * gen_code_norm_w     = nullptr; // final norm
+    ggml_tensor * gen_code_rope_freqs = nullptr;
 
     // qwen3tts code2wav: RVQ codes -> raw PCM
     clip_code2wav c2w;
@@ -797,6 +803,9 @@ struct clip_model {
     // pocket-tts: voice latent -> backbone embd (speaker path)
     ggml_tensor * spk_proj_w      = nullptr;
     ggml_tensor * downsample_w    = nullptr;
+    ggml_tensor * mimi_quant_in[2] = {};
+    ggml_tensor * mimi_quant_cb[2] = {};
+    ggml_tensor * mimi_quant_norm[2] = {};
 
     // pocket-tts: flow-matching decoder, backbone hidden state -> next latent
     clip_flow_net flow;

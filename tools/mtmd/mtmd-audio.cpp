@@ -1576,7 +1576,7 @@ bool mtmd_audio_preprocessor_pockettts::preprocess(const float *                
                                                    size_t                        n_samples,
                                                    std::vector<mtmd_audio_mel> & output) const {
     // the encoder needs whole frames, see pad_for_conv1d() in the reference
-    const int64_t frame_size = (int64_t) hparams.mimi_downsample * 120;
+    const int64_t frame_size = (int64_t) hparams.mimi_downsample * hparams.mimi_encoder_hop();
     if (n_samples == 0 || frame_size <= 0) {
         return false;
     }
@@ -1590,7 +1590,7 @@ bool mtmd_audio_preprocessor_pockettts::preprocess(const float *                
     }
 
     const int64_t n_frames  = (int64_t) (n_samples + frame_size - 1) / frame_size;
-    const int64_t n_padded  = n_frames * frame_size;
+    const int64_t n_padded  = hparams.gen_model_variant == "breeze" ? n_samples : n_frames * frame_size;
 
     mtmd_audio_mel out;
     out.n_mel     = 1;

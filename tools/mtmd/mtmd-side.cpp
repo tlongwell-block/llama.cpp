@@ -13,7 +13,7 @@ struct mtmd_side::impl {
     ggml_context_ptr work;
     ggml_cgraph * graph = nullptr;
     std::unique_ptr<mtmd_backend> backend;
-    ggml_backend_buffer_ptr buffer;
+    ggml_gallocr_ptr allocator;
     ggml_tensor * input = nullptr;
     ggml_tensor * output = nullptr;
 
@@ -40,12 +40,14 @@ struct mtmd_side::impl {
         if (!work) { throw std::runtime_error("cannot allocate side graph"); }
         auto * ctx = work.get();
         input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5120);
+        ggml_set_input(input);
         auto * norm = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, input, 1e-5f), weight("ln.weight", 5120)), weight("ln.bias", 5120));
         auto * up = ggml_add(ctx, ggml_mul_mat(ctx, weight("up.weight", 5120, 1024), norm), weight("up.bias", 1024));
         output = ggml_add(ctx, ggml_mul_mat(ctx, weight("down.weight", 1024, 2048), ggml_gelu_erf(ctx, up)), weight("down.bias", 2048));
         graph = ggml_new_graph(ctx);
+        ggml_set_output(output);
         ggml_build_forward_expand(graph, output);
-        buffer = backend->allocate(ctx, graph);
+        allocator = backend->allocate(graph);
     }
 };
 
@@ -69,7 +71,7 @@ std::array<float, 2048> mtmd_side::process(const std::array<float, 5120> & hidde
 struct mtmd_expression::impl {
     mtmd_backend backend;
     ggml_context_ptr work;
-    ggml_backend_buffer_ptr buffer;
+    ggml_gallocr_ptr allocator;
     ggml_tensor * input = nullptr;
     ggml_tensor * probabilities = nullptr;
     ggml_tensor * offset = nullptr;
@@ -96,14 +98,17 @@ struct mtmd_expression::impl {
         if (!work) { throw std::runtime_error("cannot allocate expression graph"); }
         auto * ctx = work.get();
         input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5120);
+        ggml_set_input(input);
         auto * h = ggml_div(ctx, ggml_sub(ctx, input, weight("mu", 5120)), weight("sd", 5120));
         auto * logits = ggml_add(ctx, ggml_mul_mat(ctx, weight("weight", 5120, 4), h), weight("bias", 4));
         probabilities = ggml_soft_max(ctx, logits);
         auto * gated = ggml_clamp(ctx, ggml_scale_bias(ctx, probabilities, 2.0f, -1.0f), 0.0f, 1.0f);
         offset = ggml_mul_mat(ctx, weight("directions", 4, 2048), gated);
         graph = ggml_new_graph(ctx);
+        ggml_set_output(probabilities);
+        ggml_set_output(offset);
         ggml_build_forward_expand(graph, offset);
-        buffer = backend.allocate(ctx, graph);
+        allocator = backend.allocate(graph);
     }
 };
 

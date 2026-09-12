@@ -18,9 +18,10 @@ ggml_tensor * clip_graph_pockettts_spkenc::tfm_layer_forward(ggml_tensor * cur, 
     Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
     Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
 
-    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, d_head, GGML_ROPE_TYPE_NORMAL, 0,
+    const int rope_type = model.mimi_quant_in[0] ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
+    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, d_head, rope_type, 0,
                          hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, d_head, GGML_ROPE_TYPE_NORMAL, 0,
+    Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, d_head, rope_type, 0,
                          hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
     cur = build_attn(layer.o_w, nullptr, Qcur, Kcur, Vcur, kq_mask, kq_scale, il);
@@ -69,7 +70,34 @@ ggml_cgraph * clip_graph_pockettts_spkenc::build() {
 
     // voice latent -> backbone embd
     cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
-    cur = build_mm(model.spk_proj_w, cur);
+    if (model.spk_proj_w) {
+        cur = build_mm(model.spk_proj_w, cur);
+    } else {
+        // Split RVQ: the semantic and acoustic quantizers start from the same latent.
+        ggml_tensor * sum = nullptr;
+        for (int group = 0; group < 2; ++group) {
+            auto * residual = build_mm(model.mimi_quant_in[group], cur);
+            const auto * tables = model.mimi_quant_cb[group];
+            const auto * norms = model.mimi_quant_norm[group];
+            for (int64_t i = 0; i < tables->ne[2]; ++i) {
+                auto * table = ggml_view_2d(ctx0, const_cast<ggml_tensor *>(tables), tables->ne[0], tables->ne[1],
+                                           tables->nb[1], i * tables->nb[2]);
+                auto * norm = ggml_view_1d(ctx0, const_cast<ggml_tensor *>(norms), norms->ne[0], i * norms->nb[1]);
+                auto * logits = ggml_sub(ctx0, ggml_mul_mat(ctx0, table, residual), norm);
+                auto * codes = ggml_argmax(ctx0, logits);
+                auto * quantized = ggml_get_rows(ctx0, table, codes);
+                residual = ggml_sub(ctx0, residual, quantized);
+                auto * embedding = model.gen_code_out_embd_w;
+                if (group) {
+                    const auto * all = model.gen_code_embd_w;
+                    embedding = ggml_view_2d(ctx0, model.gen_code_embd_w, all->ne[0], all->ne[1], all->nb[1], i * all->nb[2]);
+                }
+                auto * row = ggml_get_rows(ctx0, embedding, codes);
+                sum = sum ? ggml_add(ctx0, sum, row) : row;
+            }
+        }
+        cur = sum;
+    }
     cb(cur, "spk_proj", -1);
 
     ggml_build_forward_expand(gf, cur);

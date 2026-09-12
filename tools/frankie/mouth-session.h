@@ -1,5 +1,6 @@
 #pragma once
 #include "brain-session.h"
+#include "breeze-mouth.h"
 #include "mtmd-helper.h"
 #include "mtmd-side.h"
 #include "mtmd.h"
@@ -15,6 +16,7 @@ class mouth_session {
     mtmd::context_ptr                                   mctx;
     std::unique_ptr<mtmd_helper::gen_audio>               generator;
     std::unique_ptr<mtmd_side>                          side;
+    std::unique_ptr<breeze_mouth>                       breeze;
     std::unique_ptr<mtmd_expression>                    expression;
     mtmd::bitmap_ptr                                    speaker;
     std::vector<int32_t>                                codes;
@@ -31,7 +33,9 @@ class mouth_session {
     void report_memory() const;
     void speak_backchannel(int reaction, bool strong, const std::function<void(const float *, size_t)> & on_audio);
     std::atomic<bool> cancelled{ false };
-    explicit mouth_session(const std::string & package, const frankie_options & options = {});
+    using voice_transcriber = std::function<std::string(const std::vector<float> &)>;
+    explicit mouth_session(const std::string & package, const frankie_options & options = {},
+                           const voice_transcriber & transcribe = {});
     using audio_callback = std::function<void(const float *, size_t)>;
     std::vector<float> speak(const brain_session::response & response, const audio_callback & on_audio = {}, const brain_session::stage_callback & on_stage = {});
 };

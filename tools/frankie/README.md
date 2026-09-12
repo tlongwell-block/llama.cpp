@@ -1,6 +1,6 @@
 # Frankie Realtime
 
-This opt-in server runs Frankie's Qwen brain, Parakeet ear, bridges, Qwen3-TTS voice, vision and turn-taking models through llama.cpp, mtmd and ggml. It accepts a single Frankie GGUF and binds to loopback. Buzz owns tools, permissions and conversation policy; the native server performs inference.
+This opt-in server runs Frankie's Qwen brain, Parakeet ear, bridges, Qwen3-TTS or Breeze voice, vision and turn-taking models through llama.cpp, mtmd and ggml. It accepts a single Frankie GGUF and binds to loopback. Buzz owns tools, permissions and conversation policy; the native server performs inference.
 
 ## Build
 
@@ -16,7 +16,7 @@ cmake --build build-frankie --target llama-frankie-realtime -j4
 # A portable macOS build also needs -DGGML_NATIVE=OFF.
 ```
 
-CPU and Metal have integration coverage. CUDA uses the same model graphs and runtime options; an actual CUDA run and 24 GiB full-context memory measurement are still required before that hardware target is accepted.
+CPU, Metal and CUDA use the same model graphs and runtime options. Measure peak device memory with the complete voice pipeline and intended context; a successful brain-only load does not establish full-system capacity.
 
 ## Start and choose thinking
 
@@ -27,6 +27,69 @@ build-frankie/bin/llama-frankie-realtime /path/to/frankie.gguf 18793 \
 ```
 
 The authenticated WebSocket endpoint is `/v1/realtime`. `/health` becomes ready after the mouth warm-up. Only one connection owns the model session at a time. There is no automatic reconnect or replay of tool effects.
+
+For a mouth with a separate text encoder, such as Breeze, `--text-encoder-device cpu` keeps that encoder on the CPU while `--device gpu` runs the brain and acoustic models on the GPU. This leaves more VRAM for context and live-audio buffers without changing quantization. The default is `gpu`; measure the additional speech latency when selecting CPU placement. Qwen3-TTS has no separate text encoder, so this option does not change its execution.
+
+### Optional MTP
+
+`--mtp-tokens N` enables the existing llama.cpp Qwen MTP draft head, with one to four proposed tokens per step. The default is zero (disabled). CPU, Metal and CUDA use the same GGUF, graphs and common speculative sampler. Both `--batch-size` and `--ubatch-size` must exceed N. More draft tokens require more verification work; measure throughput and first-audio latency for your workload before increasing N.
+
+The brain component must include a matching MTP head. A package without one still works with MTP disabled and fails explicitly if MTP is requested. Append the original model's unquantized MTP safetensors and configuration during brain export, then replace only that component in the package:
+
+```sh
+python examples/model-conversion/convert_frankie_brain.py /path/to/mlx-brain brain-mtp.gguf \
+  --mtp-model /path/to/matching-hf-mtp
+python tools/frankie/pack.py --base frankie.gguf --component brain=brain-mtp.gguf --output frankie-mtp.gguf
+... /path/to/frankie-mtp.gguf 18793 --device gpu --mtp-tokens 2
+```
+
+The exporter reuses the Qwen converter's tensor mapping and defaults MTP matrices to Q8_0. `--mtp-type q4_1` reduces the draft head's memory without requantizing the brain or voice components; measure draft acceptance when choosing it. Matching dimensions alone do not establish weight compatibility; use the head from the brain's original checkpoint and check acceptance. MTP adds weights, its attention cache and one recurrent rollback slot per proposed token on the selected device. A rejected draft uses llama.cpp sequence rollback to retain the accepted prefix, including its verified hidden rows. Raw audio and image embeddings retain their separate target hidden states through draft prefill. Only verified answer rows reach the voice bridge; thinking and tool behavior use the existing parser and sampler.
+
+For smaller devices, the standard quantizer can also reduce a vision component before packaging:
+
+```sh
+build-frankie/bin/llama-quantize vision.gguf vision-q8.gguf Q8_0
+python tools/frankie/pack.py --base frankie-mtp.gguf --component vision=vision-q8.gguf --output frankie-mtp-q8-media.gguf
+```
+
+The quantizer retains tensors that require floating-point storage or have dimensions incompatible with the quantization block size. This changes only the selected vision component; the packer verifies that all other tensors and the packaged voice remain unchanged.
+
+### Replace the brain with a fine-tune
+
+For an ordinary HF BF16/FP16 checkpoint, use the standard converter rather than the MLX-specific exporter above. Pin the checkpoint revision, preserve its tokenizer and configuration, and merge any adapters into the intended base before conversion. Keep the checkpoint's own MTP tensors; do not pass `--no-mtp` or request a head-only export.
+
+```sh
+python convert_hf_to_gguf.py /path/to/hf-checkpoint --outtype bf16 --outfile brain-bf16.gguf
+build-frankie/bin/llama-quantize --tensor-type '^blk\.64\..*=q8_0' \
+  brain-bf16.gguf brain-q4_k_s-mtp-q8.gguf Q4_K_S
+python tools/frankie/pack.py --base frankie.gguf \
+  --component brain=brain-q4_k_s-mtp-q8.gguf --output frankie-finetune.gguf
+```
+
+The head pattern above is specific to this 64-layer brain. Q4_K_S leaves more device memory for context and streaming audio than Q4_K_M; choose the type using complete-system memory and quality measurements. The packer preserves the other components and packaged reference byte for byte.
+
+A replacement must retain the supported architecture, vocabulary and token IDs, position encoding, 5120-dimensional hidden states and the trained bridge tap after layer 16. Compatible shapes alone do not establish speech quality or MTP acceptance. Test raw audio, images, speech, thinking, tools and interrupted turns, then compare MTP off and on at the intended context. A different Qwen architecture or changed hidden representation can require new runtime support or retrained bridges. Retain source and final-file hashes with the build commands for each package.
+
+### Restore conversation history
+
+Clients can restore conversation history with ordered `conversation.item.create` events before requesting a response. User messages accept `input_text` and inline `input_image`; historical assistant messages accept `output_text` or `output_audio` with a transcript. Assistant audio bytes are not imported. To preserve learned audio inputs across a new connection, replay the stored user PCM through `input_audio_buffer.append` and `input_audio_buffer.commit`, with automatic responses disabled, in its original history position. A transcript alone does not restore the learned audio rows. Live sessions retain their existing audio rows.
+
+Historical `function_call` items require `name`, JSON-object `arguments`, and a unique `call_id`. Import each matching `function_call_output` before the next message or response. Consecutive calls belong to one assistant message, including parallel historical calls. Importing a call only stores history and acknowledges `conversation.item.created`; it never publishes a response tool-call event or executes a tool. Clients must not execute imported history acknowledgments.
+
+```json
+{"type":"conversation.item.create","item":{"id":"history_assistant","type":"message","role":"assistant","content":[{"type":"output_text","text":"I checked the result."}]}}
+{"type":"conversation.item.create","item":{"id":"history_call","type":"function_call","call_id":"previous_call","name":"calculate","arguments":"{\"expression\":\"2+2\"}"}}
+{"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"previous_call","output":"4"}}
+{"type":"conversation.item.retrieve","item_id":"history_assistant"}
+```
+
+Optional item IDs must be unique within the connection and contain at most 256 ASCII letters, digits, underscores or hyphens. Items append to the tail; `previous_item_id` may be omitted, null, or the current tail ID. Other insertion positions are rejected. The existing limits remain 16 KiB instructions, 32 tools, 16 KiB message text, 256 KiB tool arguments/results, 4096 retained messages, and 1 MiB per event. A connection admits at most 65536 item IDs. A new connection starts with empty history; explicit client compression/reset should reconnect and import the chosen history.
+
+Clients that own conversation history can set `session.truncation` to `"disabled"`. A response that would exceed context, message, or audio-history capacity then fails before any old turn or tool output is removed. The default `"auto"` preserves the existing rollover behavior. After a capacity failure, reconnect and import the history selected by the client.
+
+`conversation.item.retrieve` returns `conversation.item.retrieved` with `item`. After `conversation.item.truncate`, retrieve the assistant item to obtain the same heard-prefix transcript used by the model, including its interruption marker. This also works while audio is being cancelled. Completed transcripts reflect retained conversation state; trimmed or deleted items are no longer available. Audio bytes are not returned. Retain caller-owned user PCM separately when reconnect support is needed.
+
+### Thinking
 
 Thinking defaults to off. `--thinking` accepts `none` (or `off`), `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Their reasoning budgets are 0, 128, 512, 2048, 8192, 16384, and 32768 tokens. The existing llama.cpp chat template and common sampler enforce the budget; reasoning does not feed the speech bridge or appear in spoken transcripts. More thinking can delay the first spoken answer substantially.
 
@@ -45,9 +108,11 @@ build-frankie/bin/llama-frankie-realtime /path/to/frankie.gguf 18793 \
   --device gpu --voice /path/to/my-voice.wav
 ```
 
-A non-silent WAV up to 20 seconds uses Qwen3-TTS's existing native speaker encoder. This path replaces the packaged voice and clears its ICL text and codes. It does not require rebuilding the GGUF or installing Python inference services.
+A non-silent WAV up to 20 seconds replaces the packaged voice. Qwen3-TTS uses its existing native speaker encoder and clears the packaged ICL text and codes. Breeze uses the shared Mimi reference encoder and RVQ codebooks, plus the packaged Parakeet ear to transcribe the recording. It builds the reference prefix once at startup in the same process. A matching `--voice-text-file` can override Breeze's automatic reference transcription; omit `--voice-codes` for Breeze.
 
-For reference-text/codec conditioning as well as the speaker embedding, supply all three matching inputs:
+The GGUF must include its mouth's reference encoder. Older Breeze packages containing only cached conditioning need their mouth and conditioning assets rebuilt with the current converter before `--voice` can work. Breeze releases the reference encoder's weights and compute buffers after startup; only its voice prefix stays in memory. A complete package does not need rebuilding for each new reference, and native inference requires no Python service.
+
+For Qwen3-TTS reference-text/codec conditioning as well as the speaker embedding, supply all three matching inputs:
 
 ```sh
 # I32 file: little-endian, frame-major [frames,16], codec IDs 0..2047.
@@ -55,7 +120,7 @@ For reference-text/codec conditioning as well as the speaker embedding, supply a
 ... --voice my-voice.wav --voice-text-file my-voice.txt --voice-codes my-voice.i32
 ```
 
-The native runtime does not yet encode arbitrary WAVs into ICL codec IDs. WAV-only speaker conditioning is supported; automatic generation of the optional ICL codes is separate work. Speaker caching uses exact PCM bytes, and expression offsets do not mutate the cached base voice.
+The Qwen3-TTS path does not yet encode arbitrary WAVs into ICL codec IDs. WAV-only speaker conditioning is supported; automatic generation of those optional Qwen ICL codes is separate work. Speaker caching uses exact PCM bytes, and expression offsets do not mutate the cached base voice.
 
 ## Quantization and package assembly
 
@@ -82,9 +147,26 @@ python tools/frankie/pack.py --output frankie.gguf \
 
 The custom MLX brain, vision and Parakeet exporters are in `examples/model-conversion/convert_frankie_{brain,vision,ear}.py`. The ear exporter accepts `MODEL OUTPUT` and uses the installed `parakeet_mlx` frontend; its optional middle `FIXTURE` argument preserves frozen filter/window exports. Use the existing `convert_hf_to_gguf.py` for Qwen3-TTS, once for the talker and once with `--mmproj` for the speaker/code/codec component. These source conversions need the Python dependencies of their reference models; native inference does not.
 
-Bridge, tone, optional Side, VAD, expression, turn checkpoints and matching reference codes must come from the same source configuration. In particular, tone's emotion rows come from the original brain embedding, and the Studio's default Side has zero output. Do not substitute unrelated adapters or reference codec IDs.
+Bridge, tone, optional Side, VAD, expression, turn checkpoints and matching reference codes must come from the same source configuration. In particular, tone's emotion rows come from the original brain embedding. Do not substitute unrelated adapters or reference codec IDs.
 
 To update an existing package, pass `--base existing.gguf` and only the replacement components/assets. The packer preserves unchanged tensors and metadata, verifies every written tensor against its input and writes a manifest. Failed assembly leaves an `.incomplete` file rather than a final GGUF.
+
+### Breeze components
+
+Breeze consumes the generated spoken text through its native Gemma text encoder. The brain's hidden states select expression; they do not supply the words. The implementation reuses the Qwen3 backbone, Gemma encoder, Qwen speech depth/decoder and Mimi reference-encoder graphs. Model metadata selects Breeze's depth normalization, rotary frequencies and RVQ configuration.
+
+Convert the Breeze checkpoint, including its `audio_tokenizer/` directory, and supply its cached default voice conditioning:
+
+```sh
+python tools/frankie/convert-breeze.py /path/to/breeze-source breeze-q8 \
+  --voice-conditioning /path/to/default-voice.npz --reference-rms "$reference_rms"
+python tools/frankie/pack.py --base frankie.gguf --output frankie-breeze.gguf \
+  --component talker=breeze-q8/talker.gguf \
+  --component side=breeze-q8/encoder.gguf \
+  --component mouth=breeze-q8/acoustic.gguf --breeze breeze-q8/conditioning.gguf
+```
+
+The NPZ contains the source model's `voice_prefix` array with shape `[rows, 2048]`; `reference_rms` is the measured linear RMS of that reference, in `(0, 1]`. These are model-building inputs, not requirements for a user supplying `--voice`. The converter includes the WAV encoder, codebooks and reference EOS embedding needed to replace that cached default. Eligible matrices use Q8_0; codec tensors retain source precision. Keep Breeze and Qwen-TTS packages separate and retain the source checkpoint's model license with the artifact.
 
 The September 10 package is 20,326,799,488 bytes (18.93 GiB). That is slightly above 20 decimal GB. File size alone cannot establish whether the complete system fits a 24 GiB GPU: KV/recurrent state, compute buffers, vision, audio and turn models must be counted together during execution.
 
@@ -104,7 +186,7 @@ The phrase queue copies only the token states for each spoken span. Side conditi
 
 Input uses VAD, in-speech ear prefill with a 20-frame lag, and speculative generation after short silence. VAP gates publication, with a 1500 ms silence ceiling and stale-prediction fallback. Resumed speech restores recurrent state. Short heard false starts can merge within 700 ms, without crossing published tool calls. Interruption history retains completed heard phrases rather than claiming exact word alignment.
 
-Backchannels use the shared MaAI graph at 10 Hz, the actual rendered speaker PCM, and a temporary brain probe restricted to listener reactions. They have separate bounded audio events and never create an assistant turn or execute a tool. The probe shares prefix state through llama.cpp sequence operations and restores it after selection. Normal speech supersedes listener audio.
+Backchannels use the shared MaAI graph at 10 Hz, the actual rendered speaker PCM, and a temporary brain probe restricted to listener reactions. They have separate bounded audio events and never create an assistant turn or execute a tool. The probe uses an existing llama.cpp device checkpoint and attention-suffix rollback, then restores it after selection. Normal speech supersedes listener audio.
 
 Default limits are 90 seconds per input utterance, 300 seconds of output audio per response, and 4096 answer tokens. Use `--max-utterance-seconds` (2..120), `--max-output-audio-seconds` (1..3600), and `--max-output-tokens N|inf` to change them. Realtime `session.max_output_tokens` also accepts a positive integer or `"inf"`. Reasoning has its separate budget. An overlong VAD capture is cleared, then capture resumes after silence; no partial user turn is published. Output exhaustion reports an incomplete response and keeps capture live. Immutable input checkpoints are shared with speculative work; recovery preserves the input prefix and excludes unspoken generation. There are at most 4096 history messages and 128 audio segments; history rolls over at safe boundaries within the actual context budget.
 

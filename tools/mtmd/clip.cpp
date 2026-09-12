@@ -217,15 +217,19 @@ struct clip_ctx {
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
+        init_scheduler(ctx_params);
+        debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+    }
+
+    void init_scheduler(const clip_context_params & ctx_params) {
         sched.reset(
-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
+            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, true)
         );
 
         if (ctx_params.cb_eval != nullptr) {
             ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
         }
 
-        debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
     ~clip_ctx() {
@@ -1121,11 +1125,11 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                int n_frames = ctx->model.hparams.wav_tfm_swa;
+                int n_frames = 1; // the unselected waveform branch only needs a minimal reserve
                 if (params && gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
                     const size_t groups = ctx->model.gen_code_head_w->ne[2] + 1;
                     if (!params->codes || params->codes->empty() || params->codes->size() % groups ||
-                        params->codes->size() / groups > (size_t) n_frames) {
+                        params->codes->size() / groups > (size_t) ctx->model.hparams.wav_tfm_swa) {
                         throw std::runtime_error("invalid Qwen decoder frame count");
                     }
                     n_frames = (int) (params->codes->size() / groups);
@@ -1352,6 +1356,7 @@ struct clip_model_loader {
                 }
             } else if (is_audio) {
                 get_u32(KEY_A_NUM_MEL_BINS, hparams.n_mel_bins);
+                get_string(KEY_GEN_AUDIO_VARIANT, hparams.gen_model_variant, false);
                 // some hparams are unused, but still need to set to avoid issues
                 hparams.image_size = 0;
                 hparams.patch_size = 1;
@@ -1856,7 +1861,7 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_QWEN3TTS_GEN:
                     {
                         // TODO: hardcoded for now, read from code_predictor_config instead
-                        hparams.rope_theta = 1000000.0f;
+                        hparams.rope_theta = hparams.gen_model_variant == "breeze" ? 500000.0f : 1000000.0f;
 
                         // code2wav params
                         hparams.wav_tfm_n_layer      = 8;
@@ -1887,6 +1892,12 @@ struct clip_model_loader {
                         // flow_lm defaults, see pocket_tts/default_parameters.py
                         hparams.flow_n_step       = 1;
                         hparams.gen_eos_threshold = -4.0f;
+                        if (hparams.gen_model_variant == "breeze") {
+                            hparams.seanet_ratios = {4, 5, 6, 8};
+                            hparams.seanet_n_stage = hparams.seanet_ratios.size();
+                            hparams.mimi_downsample = 2;
+                            hparams.mimi_tfm_context = 8000;
+                        }
                     } break;
                 case PROJECTOR_TYPE_PADDLEOCR:
                     {
@@ -2997,7 +3008,17 @@ struct clip_model_loader {
                 {
                     load_seanet(model.seanet, false);
                     model.downsample_w = get_tensor(string_format(TN_A_DOWNSAMPLE_CONV, "weight"));
-                    model.spk_proj_w   = get_tensor(string_format(TN_A_SPEAKER_PROJ, "weight"));
+                    if (hparams.gen_model_variant == "breeze") {
+                        for (int i = 0; i < 2; ++i) {
+                            model.mimi_quant_in[i] = get_tensor(string_format("a.rvq.%d.in.weight", i));
+                            model.mimi_quant_cb[i] = get_tensor(string_format("a.rvq.%d.codebook.weight", i));
+                            model.mimi_quant_norm[i] = get_tensor(string_format("a.rvq.%d.norm", i));
+                        }
+                        model.gen_code_out_embd_w = get_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD, "weight"));
+                        model.gen_code_embd_w = get_tensor(string_format(TN_A_GEN_CODE_EMBD, "weight"));
+                    } else {
+                        model.spk_proj_w = get_tensor(string_format(TN_A_SPEAKER_PROJ, "weight"));
+                    }
                 } break;
             case PROJECTOR_TYPE_POCKETTTS_GEN:
                 {
@@ -3077,6 +3098,7 @@ struct clip_model_loader {
                     model.gen_code_head_w     = get_tensor(string_format(TN_A_GEN_CODE_HEAD,     "weight"));
                     model.gen_code_out_embd_w = get_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD, "weight"));
                     model.gen_code_norm_w     = get_tensor(string_format(TN_A_GEN_CODE_NORM,     "weight"));
+                    model.gen_code_rope_freqs = get_tensor("a.gen.code.rope_freqs.weight", false);
 
                     // code2wav: RVQ codes -> raw PCM, lives in the same ctx as code_predictor
                     {
@@ -3719,7 +3741,7 @@ struct clip_model_loader {
     }
 
     static void init_ctx(clip_ctx & ctx_clip) {
-        ctx_clip.buf_compute_meta.resize(ctx_clip.max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+        ctx_clip.buf_compute_meta.resize(ctx_clip.max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(ctx_clip.max_nodes, false));
 
         // check batching support
         auto batch = get_dummy_batch(ctx_clip);
@@ -3802,7 +3824,9 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+            throw std::runtime_error("cannot allocate projector compute buffers");
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -4037,8 +4061,15 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             ctx_gen_audio = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_gen_audio->model, CLIP_MODALITY_GEN_AUDIO);
             loader.load_tensors(*ctx_gen_audio);
+            if (ctx_gen_audio->model.proj_type == PROJECTOR_TYPE_QWEN3TTS_GEN) {
+                // The depth decoder unrolls one transformer per residual codebook.
+                const auto & model = ctx_gen_audio->model;
+                ctx_gen_audio->max_nodes = std::max<int64_t>(ctx_gen_audio->max_nodes,
+                    2048 + 128 * (model.layers.size() + 1) * (model.gen_code_head_w->ne[2] + 1));
+                ctx_gen_audio->init_scheduler(ctx_params);
+            }
             // TODO: fix warmup
-            ctx_gen_audio->buf_compute_meta.resize(ctx_gen_audio->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+            ctx_gen_audio->buf_compute_meta.resize(ctx_gen_audio->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(ctx_gen_audio->max_nodes, false));
         }
 
     } catch (const std::exception & e) {
@@ -4396,8 +4427,8 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             {
                 // one conditioning row per 12.5Hz frame
-                const int hop = ctx->model.hparams.mimi_downsample * 120;
-                n_patches = img->nx() / hop;
+                const int hop = ctx->model.hparams.mimi_downsample * ctx->model.hparams.mimi_encoder_hop();
+                n_patches = (img->nx() + hop - 1) / hop;
             } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
@@ -4468,7 +4499,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {
-        clip_model_loader::warmup(*ctx, *params->imgs);
+        const auto flash_attn_type = ctx->flash_attn_type;
+        try {
+            clip_model_loader::warmup(*ctx, *params->imgs);
+        } catch (const std::exception & e) {
+            ctx->flash_attn_type = flash_attn_type;
+            LOG_ERR("%s: %s\n", __func__, e.what());
+            return false;
+        }
     }
 
     if (params->seed != ctx->rng_seed) {
@@ -4479,7 +4517,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+        return false;
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -4548,7 +4589,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         set_input_i32("inp_pos", positions);
 
         // the preprocessor truncates the waveform to keep this mask bounded
-        const int64_t max_pos = (int64_t) clip_hparams::pockettts_max_spk_seconds * hparams.audio_sample_rate / 120;
+        const int64_t max_pos = (int64_t) clip_hparams::pockettts_max_spk_seconds * hparams.audio_sample_rate / hparams.mimi_encoder_hop();
         GGML_ASSERT(n_pos <= max_pos && "pocket-tts speaker reference too long for a dense mask");
 
         const int64_t context = hparams.mimi_tfm_context;
@@ -6060,7 +6101,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             return ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
-            return ctx->model.spk_proj_w->ne[1];
+            return ctx->model.spk_proj_w ? ctx->model.spk_proj_w->ne[1] : ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             return ctx->model.gen_input_lin_w->ne[1];
         case PROJECTOR_TYPE_PARAKEET:
