@@ -12,6 +12,7 @@ namespace httplib::detail {
 #include "../tools/frankie/brain-output.h"
 #include "../tools/frankie/turn-session.h"
 #include "../tools/frankie/token-boundary.h"
+#include "../tools/frankie/image-input.h"
 #include "llama-cpp.h"
 #endif
 
@@ -67,6 +68,23 @@ struct test_registry {
 
 
 #ifdef LLAMA_TEST_FRANKIE
+MAKE_TEST(test_frankie_image_transport) {
+    for (const auto * detail : {"auto", "low", "high"}) { frankie_image_detail(detail); }
+    bool rejected = false;
+    try { frankie_image_detail("invalid"); } catch (const std::invalid_argument &) { rejected = true; }
+    t.assert_true("invalid detail rejected", rejected);
+    for (const auto * mime : {"png", "jpeg"}) {
+        const auto data = frankie_image_bytes(std::string("data:image/") + mime + ";base64,aGVsbG8=", true);
+        t.assert_equal("standard inline transport", std::string("hello"), std::string(data.begin(), data.end()));
+    }
+    for (const auto * url : {"https://example.com/image.png", "file:///image.png",
+                            "data:image/png,abc", "data:image/png;base64,???", "data:image/png;base64,"}) {
+        rejected = false;
+        try { frankie_image_bytes(url, true); } catch (const std::exception &) { rejected = true; }
+        t.assert_true("invalid realtime image transport rejected", rejected);
+    }
+}
+
 MAKE_TEST(test_frankie_long_token_boundary) {
     const char * package = std::getenv("FRANKIE_PACKAGE_FIXTURE");
     if (!package) { std::cout << "SKIP long token boundary: set FRANKIE_PACKAGE_FIXTURE\n"; return; }

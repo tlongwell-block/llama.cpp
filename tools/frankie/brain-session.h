@@ -13,15 +13,23 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <mutex>
 
-// One worker owns this object; cancellation is the only cross-thread operation.
+// Compute is serialized; HTTP sequences share weights with the voice worker.
 class brain_session {
+    friend class frankie_completions;
+    friend class speech_stream;
   public:
     struct output_limit : std::runtime_error {
         explicit output_limit(const char * reason) : std::runtime_error(reason) {}
     };
     struct request;
   private:
+    mutable std::recursive_mutex compute_mutex;
+    std::function<void()> background_step;
+    std::atomic<bool> speech_active{false};
+    std::atomic<int64_t> speech_buffer_until_us{0};
+    std::atomic<bool> http_pending{false};
     component                                           encoder_source, bridge_source, brain_source, vision_source;
     std::unique_ptr<clip_ctx, decltype(&clip_free)>     encoder{ nullptr, clip_free };
     std::unique_ptr<mtmd_ear>                           ear;
@@ -72,6 +80,7 @@ class brain_session {
     void save_checkpoint(const std::string & prefix, int pos, size_t used);
     void                      decode_text(const std::string & text, int & pos, size_t & used);
   public:
+    int64_t audio_lead_ms() const { return http_pending.load() ? 800 : 240; }
     size_t audio_row_limit() const { return (options.max_utterance_seconds * 1000 + 79) / 80 + 2; }
     size_t context_tokens() const { return options.context_tokens; }
     static constexpr size_t max_messages = 4096;

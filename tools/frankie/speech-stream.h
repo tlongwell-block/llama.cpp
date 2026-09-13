@@ -48,6 +48,8 @@ class speech_stream {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (!audio_samples) { audio_clock = std::chrono::steady_clock::now(); }
                     audio_samples += samples;
+                    brain.speech_buffer_until_us = std::chrono::duration_cast<std::chrono::microseconds>(audio_clock.time_since_epoch()).count()
+                        + int64_t(audio_samples * 1000000 / 24000);
                     changed.notify_all();
                 }, on_stage);
                 {
@@ -68,7 +70,11 @@ class speech_stream {
   public:
     speech_stream(brain_session & b, mouth_session & m, mouth_session::audio_callback audio, brain_session::stage_callback stage = {},
                   std::function<void(const std::string &)> phrase = {}) :
-        brain(b), mouth(m), on_audio(std::move(audio)), on_stage(std::move(stage)), on_phrase(std::move(phrase)), worker([this] { consume(); }) {}
+        brain(b), mouth(m), on_audio(std::move(audio)), on_stage(std::move(stage)), on_phrase(std::move(phrase)) {
+        brain.speech_buffer_until_us = 0;
+        brain.speech_active = true;
+        worker = std::thread([this] { consume(); });
+    }
 
     ~speech_stream() {
         {
@@ -81,6 +87,7 @@ class speech_stream {
             mouth.cancelled = true;
             worker.join();
         }
+        brain.speech_active = false;
     }
 
     void feed(const brain_session::response & response, bool last) {
@@ -119,6 +126,10 @@ class speech_stream {
         }
         std::unique_lock<std::mutex> lock(mutex);
         while (queue.size() >= 2 && !brain.cancelled.load() && !failure) {
+            // Committed voice rows are owned by the response before this callback.
+            lock.unlock();
+            if (brain.background_step) { brain.background_step(); }
+            lock.lock();
             changed.wait_for(lock, std::chrono::milliseconds(20));
         }
         if (failure) {

@@ -48,8 +48,12 @@ brain_session::brain_session(const std::string & package, const frankie_options 
         throw std::runtime_error("brain load failed");
     }
     auto cp              = llama_context_default_params();
-    cp.n_ctx             = context_tokens();
-    cp.n_seq_max         = 1;
+    cp.n_ctx             = context_tokens() + options.http_context_tokens * options.http_slots;
+    cp.n_seq_max         = 1 + options.http_slots;
+    if (options.http_slots) {
+        cp.n_outputs_max = std::max(1 + options.mtp_tokens, options.http_slots);
+        cp.n_outputs_max_per_seq = 1 + options.mtp_tokens;
+    }
     cp.n_rs_seq          = options.mtp_tokens;
     cp.kv_unified        = true;
     cp.type_k            = options.cache_type == "q4_0" ? GGML_TYPE_Q4_0 : options.cache_type == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
@@ -91,7 +95,7 @@ brain_session::brain_session(const std::string & package, const frankie_options 
         sp.draft.n_max = options.mtp_tokens;
         sp.draft.n_min = 1;
         sp.draft.p_min = 0.0f;
-        speculative.reset(common_speculative_init(sp, 1));
+        speculative.reset(common_speculative_init(sp, cp.n_seq_max));
         if (!speculative) { throw std::runtime_error("MTP initialization failed"); }
     }
     llama_set_embeddings_layer_inp(ctx.get(), 17, true);
@@ -110,6 +114,7 @@ brain_session::brain_session(const std::string & package, const frankie_options 
 }
 
 std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, std::string * transcript) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     const auto started = std::chrono::steady_clock::now();
     if (pcm.empty() || pcm.size() > 16000 * options.max_utterance_seconds) {
         throw std::runtime_error("audio bounds");
@@ -155,7 +160,7 @@ std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, s
 
 brain_session::image_ptr brain_session::decode_image(const std::vector<unsigned char> & bytes) {
     int nx = 0, ny = 0, nc = 0;
-    if (bytes.empty() || bytes.size() > 512 * 1024 ||
+    if (bytes.empty() || bytes.size() > 10 * 1024 * 1024 ||
         !stbi_info_from_memory(bytes.data(), bytes.size(), &nx, &ny, &nc) || nx <= 0 || ny <= 0 || nx > 4096 ||
         ny > 4096 || int64_t(nx) * ny > 4 * 1024 * 1024) {
         throw std::runtime_error("image format/dimension bounds");
@@ -217,6 +222,7 @@ void brain_session::decode_text(const std::string & text, int & pos, size_t & us
 // with learned ear rows during prefill. The server rejects markers in external
 // text, instructions and tool output. Recurrent state rolls back only to a full sequence checkpoint.
 void brain_session::reset(bool preserve_checkpoint) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     cache_valid = false;
     partial_prefix.clear();
     partial_marker.clear();
@@ -284,9 +290,21 @@ brain_session::sequence_state brain_session::capture_sequence() {
 }
 
 void brain_session::clear_sequence() {
-    llama_memory_clear(llama_get_memory(ctx.get()), true);
+    if (options.http_slots) {
+        if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
+            throw std::runtime_error("voice sequence reset failed");
+        }
+    } else {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+    }
     if (speculative) {
-        llama_memory_clear(llama_get_memory(draft_ctx.get()), true);
+        if (options.http_slots) {
+            if (!llama_memory_seq_rm(llama_get_memory(draft_ctx.get()), 0, -1, -1)) {
+                throw std::runtime_error("voice draft reset failed");
+            }
+        } else {
+            llama_memory_clear(llama_get_memory(draft_ctx.get()), true);
+        }
         common_speculative_set_state(speculative.get(), 0, {});
     }
 }
@@ -320,6 +338,7 @@ void brain_session::save_checkpoint(const std::string & prefix, int pos, size_t 
 }
 
 brain_session::saved_state brain_session::suspend_state() {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     saved_state saved;
     saved.sequence = capture_sequence();
     // Speculation also needs this immutable prefix; sharing avoids a large copy.
@@ -340,6 +359,7 @@ brain_session::saved_state brain_session::suspend_state() {
 }
 
 brain_session::listener_reaction brain_session::probe_listener(const request & input) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     if (partial_marker.empty() || partial_rows.size() < 8 * 5120) { return {}; }
     auto chat = input.chat;
     chat.enable_thinking = false;
@@ -392,6 +412,7 @@ brain_session::listener_reaction brain_session::probe_listener(const request & i
 }
 
 void brain_session::restore_state(saved_state saved) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     restore_sequence(saved.sequence);
     checkpoint = std::move(saved.checkpoint);
     checkpoint_prefix = std::move(saved.checkpoint_prefix);
@@ -409,6 +430,7 @@ void brain_session::restore_state(saved_state saved) {
 }
 
 void brain_session::warm_prefix(common_chat_templates_inputs input) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     if (input.messages.size() != 1 || input.messages[0].role != "system") {
         throw std::runtime_error("warm prefix requires only system context");
     }
@@ -597,6 +619,7 @@ void brain_session::prefill(const request & request, const std::string & prompt,
 }
 
 void brain_session::precommit(const request & input, const std::string & marker, const std::vector<float> & rows, size_t count) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     if (count == 0 || rows.size() % 5120 || count >= rows.size() / 5120 || count >= audio_row_limit()) {
         throw std::runtime_error("precommit row bounds");
     }
@@ -638,6 +661,7 @@ void brain_session::precommit(const request & input, const std::string & marker,
 }
 
 void brain_session::finish_audio(const request & input, const std::string & marker, std::vector<float> & rows) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     const auto formatted = common_chat_templates_apply(templates.get(), input.chat);
     if (marker == partial_marker && formatted.prompt.compare(0, partial_prefix.size(), partial_prefix) == 0 &&
         formatted.prompt.compare(partial_prefix.size(), marker.size(), marker) == 0) {
@@ -647,6 +671,7 @@ void brain_session::finish_audio(const request & input, const std::string & mark
 }
 
 brain_session::response brain_session::generate(const request & request, const stream_callback & on_text, const stage_callback & on_stage) {
+    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     const auto & input      = request.chat;
     const auto & audio_rows = request.audio_rows;
     if (request.reasoning_budget < 0 || request.reasoning_budget > 32768 ||
@@ -798,9 +823,11 @@ brain_session::response brain_session::generate(const request & request, const s
                 result.raw.text.compare(result.content_offset, result.message.content.size(), result.message.content) != 0)) {
                 result.content_offset = result.raw.text.rfind(result.message.content);
             }
-            if (on_text) { on_text(result, false); }
         }
         pending = ids.back();
+        // Copy every committed row before callbacks can pump HTTP work.
+        if (on_text) { on_text(result, false); }
+        if (background_step) { background_step(); }
     }
     if (speculative) {
         std::cerr << "brain_mtp drafted=" << drafted_tokens << " accepted=" << accepted_tokens << "\n";

@@ -26,9 +26,42 @@ build-frankie/bin/llama-frankie-realtime /path/to/frankie.gguf 18793 \
   --device gpu --ctx-size 131072 --cache-type q4_0 --thinking none
 ```
 
-The authenticated WebSocket endpoint is `/v1/realtime`. `/health` becomes ready after the mouth warm-up. Only one connection owns the model session at a time. There is no automatic reconnect or replay of tool effects.
+The authenticated WebSocket endpoint is `/v1/realtime`. `/health` becomes ready after the mouth warm-up. Only one connection owns the voice session at a time. There is no automatic reconnect or replay of tool effects. `--host` defaults to `127.0.0.1`; set `--host 0.0.0.0` to accept LAN connections. The same bearer token authenticates HTTP and WebSocket requests.
 
 For a mouth with a separate text encoder, such as Breeze, `--text-encoder-device cpu` keeps that encoder on the CPU while `--device gpu` runs the brain and acoustic models on the GPU. This leaves more VRAM for context and live-audio buffers without changing quantization. The default is `gpu`; measure the additional speech latency when selecting CPU placement. Qwen3-TTS has no separate text encoder, so this option does not change its execution.
+
+### Experimental concurrent text and image requests
+
+Add `--http-slots 2 --http-ctx-size 4096` to expose `/v1/chat/completions`,
+`/v1/completions`, and `/v1/models` on the same port. HTTP requests share the
+loaded brain and vision weights; each slot owns its context and sampler.
+The default is zero HTTP slots. The HTTP context limit includes prompt and
+output tokens and is separate from `--ctx-size`, which still applies to voice.
+The additional slots use the selected `--cache-type`. Voice retains MTP;
+HTTP decoding currently uses the ordinary autoregressive sampler.
+
+Use a standard OpenAI client with this server's base URL and bearer token.
+Chat messages accept ordered `text` and `image_url` content parts, including
+multiple images, inline base64 data URLs, and HTTP(S) image URLs. The legacy
+`/v1/completions` endpoint accepts a text prompt. Both support streamed SSE
+and non-streamed results. `stream_options.include_usage` returns final usage.
+Each chat request accepts at most four images, with a 10 MiB limit per image
+and an 18 MiB request-body limit. Bitmap dimension limits still apply.
+
+Realtime uses `conversation.item.create` user messages containing
+`{"type":"input_image","image_url":"data:image/png;base64,..."}` alongside
+`input_text` parts. Realtime image URLs must contain inline PNG or JPEG data.
+Both image interfaces accept `detail: "auto"`, `"low"`, or `"high"`; like the
+ordinary llama.cpp handler, preprocessing uses the model's configured image
+budget rather than OpenAI-specific resolution tiers.
+
+HTTP work advances between bounded brain steps. While requests are pending,
+the speech producer may keep up to 800 ms of audio ahead to absorb compute
+bursts; voice-only buffering stays unchanged. Long prompts and images can
+still take time to produce their first text token. Contexts and cancellation
+are independent; cancelling a voice reply does not cancel HTTP requests.
+This is an experimental subset of the completion APIs. Unsupported options
+return explicit errors; the Responses API is not exposed.
 
 ### Optional MTP
 
@@ -83,7 +116,7 @@ Historical `function_call` items require `name`, JSON-object `arguments`, and a 
 {"type":"conversation.item.retrieve","item_id":"history_assistant"}
 ```
 
-Optional item IDs must be unique within the connection and contain at most 256 ASCII letters, digits, underscores or hyphens. Items append to the tail; `previous_item_id` may be omitted, null, or the current tail ID. Other insertion positions are rejected. The existing limits remain 16 KiB instructions, 32 tools, 16 KiB message text, 256 KiB tool arguments/results, 4096 retained messages, and 1 MiB per event. A connection admits at most 65536 item IDs. A new connection starts with empty history; explicit client compression/reset should reconnect and import the chosen history.
+Optional item IDs must be unique within the connection and contain at most 256 ASCII letters, digits, underscores or hyphens. Items append to the tail; `previous_item_id` may be omitted, null, or the current tail ID. Other insertion positions are rejected. The existing limits remain 16 KiB instructions, 32 tools, 16 KiB message text, 256 KiB tool arguments/results, 4096 retained messages, and 18 MiB per event. A connection admits at most 65536 item IDs. A new connection starts with empty history; explicit client compression/reset should reconnect and import the chosen history.
 
 Clients that own conversation history can set `session.truncation` to `"disabled"`. A response that would exceed context, message, or audio-history capacity then fails before any old turn or tool output is removed. The default `"auto"` preserves the existing rollover behavior. After a capacity failure, reconnect and import the history selected by the client.
 

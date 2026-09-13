@@ -1,5 +1,7 @@
 #include "base64.hpp"
 #include "brain-session.h"
+#include "completions.h"
+#include "image-input.h"
 #include "common.h"
 #include "cpp-httplib/httplib.h"
 #include "mouth-session.h"
@@ -974,18 +976,12 @@ struct realtime_session {
                         throw std::runtime_error("image history full");
                     }
                     auto url    = part.at("image_url").get<std::string>();
-                    auto comma  = url.find(',');
-                    auto header = url.substr(0, comma);
-                    if (comma == std::string::npos ||
-                        (header != "data:image/png;base64" && header != "data:image/jpeg;base64")) {
-                        throw std::runtime_error("inline PNG or JPEG required");
-                    }
-                    auto bytes  = base64::decode(url.substr(comma + 1));
-                    auto image  = brain.decode_image({ bytes.begin(), bytes.end() });
+                    frankie_image_detail(part.value("detail", "auto"));
+                    auto image = brain.decode_image(frankie_image_bytes(url, true));
                     auto marker = "[FRANKIE_IMAGE_" + next_id("image_") + "]";
                     images.emplace(marker, std::move(image));
                     message.content += marker;
-                    content.push_back({{"type", kind}, {"image_url", url}});
+                    content.push_back({{"type", kind}, {"image_url", url}, {"detail", part.value("detail", "auto")}});
                 } else {
                     throw std::runtime_error("unsupported content; use input_audio_buffer for audio");
                 }
@@ -1173,7 +1169,7 @@ struct realtime_session {
                 auto emit_audio = [&](const float * samples, size_t count) {
                     await_authorization(turn);
                     if (!audio_clock) { audio_clock = std::chrono::steady_clock::now(); }
-                    const auto due = *audio_clock + std::chrono::milliseconds(std::max(int64_t(0), int64_t(scheduled_samples / 24) - 240));
+                    const auto due = *audio_clock + std::chrono::milliseconds(std::max(int64_t(0), int64_t(scheduled_samples / 24) - brain.audio_lead_ms()));
                     while (std::chrono::steady_clock::now() < due && !brain.cancelled.load()) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     }
@@ -1384,7 +1380,7 @@ struct realtime_session {
             std::lock_guard<std::mutex> lock(state);
             std::string                 client_event_id;
             try {
-                if (bytes.size() > 1024 * 1024) {
+                if (bytes.size() > 18 * 1024 * 1024) {
                     throw std::runtime_error("event too large");
                 }
                 auto event = json::parse(bytes);
@@ -1469,7 +1465,7 @@ int main(int argc, char ** argv) {
                          "  [--text-encoder-device cpu|gpu]\n"
                          "  [--ctx-size N] [--cache-type q4_0|q8_0|f16] [--batch-size N] [--ubatch-size N]\n"
                          "  [--thinking none|minimal|low|medium|high|xhigh|max] [--speech-context-words N]\n"
-                         "  [--mtp-tokens 0..4]\n"
+                         "  [--mtp-tokens 0..4] [--host ADDRESS] [--http-slots 0..8] [--http-ctx-size N]\n"
                          "  [--max-utterance-seconds N] [--max-output-audio-seconds N] [--max-output-tokens N|inf]\n"
                          "  [--voice WAV] [--voice-text-file TXT --voice-codes I32]\n"
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
@@ -1480,6 +1476,7 @@ int main(int argc, char ** argv) {
             return argc == 2 && std::strcmp(argv[1], "--help") == 0 ? 0 : 1;
         }
         frankie_options options;
+        std::string host = "127.0.0.1";
         for (int i = 3; i < argc; ++i) {
             const std::string key = argv[i];
             if (++i == argc) { throw std::runtime_error("missing value for " + key); }
@@ -1491,6 +1488,7 @@ int main(int argc, char ** argv) {
                 if (value != "cpu" && value != "gpu") { throw std::runtime_error("text encoder device must be cpu or gpu"); }
                 options.text_encoder_gpu = value == "gpu";
             } else if (key == "--threads") { options.threads = int(frankie_unsigned(value)); }
+            else if (key == "--host") { host = value; }
             else if (key == "--voice") { options.voice = value; }
             else if (key == "--voice-text-file") { options.voice_text = value; }
             else if (key == "--voice-codes") { options.voice_codes = value; }
@@ -1513,6 +1511,8 @@ int main(int argc, char ** argv) {
             else if (key == "--thinking") { options.thinking = value; }
             else if (key == "--speech-context-words") { options.speech_context_words = frankie_unsigned(value); }
             else if (key == "--mtp-tokens") { options.mtp_tokens = frankie_unsigned(value); }
+            else if (key == "--http-slots") { options.http_slots = frankie_unsigned(value); }
+            else if (key == "--http-ctx-size") { options.http_context_tokens = frankie_unsigned(value); }
             else if (key == "--ear-model") { options.ear_model = value; }
             else if (key == "--talker-model") { options.talker_model = value; }
             else if (key == "--mouth-model") { options.mouth_model = value; }
@@ -1522,7 +1522,8 @@ int main(int argc, char ** argv) {
         }
         const auto port = frankie_unsigned(argv[2]);
         if (!port || port > 65535) { throw std::runtime_error("port must be 1..65535"); }
-        if (options.mtp_tokens > 4 || options.batch_size > 8192 || options.ubatch_size > (options.batch_size ? options.batch_size : (options.use_gpu ? 512u : 128u)) ||
+        if (host.empty()) { throw std::runtime_error("host must not be empty"); }
+        if (options.http_context_tokens < 128 || options.http_context_tokens > 262144 || options.http_slots > 8 || options.mtp_tokens > 4 || options.batch_size > 8192 || options.ubatch_size > (options.batch_size ? options.batch_size : (options.use_gpu ? 512u : 128u)) ||
             options.max_utterance_seconds < 2 || options.max_utterance_seconds > 120 ||
             !options.max_output_audio_seconds || options.max_output_audio_seconds > 3600 ||
             options.max_output_tokens > options.context_tokens || options.threads < 1 || options.threads > 256 || options.context_tokens < 4096 || options.context_tokens > 262144 ||
@@ -1555,8 +1556,9 @@ int main(int argc, char ** argv) {
         mouth.warmup();
         mouth.report_memory();
         httplib::Server   server;
+        frankie_completions completions(brain, server, options.http_slots);
         std::atomic<bool> occupied{ false };
-        server.set_payload_max_length(1024 * 1024);
+        server.set_payload_max_length(18 * 1024 * 1024);
         server.set_read_timeout(30);
         server.set_write_timeout(10);
         server.Get("/health", [](const auto &, auto & response) { response.set_content("ready", "text/plain"); });
@@ -1574,6 +1576,10 @@ int main(int argc, char ** argv) {
             occupied = false;
         });
         server.set_pre_routing_handler([&](const auto & request, auto & response) {
+            if (request.path.rfind("/v1/", 0) == 0 && request.get_header_value("Authorization") != auth) {
+                response.status = 401;
+                return httplib::Server::HandlerResponse::Handled;
+            }
             if (request.path == "/v1/realtime") {
                 if (request.get_header_value("Authorization") != auth) {
                     response.status = 401;
@@ -1586,8 +1592,8 @@ int main(int argc, char ** argv) {
             }
             return httplib::Server::HandlerResponse::Unhandled;
         });
-        std::cerr << "Realtime prototype ready on loopback\n";
-        if (!server.listen("127.0.0.1", port)) {
+        std::cerr << "Frankie ready on " << host << ":" << port << "\n";
+        if (!server.listen(host, port)) {
             throw std::runtime_error("listen failed");
         }
     } catch (const std::exception & e) {

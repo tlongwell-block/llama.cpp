@@ -15,6 +15,8 @@ struct frankie_options {
     uint32_t batch_size = 0; // automatic: 128 CPU, 512 GPU
     uint32_t ubatch_size = 0; // automatic: 128 CPU, 512 GPU
     uint32_t mtp_tokens = 0; // opt-in, requires an appended MTP head in the brain component
+    uint32_t http_slots = 0; // experimental shared-brain HTTP slots
+    uint32_t http_context_tokens = 4096;
     uint32_t context_tokens = 131072;
     uint32_t max_utterance_seconds = 90;
     uint32_t max_output_audio_seconds = 300;
