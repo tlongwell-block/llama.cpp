@@ -51,7 +51,7 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     cp.n_ctx             = context_tokens() + options.http_context_tokens * options.http_slots;
     cp.n_seq_max         = 1 + options.http_slots;
     if (options.http_slots) {
-        cp.n_outputs_max = std::max(1 + options.mtp_tokens, options.http_slots);
+        cp.n_outputs_max = (1 + options.mtp_tokens) * std::max(1u, options.http_slots);
         cp.n_outputs_max_per_seq = 1 + options.mtp_tokens;
     }
     cp.n_rs_seq          = options.mtp_tokens;

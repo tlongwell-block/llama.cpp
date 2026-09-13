@@ -37,8 +37,10 @@ Add `--http-slots 2 --http-ctx-size 4096` to expose `/v1/chat/completions`,
 loaded brain and vision weights; each slot owns its context and sampler.
 The default is zero HTTP slots. The HTTP context limit includes prompt and
 output tokens and is separate from `--ctx-size`, which still applies to voice.
-The additional slots use the selected `--cache-type`. Voice retains MTP;
-HTTP decoding currently uses the ordinary autoregressive sampler.
+The additional slots use the selected `--cache-type`. `--mtp-tokens` applies
+to both voice and HTTP requests. They share the existing MTP head, with
+independent draft histories and target verification for each request.
+The batch size must exceed the HTTP slot count times `1 + --mtp-tokens`.
 
 Use a standard OpenAI client with this server's base URL and bearer token.
 Chat messages accept ordered `text` and `image_url` content parts, including

@@ -20,8 +20,9 @@ class frankie_completions {
         std::atomic<bool> cancelled{false};
         std::string id, raw, sent, reasoning, error;
         const int64_t created = std::time(nullptr);
-        llama_tokens prompt;
+        llama_tokens prompt, draft;
         size_t offset = 0, generated = 0, maximum = 512;
+        size_t drafted = 0, accepted = 0;
         llama_pos pos = 0;
         std::map<std::string, brain_session::image_ptr> images;
         std::vector<mtmd::input_chunks_ptr> chunks;
@@ -118,6 +119,10 @@ class frankie_completions {
     }
 
     void finish(job & j, const std::string & reason) {
+        if (brain.speculative) {
+            std::cerr << "http_mtp id=" << j.id << " generated=" << j.generated
+                      << " drafted=" << j.drafted << " accepted=" << j.accepted << "\n";
+        }
         common_chat_msg message;
         message.role = "assistant";
         message.content = j.raw;
@@ -161,13 +166,22 @@ class frankie_completions {
         j.changed.notify_all();
     }
 
-    int decode(const llama_batch & batch) {
-        llama_set_abort_callback(brain.ctx.get(), nullptr, nullptr);
-        const int rc = llama_decode(brain.ctx.get(), batch);
-        llama_set_abort_callback(brain.ctx.get(), [](void * user) {
+    void set_abort_callback(bool enabled) {
+        ggml_abort_callback callback = enabled ? +[](void * user) {
             return static_cast<brain_session *>(user)->cancelled.load();
-        }, &brain);
-        return rc;
+        } : nullptr;
+        for (auto * ctx : {brain.ctx.get(), brain.draft_ctx.get()}) {
+            if (ctx) { llama_set_abort_callback(ctx, callback, &brain); }
+        }
+    }
+
+    void clear(job & j) {
+        llama_memory_seq_rm(llama_get_memory(brain.ctx.get()), j.seq, -1, -1);
+        if (brain.speculative) {
+            llama_memory_seq_rm(llama_get_memory(brain.draft_ctx.get()), j.seq, -1, -1);
+            common_speculative_set_state(brain.speculative.get(), j.seq, {});
+            common_speculative_get_draft_params(brain.speculative.get(), j.seq) = {};
+        }
     }
 
     void image_step(job & j, const mtmd_input_chunk * chunk, size_t count) {
@@ -192,7 +206,7 @@ class frankie_completions {
             return;
         }
         count = std::min(count, size_t(j.image_batch->batch.n_tokens) - j.image_offset);
-        if (decode(j.image_batch->get_view(j.image_offset, count))) { throw std::runtime_error("image prefill failed"); }
+        if (brain.decode(j.image_batch->get_view(j.image_offset, count))) { throw std::runtime_error("image prefill failed"); }
         j.image_offset += count;
         if (j.image_offset == size_t(j.image_batch->batch.n_tokens)) {
             j.offset += j.image_offset;
@@ -212,9 +226,38 @@ class frankie_completions {
         std::lock_guard<std::recursive_mutex> compute_lock(brain.compute_mutex);
         if (!has_headroom()) { return; }
         std::lock_guard<std::mutex> lock(mutex);
+        set_abort_callback(false);
+        struct restore_abort {
+            frankie_completions & owner;
+            ~restore_abort() { owner.set_abort_callback(true); }
+        } restore{*this};
+        const auto * vocab = llama_model_get_vocab(brain.model.get());
+        if (brain.speculative) {
+            for (auto & slot : slots) {
+                if (!slot || slot->done || slot->cancelled || !slot->ready || slot->offset < slot->prompt.size()) { continue; }
+                auto & j = *slot;
+                j.draft.clear();
+                if (j.maximum - j.generated > 1) {
+                    common_speculative_get_draft_params(brain.speculative.get(), j.seq) = {
+                        true, int32_t(std::min<size_t>(brain.options.mtp_tokens, j.maximum - j.generated - 1)),
+                        j.pos, j.pending, &j.prompt, &j.draft,
+                    };
+                }
+            }
+            common_speculative_draft(brain.speculative.get());
+            for (auto & slot : slots) {
+                if (!slot || slot->draft.empty()) { continue; }
+                auto & j = *slot;
+                j.draft.erase(std::find_if(j.draft.begin(), j.draft.end(), [&](llama_token t) {
+                    return llama_vocab_is_eog(vocab, t);
+                }), j.draft.end());
+                llama_memory_seq_rm(llama_get_memory(brain.draft_ctx.get()), j.seq, j.pos, -1);
+            }
+        }
         auto batch = llama_batch_init(llama_n_batch(brain.ctx.get()), 0, 1);
         struct release { llama_batch & batch; ~release() { llama_batch_free(batch); } } release_batch{batch};
-        std::vector<std::pair<std::shared_ptr<job>, int>> outputs;
+        struct output { std::shared_ptr<job> slot; std::vector<int> indices; bool verify; };
+        std::vector<output> outputs;
         bool prefilled = false;
         const size_t start = prefill_cursor;
         for (size_t index = 0; index < slots.size(); ++index) {
@@ -223,7 +266,7 @@ class frankie_completions {
             if (!slot) { continue; }
             auto & j = *slot;
             if (j.done || j.cancelled.load()) {
-                llama_memory_seq_rm(llama_get_memory(brain.ctx.get()), j.seq, -1, -1);
+                clear(j);
                 slot.reset();
                 continue;
             }
@@ -233,7 +276,8 @@ class frankie_completions {
                     if (prefilled) { continue; }
                     prefilled = true;
                     prefill_cursor = (slot_index + 1) % slots.size();
-                    const size_t count = std::min(brain.speech_active.load() ? size_t(32) : size_t(128), llama_n_batch(brain.ctx.get()) - slots.size());
+                    const size_t reserve = slots.size() * (1 + brain.options.mtp_tokens);
+                    const size_t count = std::min(brain.speech_active.load() ? size_t(32) : size_t(128), llama_n_batch(brain.ctx.get()) - reserve);
                     const auto media = j.media.find(j.offset);
                     if (media != j.media.end()) {
                         if (!j.image_batch && !has_headroom(600000)) { continue; }
@@ -247,43 +291,63 @@ class frankie_completions {
                         common_batch_add(batch, j.prompt[j.offset], j.pos++, {j.seq}, j.offset + 1 == j.prompt.size());
                         ++j.offset;
                     }
-                    if (j.offset == j.prompt.size()) { outputs.emplace_back(slot, batch.n_tokens - 1); }
+                    if (j.offset == j.prompt.size()) { outputs.push_back({slot, {batch.n_tokens - 1}, false}); }
                 } else {
-                    common_batch_add(batch, j.pending, j.pos++, {j.seq}, true);
-                    outputs.emplace_back(slot, batch.n_tokens - 1);
+                    output item{slot, {}, true};
+                    common_batch_add(batch, j.pending, j.pos, {j.seq}, true);
+                    item.indices.push_back(batch.n_tokens - 1);
+                    for (size_t k = 0; k < j.draft.size(); ++k) {
+                        common_batch_add(batch, j.draft[k], j.pos + 1 + k, {j.seq}, true);
+                        item.indices.push_back(batch.n_tokens - 1);
+                    }
+                    outputs.push_back(std::move(item));
                 }
             } catch (const std::exception & e) { fail(j, e.what()); }
         }
         if (batch.n_tokens) {
-            const int rc = decode(batch);
+            const int rc = brain.decode(batch);
             if (rc) {
                 for (auto & slot : slots) { if (slot && !slot->done) { fail(*slot, "text batch decode failed"); } }
             } else {
                 for (auto & entry : outputs) {
-                    auto & j = *entry.first;
+                    auto & j = *entry.slot;
                     try {
-                        j.pending = common_sampler_sample(j.sampler.get(), brain.ctx.get(), entry.second);
-                        common_sampler_accept(j.sampler.get(), j.pending, true);
-                        if (llama_vocab_is_eog(llama_model_get_vocab(brain.model.get()), j.pending)) {
-                            finish(j, "stop");
-                            continue;
+                        const auto ids = common_sampler_sample_and_accept_n(j.sampler.get(), brain.ctx.get(), entry.indices, j.draft);
+                        if (entry.verify) {
+                            j.pos += ids.size();
+                            if (brain.speculative) {
+                                j.drafted += j.draft.size();
+                                j.accepted += ids.size() - 1;
+                                common_speculative_accept(brain.speculative.get(), j.seq, ids.size() - 1);
+                                if (ids.size() <= j.draft.size()) {
+                                    if (!llama_memory_seq_rm(llama_get_memory(brain.ctx.get()), j.seq, j.pos, -1) ||
+                                        !llama_memory_seq_rm(llama_get_memory(brain.draft_ctx.get()), j.seq, j.pos, -1)) {
+                                        throw std::runtime_error("HTTP MTP accepted-prefix rollback failed");
+                                    }
+                                }
+                            }
                         }
-                        j.raw += common_token_to_piece(llama_model_get_vocab(brain.model.get()), j.pending, true);
-                        ++j.generated;
-                        auto parsed = j.chat ? common_chat_parse(j.raw, true, j.parser) : common_chat_msg{};
-                        const auto & text = j.chat ? parsed.content : j.raw;
-                        json delta = json::object();
-                        if (text.compare(0, j.sent.size(), j.sent) != 0) { throw std::runtime_error("text parser retracted streamed output"); }
-                        if (text.size() > j.sent.size()) { delta[j.chat ? "content" : "text"] = text.substr(j.sent.size()); j.sent = text; }
-                        if (parsed.reasoning_content.size() > j.reasoning.size()) {
-                            delta["reasoning_content"] = parsed.reasoning_content.substr(j.reasoning.size());
-                            j.reasoning = parsed.reasoning_content;
+                        j.draft.clear();
+                        for (const auto token : ids) {
+                            j.pending = token;
+                            if (llama_vocab_is_eog(vocab, token)) { finish(j, "stop"); break; }
+                            j.raw += common_token_to_piece(vocab, token, true);
+                            ++j.generated;
+                            auto parsed = j.chat ? common_chat_parse(j.raw, true, j.parser) : common_chat_msg{};
+                            const auto & text = j.chat ? parsed.content : j.raw;
+                            json delta = json::object();
+                            if (text.compare(0, j.sent.size(), j.sent) != 0) { throw std::runtime_error("text parser retracted streamed output"); }
+                            if (text.size() > j.sent.size()) { delta[j.chat ? "content" : "text"] = text.substr(j.sent.size()); j.sent = text; }
+                            if (parsed.reasoning_content.size() > j.reasoning.size()) {
+                                delta["reasoning_content"] = parsed.reasoning_content.substr(j.reasoning.size());
+                                j.reasoning = parsed.reasoning_content;
+                            }
+                            if (!delta.empty()) {
+                                j.send(j.chat ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
+                                              : json{{"index", 0}, {"text", delta["text"]}, {"finish_reason", nullptr}});
+                            }
+                            if (j.generated >= j.maximum) { finish(j, "length"); break; }
                         }
-                        if (!delta.empty()) {
-                            j.send(j.chat ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
-                                          : json{{"index", 0}, {"text", delta["text"]}, {"finish_reason", nullptr}});
-                        }
-                        if (j.generated >= j.maximum) { finish(j, "length"); }
                     } catch (const std::exception & e) { fail(j, e.what()); }
                 }
             }
@@ -298,7 +362,7 @@ class frankie_completions {
         }
         for (auto & slot : slots) {
             if (slot && (slot->done || slot->cancelled.load())) {
-                llama_memory_seq_rm(llama_get_memory(brain.ctx.get()), slot->seq, -1, -1);
+                clear(*slot);
                 slot.reset();
             }
         }
@@ -397,7 +461,9 @@ class frankie_completions {
   public:
     frankie_completions(brain_session & b, httplib::Server & server, size_t count) : brain(b), slots(count) {
         if (!count) { return; }
-        if (count >= llama_n_batch(brain.ctx.get())) { throw std::runtime_error("batch size must exceed the number of HTTP slots"); }
+        if (count * (1 + brain.options.mtp_tokens) >= llama_n_batch(brain.ctx.get())) {
+            throw std::runtime_error("batch size must exceed HTTP slots times the verification width");
+        }
         brain.background_step = [this] { step(); };
         server.Get("/v1/models", [](const auto &, auto & res) {
             res.set_content(json({{"object", "list"}, {"data", json::array({
