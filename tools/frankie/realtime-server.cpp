@@ -1278,22 +1278,23 @@ struct realtime_session {
                 if (!result.message.tool_calls.empty()) {
                     if (turn) { turn->tool_released = true; }
                     if (released_turn) { released_turn->tool_released = true; }
-                    auto & call = result.message.tool_calls[0];
-                    call.id = next_id("call_");
-                    pending_calls.emplace(call.id, false);
-                    call_ids.insert(call.id);
-                    const auto tool_item = output.empty() ? item_id : next_id("item_");
-                    const size_t index = output.size();
-                    output.push_back({{"id", tool_item}, {"type", "function_call"}, {"status", "completed"},
-                                      {"call_id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
-                    auto initial = output.back();
-                    initial["status"] = "in_progress";
-                    initial["arguments"] = "";
-                    send({{"type", "response.output_item.added"}, {"response_id", id}, {"output_index", index}, {"item", initial}});
-                    send({{"type", "response.function_call_arguments.delta"}, {"response_id", id}, {"item_id", tool_item},
-                          {"output_index", index}, {"delta", call.arguments}});
-                    send({{"type", "response.function_call_arguments.done"}, {"response_id", id}, {"item_id", tool_item},
-                          {"output_index", index}, {"call_id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
+                    for (auto & call : result.message.tool_calls) {
+                        call.id = next_id("call_");
+                        pending_calls.emplace(call.id, false);
+                        call_ids.insert(call.id);
+                        const auto tool_item = output.empty() ? item_id : next_id("item_");
+                        const size_t index = output.size();
+                        output.push_back({{"id", tool_item}, {"type", "function_call"}, {"status", "completed"},
+                                          {"call_id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
+                        auto initial = output.back();
+                        initial["status"] = "in_progress";
+                        initial["arguments"] = "";
+                        send({{"type", "response.output_item.added"}, {"response_id", id}, {"output_index", index}, {"item", initial}});
+                        send({{"type", "response.function_call_arguments.delta"}, {"response_id", id}, {"item_id", tool_item},
+                              {"output_index", index}, {"delta", call.arguments}});
+                        send({{"type", "response.function_call_arguments.done"}, {"response_id", id}, {"item_id", tool_item},
+                              {"output_index", index}, {"call_id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
+                    }
                 }
                 request.chat.messages.push_back(result.message);
                 for (const auto & item : output) { remember_item(item, request.chat.messages.size() - 1); }

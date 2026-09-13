@@ -1,5 +1,6 @@
 #pragma once
 #include "brain-session.h"
+#include "brain-sampling.h"
 #include "sampling.h"
 #include "image-input.h"
 #include "mtmd-helper-batch.h"
@@ -7,7 +8,9 @@
 #include "nlohmann/json.hpp"
 
 #include <condition_variable>
+#include <cmath>
 #include <deque>
+#include <limits>
 #include <thread>
 
 // Experimental HTTP lane: sequence zero belongs to voice. One context and
@@ -59,11 +62,7 @@ class frankie_completions {
 
     void prepare(job & j) {
         const auto * vocab = llama_model_get_vocab(brain.model.get());
-        common_params_sampling sampling;
-        sampling.temp = j.input.value("temperature", 0.7f);
-        sampling.top_p = j.input.value("top_p", 0.95f);
-        sampling.top_k = j.input.value("top_k", 20);
-        sampling.seed = j.input.value("seed", LLAMA_DEFAULT_SEED);
+        auto sampling = frankie_brain_sampling(false);
         if (j.chat) {
             common_chat_templates_inputs input;
             input.messages = common_chat_msgs_parse_oaicompat(common_json::parse(j.input.at("messages").dump()));
@@ -76,6 +75,7 @@ class frankie_completions {
             }
             input.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
             auto formatted = common_chat_templates_apply(brain.templates.get(), input);
+            sampling = frankie_brain_sampling(input.enable_thinking);
             if (input.enable_thinking) { brain.configure_thinking(sampling, formatted, budget); }
             size_t offset = 0;
             while (offset < formatted.prompt.size()) {
@@ -119,6 +119,38 @@ class frankie_completions {
         if (j.prompt.empty() || j.prompt.back() == LLAMA_TOKEN_NULL || j.prompt.size() + j.maximum > brain.options.http_context_tokens) {
             throw std::runtime_error("prompt and output exceed the per-request context");
         }
+        const auto number = [&](const char * key, float fallback, float low, float high) {
+            const auto value = j.input.value(key, json());
+            if (value.is_null()) { return fallback; }
+            if (!value.is_number()) { throw std::invalid_argument(std::string(key) + " must be a number"); }
+            const float result = value.get<float>();
+            if (!std::isfinite(result) || result < low || result > high) {
+                throw std::invalid_argument(std::string(key) + " is out of range");
+            }
+            return result;
+        };
+        sampling.temp = number("temperature", sampling.temp, 0.0f, 2.0f);
+        sampling.top_p = number("top_p", sampling.top_p, 0.0f, 1.0f);
+        sampling.min_p = number("min_p", sampling.min_p, 0.0f, 1.0f);
+        sampling.penalty_present = number("presence_penalty", sampling.penalty_present, -2.0f, 2.0f);
+        sampling.penalty_freq = number("frequency_penalty", sampling.penalty_freq, -2.0f, 2.0f);
+        sampling.penalty_last_n = j.maximum;
+        sampling.penalty_repeat = number("repeat_penalty", sampling.penalty_repeat,
+            std::numeric_limits<float>::min(), std::numeric_limits<float>::max());
+        const float repetition = number("repetition_penalty", sampling.penalty_repeat,
+            std::numeric_limits<float>::min(), std::numeric_limits<float>::max());
+        if (!j.input.value("repeat_penalty", json()).is_null() && repetition != sampling.penalty_repeat) {
+            throw std::invalid_argument("repeat_penalty conflicts with repetition_penalty");
+        }
+        sampling.penalty_repeat = repetition;
+        if (!j.input.value("top_k", json()).is_null()) {
+            const auto & value = j.input.at("top_k");
+            if (!value.is_number_integer() || value < INT32_MIN || value > INT32_MAX) {
+                throw std::invalid_argument("top_k must be a 32-bit integer");
+            }
+            sampling.top_k = value.get<int>();
+        }
+        if (!j.input.value("seed", json()).is_null()) { sampling.seed = j.input.at("seed").get<uint32_t>(); }
         j.sampler.reset(common_sampler_init(brain.model.get(), sampling));
         if (!j.sampler) { throw std::runtime_error("sampler initialization failed"); }
         j.ready = true;
@@ -135,6 +167,11 @@ class frankie_completions {
         if (j.chat) {
             message = common_chat_parse(j.raw, false, j.parser);
             message.role = "assistant";
+            std::vector<std::string> ids;
+            size_t serial = 0;
+            message.set_tool_call_ids(ids, [&] {
+                return "call_" + std::to_string(j.created) + "_" + j.id + "_" + std::to_string(serial++);
+            });
         }
         auto msg = json::parse(common_chat_msgs_to_json_oaicompat({message}).dump())[0];
         const auto finish_reason = message.tool_calls.empty() ? reason : "tool_calls";
@@ -412,14 +449,11 @@ class frankie_completions {
                 if (choice == "none") { j->input["tools"] = json::array(); }
                 j->input.erase("tool_choice");
             }
-            for (const auto * key : {"presence_penalty", "frequency_penalty"}) {
-                if (j->input.contains(key) && j->input[key] == 0) { j->input.erase(key); }
-            }
             if (j->input.value("stop", json()) == json::array()) { j->input.erase("stop"); }
             if (j->input.value("echo", json()) == false) { j->input.erase("echo"); }
             if (j->input.value("response_format", json()) == json{{"type", "text"}}) { j->input.erase("response_format"); }
             if (j->input.contains("stream_options") && j->input["stream_options"].is_null()) { j->input.erase("stream_options"); }
-            for (const auto * key : {"stop", "logprobs", "top_logprobs", "response_format", "tool_choice", "presence_penalty", "frequency_penalty", "echo"}) {
+            for (const auto * key : {"stop", "logprobs", "top_logprobs", "response_format", "tool_choice", "echo"}) {
                 if (j->input.contains(key) && !j->input[key].is_null()) { throw std::runtime_error(std::string(key) + " is not wired into the experiment yet"); }
             }
             j->id = (j->chat ? "chatcmpl-" : "cmpl-") + std::to_string(++serial);

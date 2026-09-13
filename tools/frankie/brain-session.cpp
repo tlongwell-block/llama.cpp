@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "mtmd-audio.h"
 #include "sampling.h"
+#include "brain-sampling.h"
 #include "token-boundary.h"
 #include "stb/stb_image.h"
 
@@ -726,13 +727,9 @@ brain_session::response brain_session::generate(const request & request, const s
     save_checkpoint(formatted.prompt, pos, used);
     if (on_stage) { on_stage("brain_checkpoint_done"); }
     response               result;
-    common_params_sampling sampling;
-    sampling.temp            = 0.7f;
-    sampling.top_p           = 0.8f;
-    sampling.top_k           = 20;
-    sampling.min_p           = 0.0f;
+    auto sampling = frankie_brain_sampling(input.enable_thinking);
     sampling.penalty_present = options.presence_penalty;
-    sampling.penalty_last_n  = -1;
+    sampling.penalty_last_n  = request.generation_tokens();
     sampling.seed            = 42;
     sampling.generation_prompt = formatted.generation_prompt;
     configure_thinking(sampling, formatted, request.reasoning_budget);
