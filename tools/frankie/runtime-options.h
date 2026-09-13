@@ -55,6 +55,14 @@ struct frankie_options {
     }
 };
 
+inline size_t frankie_http_output_budget(size_t prompt, size_t requested, size_t context) {
+    if (prompt >= context) {
+        throw std::runtime_error("prompt fills or exceeds the per-request context (prompt_tokens=" +
+            std::to_string(prompt) + ", context_tokens=" + std::to_string(context) + ")");
+    }
+    return std::min(requested, context - prompt);
+}
+
 inline int frankie_thinking_budget(const std::string & effort) {
     if (effort == "none" || effort == "off") { return 0; }
     if (effort == "minimal") { return 128; }

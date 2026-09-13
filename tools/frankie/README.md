@@ -39,7 +39,11 @@ The default is zero HTTP slots. `--ctx-size` is the total shared KV capacity,
 including voice and all HTTP slots. Without `--http-ctx-size` (or with zero),
 the total is split evenly across those slots. An explicit `--http-ctx-size`
 sets each HTTP slot's limit; voice uses the remaining tokens. All limits include
-prompt and output tokens. Each HTTP slot supports up to 262144 tokens, and voice
+prompt and generated output tokens. `max_tokens` or `max_completion_tokens` is
+an output ceiling, capped to the space remaining after the formatted prompt.
+Generation stops with `finish_reason: "length"` if it reaches that ceiling.
+Prompts that leave no output space are rejected with the exact token counts.
+Each HTTP slot supports up to 262144 tokens, and voice
 must retain 4096..262144 tokens. Invalid allocations fail before model loading.
 For example, `--ctx-size 300000 --http-slots 2` gives each slot 100000 tokens.
 Adding `--http-ctx-size 110000` gives each HTTP slot 110000 and voice 80000;

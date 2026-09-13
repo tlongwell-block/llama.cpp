@@ -116,9 +116,10 @@ class frankie_completions {
         } else {
             j.prompt = common_tokenize(vocab, j.input.at("prompt").get<std::string>(), false, true);
         }
-        if (j.prompt.empty() || j.prompt.back() == LLAMA_TOKEN_NULL || j.prompt.size() + j.maximum > brain.options.http_context_tokens) {
-            throw std::runtime_error("prompt and output exceed the per-request context");
+        if (j.prompt.empty() || j.prompt.back() == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error("prompt must contain text after any media");
         }
+        j.maximum = frankie_http_output_budget(j.prompt.size(), j.maximum, brain.options.http_context_tokens);
         const auto number = [&](const char * key, float fallback, float low, float high) {
             const auto value = j.input.value(key, json());
             if (value.is_null()) { return fallback; }
@@ -442,8 +443,14 @@ class frankie_completions {
                     }
                 }
             }
-            j->maximum = j->input.value("max_completion_tokens", j->input.value("max_tokens", size_t(512)));
-            if (!j->maximum || j->maximum > brain.options.http_context_tokens || j->input.value("n", 1) != 1) { throw std::runtime_error("invalid output budget or n"); }
+            auto maximum = j->input.value("max_completion_tokens", json());
+            if (maximum.is_null()) { maximum = j->input.value("max_tokens", json()); }
+            if (maximum.is_null()) { maximum = 512; }
+            if (!maximum.is_number_integer() || maximum <= 0 || maximum > INT32_MAX) {
+                throw std::runtime_error("max_tokens/max_completion_tokens must be a positive 32-bit integer");
+            }
+            if (j->input.value("n", 1) != 1) { throw std::runtime_error("n must be 1"); }
+            j->maximum = maximum.get<size_t>();
             const auto choice = j->input.value("tool_choice", json());
             if (choice == "auto" || choice == "none") {
                 if (choice == "none") { j->input["tools"] = json::array(); }

@@ -69,6 +69,18 @@ struct test_registry {
 
 #ifdef LLAMA_TEST_FRANKIE
 MAKE_TEST(test_frankie_context_pool) {
+    t.assert_equal("output ceiling fits", size_t(65536), frankie_http_output_budget(47000, 65536, 128000));
+    t.assert_equal("output ceiling uses remaining capacity", size_t(81000), frankie_http_output_budget(47000, 100000, 128000));
+    t.assert_equal("large requested ceiling stays within the slot", size_t(81000), frankie_http_output_budget(47000, INT32_MAX, 128000));
+    t.assert_equal("last available output token", size_t(1), frankie_http_output_budget(127999, 512, 128000));
+    for (size_t prompt : {128000u, 128001u}) {
+        bool rejected = false;
+        try { frankie_http_output_budget(prompt, 1, 128000); }
+        catch (const std::runtime_error & e) {
+            rejected = std::string(e.what()).find("prompt_tokens=" + std::to_string(prompt)) != std::string::npos;
+        }
+        t.assert_true("full prompt reports its token count", rejected);
+    }
     for (const auto & [total, slots, per_http, voice, expected_http] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>{
             {131072, 0, 0, 131072, 0},
             {300000, 2, 0, 100000, 100000},
