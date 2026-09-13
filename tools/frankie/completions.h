@@ -225,7 +225,8 @@ class frankie_completions {
         if (!work.load() || !has_headroom()) { return; }
         std::lock_guard<std::recursive_mutex> compute_lock(brain.compute_mutex);
         if (!has_headroom()) { return; }
-        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<std::shared_ptr<job>> active;
+        { std::lock_guard<std::mutex> lock(mutex); active = slots; }
         set_abort_callback(false);
         struct restore_abort {
             frankie_completions & owner;
@@ -233,7 +234,7 @@ class frankie_completions {
         } restore{*this};
         const auto * vocab = llama_model_get_vocab(brain.model.get());
         if (brain.speculative) {
-            for (auto & slot : slots) {
+            for (auto & slot : active) {
                 if (!slot || slot->done || slot->cancelled || !slot->ready || slot->offset < slot->prompt.size()) { continue; }
                 auto & j = *slot;
                 j.draft.clear();
@@ -245,7 +246,7 @@ class frankie_completions {
                 }
             }
             common_speculative_draft(brain.speculative.get());
-            for (auto & slot : slots) {
+            for (auto & slot : active) {
                 if (!slot || slot->draft.empty()) { continue; }
                 auto & j = *slot;
                 j.draft.erase(std::find_if(j.draft.begin(), j.draft.end(), [&](llama_token t) {
@@ -260,14 +261,12 @@ class frankie_completions {
         std::vector<output> outputs;
         bool prefilled = false;
         const size_t start = prefill_cursor;
-        for (size_t index = 0; index < slots.size(); ++index) {
-            const size_t slot_index = (start + index) % slots.size();
-            auto & slot = slots[slot_index];
+        for (size_t index = 0; index < active.size(); ++index) {
+            const size_t slot_index = (start + index) % active.size();
+            auto & slot = active[slot_index];
             if (!slot) { continue; }
             auto & j = *slot;
             if (j.done || j.cancelled.load()) {
-                clear(j);
-                slot.reset();
                 continue;
             }
             try {
@@ -275,8 +274,8 @@ class frankie_completions {
                 if (j.offset < j.prompt.size()) {
                     if (prefilled) { continue; }
                     prefilled = true;
-                    prefill_cursor = (slot_index + 1) % slots.size();
-                    const size_t reserve = slots.size() * (1 + brain.options.mtp_tokens);
+                    prefill_cursor = (slot_index + 1) % active.size();
+                    const size_t reserve = active.size() * (1 + brain.options.mtp_tokens);
                     const size_t count = std::min(brain.speech_active.load() ? size_t(32) : size_t(128), llama_n_batch(brain.ctx.get()) - reserve);
                     const auto media = j.media.find(j.offset);
                     if (media != j.media.end()) {
@@ -307,7 +306,7 @@ class frankie_completions {
         if (batch.n_tokens) {
             const int rc = brain.decode(batch);
             if (rc) {
-                for (auto & slot : slots) { if (slot && !slot->done) { fail(*slot, "text batch decode failed"); } }
+                for (auto & slot : active) { if (slot && !slot->done) { fail(*slot, "text batch decode failed"); } }
             } else {
                 for (auto & entry : outputs) {
                     auto & j = *entry.slot;
@@ -353,13 +352,14 @@ class frankie_completions {
             }
         }
         if (std::getenv("FRANKIE_HTTP_PROFILE")) {
-            for (const auto & slot : slots) { if (slot) {
+            for (const auto & slot : active) { if (slot) {
                 const auto now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                 std::cerr << "http_progress " << json({{"at", now}, {"seq", slot->seq},
                     {"pos", slot->pos}, {"offset", slot->offset},
                     {"prefill_tokens", slot->offset + (slot->image_batch ? slot->image_offset : 0)}, {"generated", slot->generated}}).dump() << "\n";
             } }
         }
+        std::lock_guard<std::mutex> lock(mutex);
         for (auto & slot : slots) {
             if (slot && (slot->done || slot->cancelled.load())) {
                 clear(*slot);
