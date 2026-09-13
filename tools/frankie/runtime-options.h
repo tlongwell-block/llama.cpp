@@ -24,6 +24,7 @@ struct frankie_options {
     uint32_t speech_context_words = 100;
     std::string cache_type = "q4_0";
     std::string thinking = "none";
+    std::string http_thinking = "none";
     float side_scale = 0.0f;
     float presence_penalty = 0.0f;
     std::string voice, voice_text, voice_codes;

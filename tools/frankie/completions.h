@@ -68,9 +68,15 @@ class frankie_completions {
             common_chat_templates_inputs input;
             input.messages = common_chat_msgs_parse_oaicompat(common_json::parse(j.input.at("messages").dump()));
             input.tools = common_chat_tools_parse_oaicompat(common_json::parse(j.input.value("tools", json::array()).dump()));
-            input.enable_thinking = j.input.value("enable_thinking", false);
+            const auto effort = j.input.value("reasoning_effort", json());
+            const int budget = frankie_thinking_budget(effort.is_null() ? brain.options.http_thinking : effort.get<std::string>());
+            input.enable_thinking = j.input.value("enable_thinking", budget > 0);
+            if (!effort.is_null() && j.input.contains("enable_thinking") && input.enable_thinking != (budget > 0)) {
+                throw std::invalid_argument("enable_thinking conflicts with reasoning_effort");
+            }
             input.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
             auto formatted = common_chat_templates_apply(brain.templates.get(), input);
+            if (input.enable_thinking) { brain.configure_thinking(sampling, formatted, budget); }
             size_t offset = 0;
             while (offset < formatted.prompt.size()) {
                 const auto marker = formatted.prompt.find("[FRANKIE_", offset);

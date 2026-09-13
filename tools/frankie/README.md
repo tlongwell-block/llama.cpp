@@ -128,6 +128,8 @@ Clients that own conversation history can set `session.truncation` to `"disabled
 
 Thinking defaults to off. `--thinking` accepts `none` (or `off`), `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Their reasoning budgets are 0, 128, 512, 2048, 8192, 16384, and 32768 tokens. The existing llama.cpp chat template and common sampler enforce the budget; reasoning does not feed the speech bridge or appear in spoken transcripts. More thinking can delay the first spoken answer substantially.
 
+`--http-thinking` sets an independent default for `/v1/chat/completions`, with the same levels and budgets. It defaults to `none`. For example, `--thinking none --http-thinking high` keeps voice thinking off and enables it for HTTP chat. A request can override this default with `"reasoning_effort": "low"` or `"reasoning_effort": "none"`. The response separates reasoning into `reasoning_content`; `max_completion_tokens` (or `max_tokens`) still caps total generated tokens, including reasoning, so allow room for the answer. Explicit `enable_thinking: false` disables thinking. The existing boolean-only `enable_thinking: true` keeps its prior behavior when the server default is off: thinking is limited by the total output cap. Conflicting `reasoning_effort` and `enable_thinking` values are rejected. `/v1/completions` accepts a raw prompt and does not apply a chat thinking template.
+
 A client may change the level with an ordinary session update while the server is idle:
 
 ```json

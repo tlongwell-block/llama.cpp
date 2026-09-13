@@ -56,6 +56,7 @@ class brain_session {
     void restore_sequence(const sequence_state & state);
     void clear_sequence();
     int decode(const llama_batch & batch);
+    void configure_thinking(common_params_sampling & sampling, const common_chat_params & formatted, int budget) const;
     std::shared_ptr<const sequence_state> checkpoint;
     // Only system/tool context may survive a connection; never cache user turns here.
     std::shared_ptr<const sequence_state> warm_checkpoint;

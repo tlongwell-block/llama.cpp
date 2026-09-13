@@ -670,6 +670,20 @@ void brain_session::finish_audio(const request & input, const std::string & mark
     }
 }
 
+void brain_session::configure_thinking(common_params_sampling & sampling, const common_chat_params & formatted, int budget) const {
+    if (budget <= 0) { return; }
+    if (formatted.thinking_start_tag.empty() || formatted.thinking_end_tags.empty()) {
+        throw std::runtime_error("chat template does not support bounded thinking");
+    }
+    const auto * vocab = llama_model_get_vocab(model.get());
+    sampling.reasoning_budget_tokens = budget;
+    sampling.reasoning_budget_start = common_tokenize(vocab, formatted.thinking_start_tag, false, true);
+    for (const auto & tag : formatted.thinking_end_tags) {
+        sampling.reasoning_budget_end.push_back(common_tokenize(vocab, tag, false, true));
+    }
+    sampling.reasoning_budget_forced = sampling.reasoning_budget_end.front();
+}
+
 brain_session::response brain_session::generate(const request & request, const stream_callback & on_text, const stage_callback & on_stage) {
     std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
     const auto & input      = request.chat;
@@ -721,18 +735,7 @@ brain_session::response brain_session::generate(const request & request, const s
     sampling.penalty_last_n  = -1;
     sampling.seed            = 42;
     sampling.generation_prompt = formatted.generation_prompt;
-    if (request.reasoning_budget > 0) {
-        if (formatted.thinking_start_tag.empty() || formatted.thinking_end_tags.empty()) {
-            throw std::runtime_error("chat template does not support bounded thinking");
-        }
-        const auto * vocab = llama_model_get_vocab(model.get());
-        sampling.reasoning_budget_tokens = request.reasoning_budget;
-        sampling.reasoning_budget_start = common_tokenize(vocab, formatted.thinking_start_tag, false, true);
-        for (const auto & tag : formatted.thinking_end_tags) {
-            sampling.reasoning_budget_end.push_back(common_tokenize(vocab, tag, false, true));
-        }
-        sampling.reasoning_budget_forced = sampling.reasoning_budget_end.front();
-    }
+    configure_thinking(sampling, formatted, request.reasoning_budget);
     std::unique_ptr<common_sampler, decltype(&common_sampler_free)> sampler(common_sampler_init(model.get(), sampling),
                                                                             common_sampler_free);
     if (!sampler) {
