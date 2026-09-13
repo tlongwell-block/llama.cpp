@@ -16,8 +16,8 @@ struct frankie_options {
     uint32_t ubatch_size = 0; // automatic: 128 CPU, 512 GPU
     uint32_t mtp_tokens = 0; // opt-in, requires an appended MTP head in the brain component
     uint32_t http_slots = 0; // experimental shared-brain HTTP slots
-    uint32_t http_context_tokens = 4096;
-    uint32_t context_tokens = 131072;
+    uint32_t http_context_tokens = 0; // automatic: divide the total across voice and HTTP slots
+    uint32_t context_tokens = 131072; // total shared KV pool
     uint32_t max_utterance_seconds = 90;
     uint32_t max_output_audio_seconds = 300;
     uint32_t max_output_tokens = 4096;
@@ -31,6 +31,28 @@ struct frankie_options {
     std::string expression;
     std::string vap_model, bc_model;
     std::string ear_model, talker_model, mouth_model;
+
+    uint32_t voice_context_tokens() const {
+        return context_tokens - http_slots * http_context_tokens;
+    }
+
+    void resolve_context() {
+        if (http_slots > 8) { throw std::runtime_error("--http-slots must be 0..8"); }
+        if (context_tokens < 4096 || context_tokens > 262144u * (1 + http_slots)) {
+            throw std::runtime_error("--ctx-size is the total KV pool: at least 4096 and at most 262144 per slot");
+        }
+        if (http_slots && !http_context_tokens) { http_context_tokens = context_tokens / (1 + http_slots); }
+        if (http_slots && (http_context_tokens < 128 || http_context_tokens > 262144)) {
+            throw std::runtime_error("--http-ctx-size must be 128..262144 per HTTP slot, or 0 for an equal split");
+        }
+        const uint64_t reserved = uint64_t(http_slots) * http_context_tokens;
+        if (reserved + 4096 > context_tokens || context_tokens - reserved > 262144) {
+            throw std::runtime_error("--ctx-size minus --http-slots * --http-ctx-size must leave 4096..262144 tokens for voice");
+        }
+        if (max_output_tokens > voice_context_tokens()) {
+            throw std::runtime_error("--max-output-tokens exceeds the remaining voice context");
+        }
+    }
 };
 
 inline int frankie_thinking_budget(const std::string & effort) {

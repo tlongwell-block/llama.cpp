@@ -20,6 +20,7 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     bridge_source(package, "bridge"),
     brain_source(package, "brain"),
     vision_source(package, "vision"), options(config) {
+    options.resolve_context();
     clip_context_params ep{};
     ep.use_gpu                = options.use_gpu;
     ep.flash_attn_type        = CLIP_FLASH_ATTN_TYPE_DISABLED;
@@ -49,7 +50,7 @@ brain_session::brain_session(const std::string & package, const frankie_options 
         throw std::runtime_error("brain load failed");
     }
     auto cp              = llama_context_default_params();
-    cp.n_ctx             = context_tokens() + options.http_context_tokens * options.http_slots;
+    cp.n_ctx             = options.context_tokens;
     cp.n_seq_max         = 1 + options.http_slots;
     if (options.http_slots) {
         cp.n_outputs_max = std::max(cp.n_seq_max, (1 + options.mtp_tokens) * options.http_slots);
@@ -74,7 +75,9 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     };
     cp.abort_callback_data = this;
     ctx.reset(llama_init_from_model(model.get(), cp));
-    std::cerr << "Frankie context requested=" << context_tokens() << " allocated=" << (ctx ? llama_n_ctx(ctx.get()) : 0)
+    std::cerr << "Frankie context total=" << options.context_tokens << " allocated=" << (ctx ? llama_n_ctx(ctx.get()) : 0)
+              << " voice=" << context_tokens() << " http_slots=" << options.http_slots
+              << " http_per_slot=" << (options.http_slots ? options.http_context_tokens : 0)
               << " KV=" << options.cache_type << "\n";
     if (!ctx) {
         throw std::runtime_error("brain context failed");

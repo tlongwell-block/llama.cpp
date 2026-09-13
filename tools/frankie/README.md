@@ -35,8 +35,20 @@ For a mouth with a separate text encoder, such as Breeze, `--text-encoder-device
 Add `--http-slots 2 --http-ctx-size 4096` to expose `/v1/chat/completions`,
 `/v1/completions`, and `/v1/models` on the same port. HTTP requests share the
 loaded brain and vision weights; each slot owns its context and sampler.
-The default is zero HTTP slots. The HTTP context limit includes prompt and
-output tokens and is separate from `--ctx-size`, which still applies to voice.
+The default is zero HTTP slots. `--ctx-size` is the total shared KV capacity,
+including voice and all HTTP slots. Without `--http-ctx-size` (or with zero),
+the total is split evenly across those slots. An explicit `--http-ctx-size`
+sets each HTTP slot's limit; voice uses the remaining tokens. All limits include
+prompt and output tokens. Each HTTP slot supports up to 262144 tokens, and voice
+must retain 4096..262144 tokens. Invalid allocations fail before model loading.
+For example, `--ctx-size 300000 --http-slots 2` gives each slot 100000 tokens.
+Adding `--http-ctx-size 110000` gives each HTTP slot 110000 and voice 80000;
+HTTP limits are not divided again. `--ctx-size 356000 --http-slots 2
+--http-ctx-size 128000` reserves 100000 for voice and 128000 per HTTP slot.
+The pool can be slightly larger due to backend alignment. These are capacity
+examples, not guarantees that a particular GPU has enough memory.
+Earlier Frankie builds treated `--ctx-size` as voice-only capacity; when
+upgrading, add the old HTTP reservations to that value to retain the same limits.
 The additional slots use the selected `--cache-type`. `--mtp-tokens` applies
 to both voice and HTTP requests. They share the existing MTP head, with
 independent draft histories and target verification for each request.

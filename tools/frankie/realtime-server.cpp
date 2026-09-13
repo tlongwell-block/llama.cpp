@@ -1473,6 +1473,8 @@ int main(int argc, char ** argv) {
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
                          "  [--vap-model GGUF] [--bc-model GGUF]\n"
                          "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF]\n"
+                         "--ctx-size is the total KV pool (default 131072). HTTP slots default to an equal share.\n"
+                         "--http-ctx-size is per HTTP slot; voice uses the remainder of the total pool.\n"
                          "WAV alone uses the native reference encoder. Breeze transcribes it with the packaged ear.\n"
                          "Breeze accepts optional --voice-text-file; Qwen ICL requires matching text and frame-major codes.\n";
             return argc == 2 && std::strcmp(argv[1], "--help") == 0 ? 0 : 1;
@@ -1526,10 +1528,11 @@ int main(int argc, char ** argv) {
         const auto port = frankie_unsigned(argv[2]);
         if (!port || port > 65535) { throw std::runtime_error("port must be 1..65535"); }
         if (host.empty()) { throw std::runtime_error("host must not be empty"); }
-        if (options.http_context_tokens < 128 || options.http_context_tokens > 262144 || options.http_slots > 8 || options.mtp_tokens > 4 || options.batch_size > 8192 || options.ubatch_size > (options.batch_size ? options.batch_size : (options.use_gpu ? 512u : 128u)) ||
+        options.resolve_context();
+        if (options.mtp_tokens > 4 || options.batch_size > 8192 || options.ubatch_size > (options.batch_size ? options.batch_size : (options.use_gpu ? 512u : 128u)) ||
             options.max_utterance_seconds < 2 || options.max_utterance_seconds > 120 ||
             !options.max_output_audio_seconds || options.max_output_audio_seconds > 3600 ||
-            options.max_output_tokens > options.context_tokens || options.threads < 1 || options.threads > 256 || options.context_tokens < 4096 || options.context_tokens > 262144 ||
+            options.threads < 1 || options.threads > 256 ||
             (options.cache_type != "q4_0" && options.cache_type != "q8_0" && options.cache_type != "f16") || !std::isfinite(options.side_scale) ||
             options.side_scale < 0 || options.side_scale > 2 || !std::isfinite(options.presence_penalty) ||
             options.presence_penalty < 0 || options.presence_penalty > 2 ||

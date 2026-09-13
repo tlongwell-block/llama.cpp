@@ -68,6 +68,43 @@ struct test_registry {
 
 
 #ifdef LLAMA_TEST_FRANKIE
+MAKE_TEST(test_frankie_context_pool) {
+    for (const auto & [total, slots, per_http, voice, expected_http] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>{
+            {131072, 0, 0, 131072, 0},
+            {300000, 2, 0, 100000, 100000},
+            {300001, 2, 0, 100001, 100000},
+            {300000, 2, 110000, 80000, 110000},
+            {356000, 2, 128000, 100000, 128000},
+            {16384, 2, 6144, 4096, 6144},
+            {2359296, 8, 0, 262144, 262144}}) {
+        frankie_options options;
+        options.context_tokens = total;
+        options.http_slots = slots;
+        options.http_context_tokens = per_http;
+        options.resolve_context();
+        t.assert_equal("voice receives the pool remainder", voice, options.voice_context_tokens());
+        t.assert_equal("HTTP capacity is per slot", expected_http, options.http_context_tokens);
+        t.assert_equal("slots fit the total pool", total, options.voice_context_tokens() + slots * options.http_context_tokens);
+        options.resolve_context();
+        t.assert_equal("resolution is idempotent", voice, options.voice_context_tokens());
+    }
+    for (const auto & [total, slots, per_http, output] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>>{
+            {0, 0, 0, 4096}, {4096, 2, 0, 4096}, {300000, 0, 0, 4096},
+            {300000, 2, 150000, 4096}, {300000, 2, 200000, 4096},
+            {300000, 2, 127, 4096}, {300000, 2, UINT32_MAX, 4096},
+            {UINT32_MAX, 8, 0, 4096}, {131072, UINT32_MAX, 0, 4096},
+            {300000, 2, 110000, 80001}}) {
+        frankie_options options;
+        options.context_tokens = total;
+        options.http_slots = slots;
+        options.http_context_tokens = per_http;
+        options.max_output_tokens = output;
+        bool rejected = false;
+        try { options.resolve_context(); } catch (const std::runtime_error &) { rejected = true; }
+        t.assert_true("invalid or overflowing allocation rejected", rejected);
+    }
+}
+
 MAKE_TEST(test_frankie_image_transport) {
     for (const auto * detail : {"auto", "low", "high"}) { frankie_image_detail(detail); }
     bool rejected = false;

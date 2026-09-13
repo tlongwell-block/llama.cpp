@@ -83,7 +83,7 @@ class brain_session {
   public:
     int64_t audio_lead_ms() const { return http_pending.load() ? 800 : 240; }
     size_t audio_row_limit() const { return (options.max_utterance_seconds * 1000 + 79) / 80 + 2; }
-    size_t context_tokens() const { return options.context_tokens; }
+    size_t context_tokens() const { return options.voice_context_tokens(); }
     static constexpr size_t max_messages = 4096;
     static constexpr size_t max_audio_segments = 128;
     std::atomic<bool> cancelled{ false };
