@@ -255,6 +255,17 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        if (mask) {
+            int all_masked = 1;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ic0 + j < int(ne01.z)) {
+                    all_masked = all_masked && __half2float(maskh[j*ne11 + tid]) == -INFINITY;
+                }
+            }
+            if (warp_reduce_all(all_masked)) { continue; }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 

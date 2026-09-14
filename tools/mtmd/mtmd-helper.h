@@ -119,6 +119,14 @@ MTMD_API int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
 
 typedef int32_t (*mtmd_helper_post_decode_callback)(struct llama_batch batch, void * user_data);
 
+// As eval_chunks, calling callback after every successful text or media decode.
+// A nonzero callback result stops evaluation and is returned to the caller.
+MTMD_API int32_t mtmd_helper_eval_chunks_with_callback(mtmd_context * ctx,
+        struct llama_context * lctx, const mtmd_input_chunks * chunks,
+        llama_pos n_past, llama_seq_id seq_id, int32_t n_batch, bool logits_last,
+        llama_pos * new_n_past, mtmd_helper_post_decode_callback callback, void * user_data);
+
+
 // helper function to decode an image whose embeddings have already been calculated
 // this helper will handle batching and pre/post decoding setup (for ex. gemma 3 requires non-causal attention)
 // ret 0 on success, -1 on chunk not being a valid image chunk, 1 on decode failure
@@ -199,14 +207,42 @@ struct mtmd_helper_gen_audio_inp {
     const char * prompt;
     size_t       prompt_len;
 
+    // Complete continuous backbone prompt, including reference and control rows.
+    const float * prompt_embd;
+    size_t        n_prompt_embd; // rows of llama_model_n_embd_inp() floats
+
     mtmd_bitmap * speaker_ref; // optional, can be NULL
     const char * lang; // optional, can be NULL
 
     int32_t  top_k;
     float    top_p;
+    float    code_temperature; // Qwen predictor: >0 overrides the model default; 0 keeps it
     uint32_t seed; // UINT32_MAX for random (default: random)
 
     enum mtmd_helper_gen_audio_outtype out_type;
+
+    // Qwen3-TTS only. Add these offsets to target token embeddings, leaving control and reference rows unchanged.
+    const float * target_offset;
+    size_t        n_target_offset; // rows, each llama_model_n_embd_inp() floats; must match the target token count
+
+    // Optional ICL context. Codec rows are sums of all talker codebook embeddings, without codec BOS.
+    const char * ref_text;
+    size_t       ref_text_len;
+    const float * ref_codec_embd;
+    size_t        n_ref_codec_embd; // rows, each llama_model_n_embd() floats
+
+    // Alternative to ref_codec_embd: frame-major codec IDs, 16 IDs per frame. Copied during set_input().
+    const int32_t * ref_codes;
+    size_t          n_ref_frames;
+    size_t          prime_frames; // last reference frames decoded silently before generated audio; requires ref_codes
+
+    // Qwen3-TTS only. Optional additive x-vector offset, applied after encoding speaker_ref.
+    // Copied during set_input(); exactly one embedding row. The cached reference remains unmodified.
+    const float * speaker_offset;
+    size_t        n_speaker_offset; // floats, must equal llama_model_n_embd_inp()
+
+    // Breeze continuous prompts can follow an existing sequence without replaying its KV.
+    llama_pos n_past;
 };
 
 MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(
@@ -254,6 +290,22 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
 #ifdef __cplusplus
 #include <set>
 #include <memory>
+#include <vector>
+
+// Encode an audio reference into conditioning rows. Output is unchanged on failure.
+bool mtmd_helper_encode_audio(mtmd_context * ctx, const mtmd_bitmap * bitmap,
+                              int32_t n_embd, std::vector<float> & output);
+
+// Qwen3-TTS non-streaming ICL body: reference text, target text, EOS, codec BOS, reference codes.
+// Returns false for malformed/non-finite rows or a body exceeding max_rows. Output is unchanged on failure.
+bool mtmd_helper_qwen3tts_body(
+    size_t width, size_t max_rows,
+    const std::vector<float> & ref_text, const std::vector<float> & target_text,
+    const float * ref_codec, size_t n_ref_codec,
+    const std::vector<float> & tts_eos, const std::vector<float> & tts_pad,
+    const std::vector<float> & codec_bos, const std::vector<float> & codec_pad,
+    std::vector<float> & output);
+
 
 namespace mtmd_helper {
 

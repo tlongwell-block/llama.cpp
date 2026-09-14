@@ -17,6 +17,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    size_t allocation_limit = SIZE_MAX;
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -40,6 +41,7 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (size > ctx->allocation_limit) { return nullptr; }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -615,6 +617,59 @@ static void test_reallocation() {
     }
 }
 
+static void test_allocation_failure() {
+    for (int n_buffers : {1, 2}) {
+        for (bool recover : {false, true}) {
+            dummy_backend backend = dummy_backend_init(SIZE_MAX);
+            backend.context->allocation_limit = 32;
+            ggml_backend_buffer_type_t bufts[2] = {&backend.buffer_type, &backend.buffer_type};
+            ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, n_buffers));
+            const int buffer_ids[] = {0};
+            for (size_t size : {size_t(16), size_t(128), size_t(16)}) {
+                auto [ctx, graph, ctx_ptr] = make_context();
+                auto * input = make_input_with_size(ctx, size);
+                auto * output = ggml_scale(ctx, input, 2.0f);
+                ggml_set_output(output);
+                ggml_build_forward_expand(graph, output);
+                const bool fits = size <= backend.context->allocation_limit;
+                GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, buffer_ids, buffer_ids) == fits);
+                GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph) == fits);
+                if (fits) {
+                    check_all_allocated(graph);
+                } else {
+                    GGML_ASSERT(input->data == nullptr && output->data == nullptr);
+                    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+                    if (!recover) { break; }
+                }
+            }
+            galloc.reset();
+            GGML_ASSERT(backend.context->buffers.empty());
+        }
+    }
+}
+
+static void test_scheduler_allocation_failure() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    backend.context->allocation_limit = 32;
+    ggml_backend_t backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, false, true));
+    for (size_t size : {size_t(16), size_t(128), size_t(128), size_t(16)}) {
+        ggml_backend_sched_reset(sched.get());
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * input = make_input_with_size(ctx, size);
+        auto * output = ggml_scale(ctx, input, 2.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        const bool fits = size <= backend.context->allocation_limit;
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph) == fits);
+        if (fits) { check_all_allocated(graph); }
+        else { GGML_ASSERT(input->data == nullptr && output->data == nullptr); }
+    }
+    sched.reset();
+    GGML_ASSERT(backend.context->buffers.empty());
+}
+
 static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -671,6 +726,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_allocation_failure", test_allocation_failure);
+    run("test_scheduler_allocation_failure", test_scheduler_allocation_failure);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
 }

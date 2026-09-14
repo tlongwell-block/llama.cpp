@@ -117,12 +117,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                     (is_required ? required_args : optional_args).push_back(arg_rule);
                 });
 
-                // Accept required arguments in any order, as Qwen does not always adhere to the
-                // order provided.
-                auto args = p.permute("tool-" + name + "-args", required_args);
-                if (!optional_args.empty()) {
-                    args = args + p.zero_or_more(p.choice(optional_args));
-                }
+                auto args = p.permute("tool-" + name + "-args", required_args, optional_args);
 
                 auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
                                    p.tool_args(args) +

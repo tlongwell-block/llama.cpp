@@ -1486,12 +1486,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
-            return true;
-        }
-
         const int32_t n_tokens = batch_in.n_tokens;
+        if (!is_mem_shared && n_tokens > (int32_t) llama_n_batch(params.ctx_dft)) {
+            SPC_ERR("%s", "MTP process batch exceeds draft capacity\n");
+            return false;
+        }
 
         // remember the frist and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -1517,11 +1516,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
-            common_batch_clear(batch);
-
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
+            // Preserve the actual token/embedding inputs and all M-RoPE axes.
+            // The shifted target states are a separate input to the MTP stem.
+            llama_batch catchup = batch_in;
+            std::fill_n(batch.logits, n_tokens, 0);
+            catchup.logits = batch.logits;
 
             // shift the tgt embeddings to the right by one position
             // assumes that the tokens in the batch are sequential for each sequence
@@ -1561,7 +1560,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = llama_decode_mtp(ctx_dft, catchup, batch.embd);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1697,7 +1696,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if ((params.n_max <= (int) result.size()) ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1763,6 +1763,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        data.resize((size_t) n_embd * sizeof(float));
+        std::memcpy(data.data(), pending_h[seq_id].data(), data.size());
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        if (data.empty()) {
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        } else {
+            if (data.size() != (size_t) n_embd * sizeof(float)) {
+                throw std::invalid_argument("invalid MTP boundary state size");
+            }
+            std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
+        }
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        if (chain_heads) { chain_h[seq_id].clear(); }
     }
 };
 

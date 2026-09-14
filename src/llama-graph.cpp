@@ -104,13 +104,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 
-    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
-    //       for now, we assume that the hidden state is always provided as an embedding
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    // Keep the legacy token+hidden convention for existing speculative callers.
+    const float * hidden = ubatch->embd_h ? ubatch->embd_h : ubatch->embd;
+    if (hidden) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        ggml_backend_tensor_set(h, hidden, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 }
 
@@ -119,7 +118,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !params.ubatch.embd_h) || (h && h->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }
@@ -467,6 +466,11 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_input_attn_kv::llm_graph_input_attn_kv(
+        const llama_hparams & hparams, const llama_cparams & cparams, const llama_kv_cache_context * mctx) :
+    hparams(hparams), cparams(cparams), mctx(mctx), n_kv_max(mctx->get_n_kv_max()) {
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -492,6 +496,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
 
     bool res = true;
+    res &= n_kv_max == mctx->get_n_kv_max();
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
@@ -2884,7 +2889,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, inp->n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

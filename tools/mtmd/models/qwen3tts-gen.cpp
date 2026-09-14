@@ -6,6 +6,10 @@
 ggml_tensor * clip_graph_qwen3tts_gen::code_gen::do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const {
     logits = ggml_reshape_1d(ctx0, logits, ggml_nelements(logits));
     const int64_t n_vocab = logits->ne[0];
+    if (hparams.gen_model_variant == "breeze") {
+        auto * keep = ggml_step(ctx0, ggml_arange(ctx0, 0, (float) n_vocab, 1));
+        logits = ggml_add(ctx0, logits, ggml_log(ctx0, keep));
+    }
 
     // sort a's rows by idx
     auto sort_by = [this](ggml_tensor * a, ggml_tensor * idx) {
@@ -152,14 +156,16 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::layer_forward(
     q = ggml_reshape_3d(ctx0, q, d_head, n_head, 1);
     k = ggml_reshape_3d(ctx0, k, d_head, n_head_kv, 1);
 
-    q = ggml_rms_norm(ctx0, q, hparams.eps);
-    q = ggml_mul(ctx0, q, layer.q_norm);
-    k = ggml_rms_norm(ctx0, k, hparams.eps);
-    k = ggml_mul(ctx0, k, layer.k_norm);
+    if (layer.q_norm) {
+        q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, hparams.eps), layer.q_norm);
+    }
+    if (layer.k_norm) {
+        k = ggml_mul(ctx0, ggml_rms_norm(ctx0, k, hparams.eps), layer.k_norm);
+    }
 
-    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
+    q = ggml_rope_ext(ctx0, q, inp_pos, model.gen_code_rope_freqs, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    k = ggml_rope_ext(ctx0, k, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
+    k = ggml_rope_ext(ctx0, k, inp_pos, model.gen_code_rope_freqs, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
     // write k/v into the cache at row pos, flat layout
@@ -661,6 +667,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     switch (gen_process) {
         case CLIP_GEN_PROCESS_GEN_CODE: idx = 0; break;
         case CLIP_GEN_PROCESS_GEN_WAV:  idx = 1; break;
+        case CLIP_GEN_PROCESS_EMBED_CODES: idx = 2; break;
         default: GGML_ABORT("unknown gen_process");
     }
 
@@ -732,7 +739,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     cb(out_embd, "gen_audio_out", -1);
 
     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
+    GGML_ASSERT(n_frames > 0 && n_frames <= hparams.wav_tfm_swa);
 
     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
     ggml_set_name(inp_codes, "inp_codes");
@@ -755,16 +762,33 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
         ggml_set_output(slot.second);
     }
 
+    ggml_tensor * ref_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_codes);
+    ggml_set_name(ref_codes, "inp_ref_codes");
+    ggml_set_input(ref_codes);
+    ggml_tensor * ref_embd = nullptr;
+    for (int g = 0; g < n_codes; ++g) {
+        ggml_tensor * code = ggml_view_1d(ctx0, ref_codes, 1, (size_t) g * sizeof(int32_t));
+        ggml_tensor * table = g == 0 ? model.gen_code_out_embd_w :
+            ggml_view_2d(ctx0, model.gen_code_embd_w, model.gen_code_embd_w->ne[0], model.gen_code_embd_w->ne[1],
+                         model.gen_code_embd_w->nb[1], (size_t) (g - 1) * model.gen_code_embd_w->nb[2]);
+        ggml_tensor * value = ggml_get_rows(ctx0, table, code);
+        ref_embd = ref_embd ? ggml_add(ctx0, ref_embd, value) : value;
+    }
+
+    ggml_set_name(ref_embd, "ref_code_embd");
+    ggml_set_output(ref_embd);
+
     // out_embd goes last, clip_encode() reads it back via ggml_graph_node(gf, -1)
-    ggml_tensor * outs[2];
+    ggml_tensor * outs[3];
+    outs[2] = ref_embd;
     outs[0] = out_codes; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 2, idx);
+    ggml_build_forward_select(gf, outs, 3, idx);
     for (auto & slot : c2w.state_out) {
         outs[0] = out_codes; outs[1] = slot.second;
-        ggml_build_forward_select(gf, outs, 2, idx);
+        ggml_build_forward_select(gf, outs, 3, idx);
     }
     outs[0] = out_embd; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 2, idx);
+    ggml_build_forward_select(gf, outs, 3, idx);
 
     return gf;
 }

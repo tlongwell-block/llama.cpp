@@ -421,23 +421,13 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             }
         }
 
-        // Build required arg sequence in definition order
-        common_peg_parser args_seq = p.eps();
-        for (size_t i = 0; i < required_parsers.size(); i++) {
-            if (i > 0) {
-                args_seq = args_seq + p.space();
-            }
-            args_seq = args_seq + required_parsers[i];
+        for (auto & arg : required_parsers) {
+            arg = arg + p.space();
         }
-
-        // Build optional args with flexible ordering
-        if (!optional_parsers.empty()) {
-            common_peg_parser any_opt = p.choice();
-            for (const auto & opt : optional_parsers) {
-                any_opt |= opt;
-            }
-            args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+        for (auto & arg : optional_parsers) {
+            arg = arg + p.space();
         }
+        auto args_seq = p.permute("tool-" + name + "-args", required_parsers, optional_parsers);
 
         if (!arguments.start.empty()) {
             args_seq = p.literal(arguments.start) + args_seq;

@@ -184,6 +184,7 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv_max(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -390,6 +391,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_max() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
