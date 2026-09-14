@@ -66,6 +66,22 @@ void mtmd_helper_log_set(ggml_log_callback log_callback, void * user_data) {
 // helper functions
 //
 
+uint64_t mtmd_helper_audio_convert_frames(
+        void * output, uint64_t output_capacity, mtmd_helper_audio_format output_format,
+        uint32_t output_channels, uint32_t output_rate,
+        const void * input, uint64_t input_frames, mtmd_helper_audio_format input_format,
+        uint32_t input_channels, uint32_t input_rate) {
+    const auto format = [](mtmd_helper_audio_format value) {
+        switch (value) {
+            case MTMD_HELPER_AUDIO_FORMAT_S16: return ma_format_s16;
+            case MTMD_HELPER_AUDIO_FORMAT_F32: return ma_format_f32;
+            default: return ma_format_unknown;
+        }
+    };
+    return ma_convert_frames(output, output_capacity, format(output_format), output_channels, output_rate,
+                             input, input_frames, format(input_format), input_channels, input_rate);
+}
+
 size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks) {
     size_t n_tokens = 0;
     for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {

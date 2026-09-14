@@ -4402,6 +4402,9 @@ public:
   bool send(const char *data, size_t len);
   void close(CloseStatus status = CloseStatus::Normal,
              const std::string &reason = "");
+  // Interrupt concurrent reads/writes without closing the owned descriptor.
+  // The caller must keep this WebSocket alive until the call returns.
+  void shutdown() noexcept;
   const Request &request() const;
   bool is_open() const;
 

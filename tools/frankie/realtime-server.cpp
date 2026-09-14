@@ -9,14 +9,6 @@
 #include "mtmd-vad.h"
 #include "turn-session.h"
 #include "nlohmann/json.hpp"
-#define MA_NO_DEVICE_IO
-#define MA_NO_ENCODING
-#define MA_NO_DECODING
-#define MA_NO_RESOURCE_MANAGER
-#define MA_NO_NODE_GRAPH
-#define MA_NO_ENGINE
-#define MINIAUDIO_IMPLEMENTATION
-#include "miniaudio/miniaudio.h"
 
 #include <cstring>
 #include <condition_variable>
@@ -367,8 +359,8 @@ struct realtime_session {
                     }
                     if (mouth.aside_cancelled.load() || mouth.cancelled.load()) { throw std::runtime_error("cancelled"); }
                     std::vector<int16_t> pcm(count);
-                    if (ma_convert_frames(pcm.data(), count, ma_format_s16, 1, 24000, samples, count,
-                                          ma_format_f32, 1, 24000) != count) { throw std::runtime_error("backchannel PCM conversion"); }
+                    if (mtmd_helper_audio_convert_frames(pcm.data(), count, MTMD_HELPER_AUDIO_FORMAT_S16, 1, 24000, samples, count,
+                                          MTMD_HELPER_AUDIO_FORMAT_F32, 1, 24000) != count) { throw std::runtime_error("backchannel PCM conversion"); }
                     std::lock_guard<std::mutex> lock(state);
                     if (!connected || busy) { throw std::runtime_error("cancelled"); }
                     send({{"type", "frankie.backchannel.delta"}, {"id", id}, {"sequence", sequence++},
@@ -415,8 +407,8 @@ struct realtime_session {
             try {
                 restore_merged_input();
                 std::vector<float> pcm(captured.size() / 3 + 64);
-                auto n = ma_convert_frames(pcm.data(), pcm.size(), ma_format_f32, 1, 16000,
-                                           captured.data(), captured.size() / 2, ma_format_s16, 1, 24000);
+                auto n = mtmd_helper_audio_convert_frames(pcm.data(), pcm.size(), MTMD_HELPER_AUDIO_FORMAT_F32, 1, 16000,
+                                           captured.data(), captured.size() / 2, MTMD_HELPER_AUDIO_FORMAT_S16, 1, 24000);
                 if (!n || n > 16000 * max_utterance_seconds) { throw std::runtime_error("precommit resampling failed"); }
                 pcm.resize(n);
                 auto rows = brain.encode_audio(pcm);
@@ -677,8 +669,8 @@ struct realtime_session {
             throw std::runtime_error("audio/history bounds");
         }
         std::vector<float> pcm(audio.size() / 3 + 64);
-        auto frames = ma_convert_frames(pcm.data(), pcm.size(), ma_format_f32, 1, 16000, audio.data(), audio.size() / 2,
-                                        ma_format_s16, 1, 24000);
+        auto frames = mtmd_helper_audio_convert_frames(pcm.data(), pcm.size(), MTMD_HELPER_AUDIO_FORMAT_F32, 1, 16000, audio.data(), audio.size() / 2,
+                                        MTMD_HELPER_AUDIO_FORMAT_S16, 1, 24000);
         if (frames == 0 || frames > 16000 * max_utterance_seconds) {
             throw std::runtime_error("resampling failed");
         }
@@ -763,13 +755,13 @@ struct realtime_session {
                 continue;
             }
             std::array<float, 512> samples{};
-            if (ma_convert_frames(samples.data(), 512, ma_format_f32, 1, 16000, vad_frame.data(), 768,
-                                  ma_format_s16, 1, 24000) != 512) {
+            if (mtmd_helper_audio_convert_frames(samples.data(), 512, MTMD_HELPER_AUDIO_FORMAT_F32, 1, 16000, vad_frame.data(), 768,
+                                  MTMD_HELPER_AUDIO_FORMAT_S16, 1, 24000) != 512) {
                 throw std::runtime_error("VAD resampling failed");
             }
             std::array<float, 512> system{};
-            if (ma_convert_frames(system.data(), 512, ma_format_f32, 1, 16000, playback_frame.data(), 768,
-                                  ma_format_s16, 1, 24000) != 512) { throw std::runtime_error("playback resampling failed"); }
+            if (mtmd_helper_audio_convert_frames(system.data(), 512, MTMD_HELPER_AUDIO_FORMAT_F32, 1, 16000, playback_frame.data(), 768,
+                                  MTMD_HELPER_AUDIO_FORMAT_S16, 1, 24000) != 512) { throw std::runtime_error("playback resampling failed"); }
             turns->append(samples, system);
             audio.insert(audio.end(), vad_frame.begin(), vad_frame.end());
             vad_frame.clear(); playback_frame.clear();
@@ -1052,8 +1044,8 @@ struct realtime_session {
             const size_t speech_bytes = speech_end_bytes;
             turn->capture.assign(audio.begin(), audio.begin() + speech_bytes);
             std::vector<float> pcm(speech_bytes / 3 + 64);
-            const auto n = ma_convert_frames(pcm.data(), pcm.size(), ma_format_f32, 1, 16000,
-                                             audio.data(), speech_bytes / 2, ma_format_s16, 1, 24000);
+            const auto n = mtmd_helper_audio_convert_frames(pcm.data(), pcm.size(), MTMD_HELPER_AUDIO_FORMAT_F32, 1, 16000,
+                                             audio.data(), speech_bytes / 2, MTMD_HELPER_AUDIO_FORMAT_S16, 1, 24000);
             if (!n || n > 16000 * max_utterance_seconds) { throw std::runtime_error("speculative input bounds"); }
             pcm.resize(n);
             captured.emplace(marker, std::move(pcm));
@@ -1176,8 +1168,8 @@ struct realtime_session {
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     }
                     std::vector<int16_t> pcm(count);
-                    auto frames = ma_convert_frames(pcm.data(), pcm.size(), ma_format_s16, 1, 24000,
-                                                    samples, count, ma_format_f32, 1, 24000);
+                    auto frames = mtmd_helper_audio_convert_frames(pcm.data(), pcm.size(), MTMD_HELPER_AUDIO_FORMAT_S16, 1, 24000,
+                                                    samples, count, MTMD_HELPER_AUDIO_FORMAT_F32, 1, 24000);
                     if (frames != count || pcm.empty()) {
                         throw std::runtime_error("output PCM conversion failed");
                     }
@@ -1463,28 +1455,49 @@ struct realtime_session {
 
 struct frankie_realtime_routes::state {
     std::atomic<bool> occupied{false};
+    std::mutex mutex;
+    bool stopping = false;
+    httplib::ws::WebSocket * socket = nullptr;
+    brain_session & brain;
+    mouth_session & mouth;
+    state(brain_session & b, mouth_session & m) : brain(b), mouth(m) {}
 };
 
 frankie_realtime_routes::frankie_realtime_routes(httplib::Server & server, brain_session & brain,
-        mouth_session & mouth, std::string package, frankie_options options) : state_(std::make_shared<state>()) {
+        mouth_session & mouth, std::string package, frankie_options options) : state_(std::make_shared<state>(brain, mouth)) {
     server.WebSocket("/v1/realtime", [state = state_, &brain, &mouth, package = std::move(package), options](const auto &, auto & socket) {
-        if (state->occupied.exchange(true)) { socket.close(); return; }
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->stopping || state->occupied.load()) { socket.shutdown(); return; }
+            state->socket = &socket;
+            state->occupied = true;
+        }
         try {
             realtime_session session(brain, mouth, socket, package, options);
             session.run();
         } catch (const std::exception & e) {
             std::cerr << "session closed: " << e.what() << "\n";
         }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->socket = nullptr;
         state->occupied = false;
     });
 }
 
 bool frankie_realtime_routes::occupied() const { return state_->occupied.load(); }
 
+void frankie_realtime_routes::stop() {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->stopping = true;
+    state_->brain.cancelled = true;
+    state_->mouth.cancelled = true;
+    if (state_->socket) { state_->socket->shutdown(); }
+}
+
 std::string frankie_reference_transcript(brain_session & brain, const std::vector<float> & pcm24) {
     std::vector<float> pcm16(pcm24.size() * 2 / 3 + 16);
-    const auto n = ma_convert_frames(pcm16.data(), pcm16.size(), ma_format_f32, 1, 16000,
-                                     pcm24.data(), pcm24.size(), ma_format_f32, 1, 24000);
+    const auto n = mtmd_helper_audio_convert_frames(pcm16.data(), pcm16.size(), MTMD_HELPER_AUDIO_FORMAT_F32, 1, 16000,
+                                     pcm24.data(), pcm24.size(), MTMD_HELPER_AUDIO_FORMAT_F32, 1, 24000);
     if (!n || n > 16000 * 20) { throw std::runtime_error("reference resampling failed"); }
     pcm16.resize(n);
     std::string transcript;

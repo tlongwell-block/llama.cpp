@@ -17,6 +17,8 @@ class frankie_realtime_routes {
     frankie_realtime_routes(httplib::Server &, brain_session &, mouth_session &,
                            std::string package, frankie_options options);
     bool occupied() const;
+    // Cancel the active session and interrupt its socket on a normal thread.
+    void stop();
 };
 
 std::string frankie_reference_transcript(brain_session &, const std::vector<float> & pcm24);

@@ -17672,6 +17672,12 @@ bool WebSocket::send(const char *data, size_t len) {
   return send_frame(Opcode::Binary, data, len);
 }
 
+void WebSocket::shutdown() noexcept {
+  closed_ = true;
+  ping_cv_.notify_all();
+  detail::shutdown_socket(strm_.socket());
+}
+
 void WebSocket::close(CloseStatus status, const std::string &reason) {
   if (closed_.exchange(true)) { return; }
   ping_cv_.notify_all();

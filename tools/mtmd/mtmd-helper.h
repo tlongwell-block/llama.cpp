@@ -187,6 +187,18 @@ MTMD_API int32_t mtmd_helper_video_read_next(mtmd_helper_video * ctx,
 // return true if model can be used for chat
 MTMD_API bool mtmd_helper_model_can_chat(const struct llama_context * lctx, const struct mtmd_context * mctx);
 
+// PCM format/rate conversion using the same decoder/resampler as audio inputs.
+// Frame counts exclude channels. Returns the converted frame count, or zero on failure.
+enum mtmd_helper_audio_format {
+    MTMD_HELPER_AUDIO_FORMAT_S16,
+    MTMD_HELPER_AUDIO_FORMAT_F32,
+};
+MTMD_API uint64_t mtmd_helper_audio_convert_frames(
+        void * output, uint64_t output_capacity, enum mtmd_helper_audio_format output_format,
+        uint32_t output_channels, uint32_t output_rate,
+        const void * input, uint64_t input_frames, enum mtmd_helper_audio_format input_format,
+        uint32_t input_channels, uint32_t input_rate);
+
 //
 // Audio generation helpers
 // (early-stage experimental, subjected to breaking changes)
