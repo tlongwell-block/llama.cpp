@@ -50,8 +50,8 @@ class brain_session {
         std::vector<uint8_t> recurrent, boundary;
         int pos = 0;
     };
-    void capture_branch(branch_state & state, int pos);
-    void restore_branch(const branch_state & state);
+    void capture_branch(branch_state & state, int pos, llama_seq_id seq = 0);
+    void restore_branch(const branch_state & state, llama_seq_id seq = 0);
     sequence_state capture_sequence();
     void restore_sequence(const sequence_state & state);
     void clear_sequence();

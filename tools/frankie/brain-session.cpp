@@ -247,27 +247,27 @@ int brain_session::decode(const llama_batch & batch) {
     return rc;
 }
 
-void brain_session::capture_branch(branch_state & state, int pos) {
-    const size_t size = llama_state_seq_get_size_ext(ctx.get(), 0, branch_flags);
+void brain_session::capture_branch(branch_state & state, int pos, llama_seq_id seq) {
+    const size_t size = llama_state_seq_get_size_ext(ctx.get(), seq, branch_flags);
     state.recurrent.resize(size);
-    if (!size || llama_state_seq_get_data_ext(ctx.get(), state.recurrent.data(), size, 0, branch_flags) != size ||
-        (speculative && !common_speculative_get_state(speculative.get(), 0, state.boundary))) {
+    if (!size || llama_state_seq_get_data_ext(ctx.get(), state.recurrent.data(), size, seq, branch_flags) != size ||
+        (speculative && !common_speculative_get_state(speculative.get(), seq, state.boundary))) {
         throw std::runtime_error("branch checkpoint capture failed");
     }
     state.pos = pos;
 }
 
-void brain_session::restore_branch(const branch_state & state) {
+void brain_session::restore_branch(const branch_state & state, llama_seq_id seq) {
     // Restore recurrent state before removing the branch's attention suffix.
-    if (llama_state_seq_set_data_ext(ctx.get(), state.recurrent.data(), state.recurrent.size(), 0, branch_flags) != state.recurrent.size() ||
-        !llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, state.pos, -1)) {
+    if (llama_state_seq_set_data_ext(ctx.get(), state.recurrent.data(), state.recurrent.size(), seq, branch_flags) != state.recurrent.size() ||
+        !llama_memory_seq_rm(llama_get_memory(ctx.get()), seq, state.pos, -1)) {
         throw std::runtime_error("branch checkpoint restore failed");
     }
     if (speculative) {
-        if (!llama_memory_seq_rm(llama_get_memory(draft_ctx.get()), 0, state.pos, -1)) {
+        if (!llama_memory_seq_rm(llama_get_memory(draft_ctx.get()), seq, state.pos, -1)) {
             throw std::runtime_error("branch draft rollback failed");
         }
-        common_speculative_set_state(speculative.get(), 0, state.boundary);
+        common_speculative_set_state(speculative.get(), seq, state.boundary);
     }
 }
 

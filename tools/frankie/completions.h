@@ -25,6 +25,7 @@ class frankie_completions {
         const int64_t created = std::time(nullptr);
         llama_tokens prompt, draft;
         size_t offset = 0, generated = 0, maximum = 512;
+        size_t cached = 0, cache_at = 0;
         size_t drafted = 0, accepted = 0;
         llama_pos pos = 0;
         std::map<std::string, brain_session::image_ptr> images;
@@ -55,6 +56,11 @@ class frankie_completions {
     std::mutex mutex;
     std::condition_variable changed;
     std::vector<std::shared_ptr<job>> slots;
+    struct prompt_cache {
+        llama_tokens prefix;
+        brain_session::branch_state state;
+    };
+    std::vector<prompt_cache> caches;
     std::atomic<bool> stopping{false}, work{false};
     std::atomic<uint64_t> serial{0};
     size_t prefill_cursor = 0;
@@ -154,6 +160,30 @@ class frankie_completions {
         if (!j.input.value("seed", json()).is_null()) { sampling.seed = j.input.at("seed").get<uint32_t>(); }
         j.sampler.reset(common_sampler_init(brain.model.get(), sampling));
         if (!j.sampler) { throw std::runtime_error("sampler initialization failed"); }
+        if (j.input.value("cache_prompt", true) && j.media.empty()) {
+            std::lock_guard<std::mutex> lock(mutex);
+            size_t best = j.seq - 1, matched = 0;
+            for (size_t i = 0; i < caches.size(); ++i) {
+                const auto & prefix = caches[i].prefix;
+                if ((!slots[i] || slots[i].get() == &j) && prefix.size() > matched && prefix.size() < j.prompt.size() &&
+                    std::equal(prefix.begin(), prefix.end(), j.prompt.begin())) {
+                    best = i;
+                    matched = prefix.size();
+                }
+            }
+            if (best != size_t(j.seq - 1)) {
+                std::swap(slots[best], slots[j.seq - 1]);
+                j.seq = best + 1;
+            }
+            if (matched && clear(j, true)) {
+                j.offset = j.cached = matched;
+                j.pos = caches[best].state.pos;
+            }
+            // Keep the mutable assistant tail out of the checkpoint without changing normal prefill batches.
+            const size_t chunk = std::min<size_t>(128, llama_n_batch(brain.ctx.get()) - slots.size() * (1 + brain.options.mtp_tokens));
+            j.cache_at = std::max(j.cached, j.prompt.size() > 128 ? (j.prompt.size() - 128) / chunk * chunk : 0);
+        }
+        if (!j.cached) { clear(j); }
         j.ready = true;
     }
 
@@ -189,6 +219,7 @@ class frankie_completions {
             {"choices", json::array({j.chat ? json{{"index", 0}, {"message", msg}, {"finish_reason", finish_reason}}
                                            : json{{"index", 0}, {"text", j.raw}, {"finish_reason", finish_reason}}})},
             {"usage", {{"prompt_tokens", j.prompt.size()}, {"completion_tokens", j.generated},
+                       {"prompt_tokens_details", {{"cached_tokens", j.cached}}},
                        {"total_tokens", j.prompt.size() + j.generated}}}};
         if (j.input.value("stream_options", json::object()).value("include_usage", false)) {
             auto usage = j.result;
@@ -219,13 +250,26 @@ class frankie_completions {
         }
     }
 
-    void clear(job & j) {
+    bool clear(job & j, bool retain = false) {
+        auto & cache = caches[j.seq - 1];
+        if (brain.speculative) {
+            common_speculative_get_draft_params(brain.speculative.get(), j.seq) = {};
+        }
+        if (retain && !cache.prefix.empty()) {
+            try {
+                brain.restore_branch(cache.state, j.seq);
+                return true;
+            } catch (const std::exception & e) {
+                std::cerr << "http_prompt_cache restore_failed seq=" << j.seq << " " << e.what() << "\n";
+            }
+        }
+        cache = {};
         llama_memory_seq_rm(llama_get_memory(brain.ctx.get()), j.seq, -1, -1);
         if (brain.speculative) {
             llama_memory_seq_rm(llama_get_memory(brain.draft_ctx.get()), j.seq, -1, -1);
             common_speculative_set_state(brain.speculative.get(), j.seq, {});
-            common_speculative_get_draft_params(brain.speculative.get(), j.seq) = {};
         }
+        return false;
     }
 
     void image_step(job & j, const mtmd_input_chunk * chunk, size_t count) {
@@ -328,6 +372,7 @@ class frankie_completions {
                         continue;
                     }
                     size_t end = std::min(j.prompt.size(), j.offset + count);
+                    if (j.offset < j.cache_at) { end = std::min(end, j.cache_at); }
                     const auto next_image = j.media.lower_bound(j.offset);
                     if (next_image != j.media.end()) { end = std::min(end, next_image->first); }
                     while (j.offset < end) {
@@ -352,6 +397,21 @@ class frankie_completions {
             if (rc) {
                 for (auto & slot : active) { if (slot && !slot->done) { fail(*slot, "text batch decode failed"); } }
             } else {
+                for (auto & slot : active) {
+                    if (slot && !slot->done && slot->cache_at && slot->offset == slot->cache_at) {
+                        auto & cache = caches[slot->seq - 1];
+                        if (cache.prefix.size() != slot->cache_at) {
+                            try {
+                                brain.capture_branch(cache.state, slot->pos, slot->seq);
+                                cache.prefix.assign(slot->prompt.begin(), slot->prompt.begin() + slot->offset);
+                            } catch (const std::exception & e) {
+                                cache = {};
+                                slot->cache_at = 0;
+                                std::cerr << "http_prompt_cache capture_failed seq=" << slot->seq << " " << e.what() << "\n";
+                            }
+                        }
+                    }
+                }
                 for (auto & entry : outputs) {
                     auto & j = *entry.slot;
                     try {
@@ -400,13 +460,14 @@ class frankie_completions {
                 const auto now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                 std::cerr << "http_progress " << json({{"at", now}, {"seq", slot->seq},
                     {"pos", slot->pos}, {"offset", slot->offset},
-                    {"prefill_tokens", slot->offset + (slot->image_batch ? slot->image_offset : 0)}, {"generated", slot->generated}}).dump() << "\n";
+                    {"prefill_tokens", slot->offset + (slot->image_batch ? slot->image_offset : 0)},
+                    {"cached_tokens", slot->cached}, {"generated", slot->generated}}).dump() << "\n";
             } }
         }
         std::lock_guard<std::mutex> lock(mutex);
         for (auto & slot : slots) {
             if (slot && (slot->done || slot->cancelled.load())) {
-                clear(*slot);
+                clear(*slot, slot->done && slot->error.empty());
                 slot.reset();
             }
         }
@@ -506,7 +567,7 @@ class frankie_completions {
     }
 
   public:
-    frankie_completions(brain_session & b, httplib::Server & server, size_t count) : brain(b), slots(count) {
+    frankie_completions(brain_session & b, httplib::Server & server, size_t count) : brain(b), slots(count), caches(count) {
         if (!count) { return; }
         if (count * (1 + brain.options.mtp_tokens) >= llama_n_batch(brain.ctx.get())) {
             throw std::runtime_error("batch size must exceed HTTP slots times the verification width");

@@ -66,6 +66,17 @@ and non-streamed results. `stream_options.include_usage` returns final usage.
 Each chat request accepts at most four images, with a 10 MiB limit per image
 and an 18 MiB request-body limit. Bitmap dimension limits still apply.
 
+Text-only HTTP requests reuse matching prompt prefixes by default, including
+tool continuations. Each slot retains one prefix and a bounded recurrent/MTP
+checkpoint (about 150 MiB per cached 27B slot); model weights and the existing
+KV allocation are reused. Matching idle slots are preferred.
+The mutable assistant tail is evaluated again. `usage.prompt_tokens_details.cached_tokens`
+reports reused tokens, including in final SSE usage. Set `cache_prompt: false`
+to bypass caching. Changed prefixes, image requests, and cancelled or failed
+requests discard that slot's cache. Cache restoration failures fall back to
+fresh evaluation. Realtime separately retains its conversation prefix and audio
+precommit state; cache reuse never transfers conversation history between clients.
+
 Realtime uses `conversation.item.create` user messages containing
 `{"type":"input_image","image_url":"data:image/png;base64,..."}` alongside
 `input_text` parts. Realtime image URLs must contain inline PNG or JPEG data.
