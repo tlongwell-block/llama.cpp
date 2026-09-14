@@ -162,7 +162,7 @@ std::vector<float> mouth_session::speak(const brain_session::response & response
 
 void mouth_session::clear_speech_context() {
     speech_words = 0;
-    llama_memory_clear(llama_get_memory(ctx.get()), true);
+    options.device_work([&] { llama_memory_clear(llama_get_memory(ctx.get()), true); if (options.execute_device && options.use_gpu) { llama_synchronize(ctx.get()); } });
 }
 
 void mouth_session::reset_speech_context() {
@@ -233,7 +233,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         }
         if (!count) { throw std::runtime_error("missing expression states for spoken span"); }
         for (auto & v : pooled) { v /= count; }
-        const auto result = expression->process(pooled);
+        const auto result = options.device_work([&] { return expression->process(pooled); });
         speaker_offset = result.offset;
         const auto winner = std::max_element(result.probabilities.begin(), result.probabilities.end());
         if (*winner > 0.5f) { emotion = winner - result.probabilities.begin(); }
@@ -246,7 +246,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         const frankie_text_offsets offsets(text);
         bool space = true;
         for (bool next : offsets.whitespace) { words += space && !next; space = next; }
-        target = breeze->conditioning(text, emotion);
+        target = options.device_work([&] { return breeze->conditioning(text, emotion); });
     }
     if (side && !style) {
     auto * vocab = llama_model_get_vocab(model.get());
@@ -271,7 +271,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         if (chosen >= brain.hidden.size()) {
             throw std::runtime_error("alignment bounds");
         }
-        auto residual = side->process(brain.hidden[chosen]);
+        auto residual = options.device_work([&] { return side->process(brain.hidden[chosen]); });
         for (size_t j = 0; j < 2048; ++j) {
             target.push_back(options.side_scale * residual[j]);
         }
@@ -315,7 +315,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         throw std::runtime_error("cancelled");
     }
     if (on_stage) { on_stage("mouth_conditioning_done"); }
-    if (gen.set_input(&input)) {
+    if (options.device_work([&] { const int rc = gen.set_input(&input); if (options.execute_device && options.use_gpu) { llama_synchronize(ctx.get()); } return rc; })) {
         throw std::runtime_error("mouth input failed");
     }
     if (on_stage) { on_stage("mouth_input_primed"); }
@@ -323,7 +323,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         if (is_cancelled()) {
             throw std::runtime_error("cancelled");
         }
-        int rc = gen.step_prompt(256);
+        int rc = options.device_work([&] { const int rc = gen.step_prompt(256); if (options.execute_device && options.use_gpu) { llama_synchronize(ctx.get()); } return rc; });
         if (rc < 0) {
             throw std::runtime_error("mouth prefill failed");
         }
@@ -382,7 +382,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         }
     };
     bool          stop   = false;
-    const float * hidden = llama_get_embeddings_ith(ctx.get(), -1);
+    const float * hidden = options.device_work([&] { return llama_get_embeddings_ith(ctx.get(), -1); });
     for (int frame = 0; frame < (style ? style->frames : 512) && !stop; ++frame) {
         if (is_cancelled()) {
             throw std::runtime_error("cancelled");
@@ -390,7 +390,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         auto token = common_sampler_sample(sampler.get(), ctx.get(), -1);
         common_sampler_accept(sampler.get(), token, true);
         const float * next = nullptr;
-        if (gen.step_gen(token, hidden, &next, &stop)) {
+        if (options.device_work([&] { const int rc = gen.step_gen(token, hidden, &next, &stop); if (options.execute_device && options.use_gpu) { llama_synchronize(ctx.get()); } return rc; })) {
             throw std::runtime_error("mouth generation failed");
         }
         emit();

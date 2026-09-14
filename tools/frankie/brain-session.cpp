@@ -16,6 +16,9 @@
 #include <stdexcept>
 
 brain_session::brain_session(const std::string & package, const frankie_options & config) :
+    brain_session(package, config, brain_backend::llama) {}
+
+brain_session::brain_session(const std::string & package, const frankie_options & config, brain_backend backend) :
     encoder_source(package, "ear", config.ear_model),
     bridge_source(package, "bridge"),
     brain_source(package, "brain"),
@@ -43,12 +46,18 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     ear             = std::make_unique<mtmd_ear>(raw, options.use_gpu);
     weights.reset();
     auto mp         = llama_model_default_params();
-    mp.n_gpu_layers = options.use_gpu ? 99 : 0;
-    mp.load_mtp = options.mtp_tokens != 0;
+    const bool external = backend == brain_backend::external;
+    mp.n_gpu_layers = !external && options.use_gpu ? 99 : 0;
+    mp.load_mtp = !external && options.mtp_tokens != 0;
+    mp.vocab_only = external;
     model.reset(llama_model_init_from_user(brain_source.metadata(), component::set_tensor, &brain_source, mp));
     if (!model) {
         throw std::runtime_error("brain load failed");
     }
+    templates = common_chat_templates_init(model.get(), "");
+    // External engines reuse the packaged tokenizer/template and speech components,
+    // without loading a second brain or vision model or allocating another KV pool.
+    if (external) { return; }
     auto cp              = llama_context_default_params();
     cp.n_ctx             = options.context_tokens;
     cp.n_seq_max         = 1 + options.http_slots;
@@ -114,11 +123,11 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     if (!vision || !mtmd_support_vision(vision.get())) {
         throw std::runtime_error("vision load failed");
     }
-    templates = common_chat_templates_init(model.get(), "");
 }
 
 std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, std::string * transcript) {
     auto compute_lock = lock_compute();
+    return options.device_work([&]() -> std::vector<float> {
     const auto started = std::chrono::steady_clock::now();
     if (pcm.empty() || pcm.size() > 16000 * options.max_utterance_seconds) {
         throw std::runtime_error("audio bounds");
@@ -160,6 +169,7 @@ std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, s
                   << " bridge_ms=" << ms(encoder_done, std::chrono::steady_clock::now()) << "\n";
     }
     return rows;
+    });
 }
 
 brain_session::image_ptr brain_session::decode_image(const std::vector<unsigned char> & bytes) {
@@ -881,7 +891,7 @@ void brain_session::report_memory() const {
     for (const auto & [device, bytes] : clip_get_mem_usage(encoder.get())) {
         std::cerr << "memory parakeet backend=" << ggml_backend_dev_name(device) << " bytes=" << bytes << "\n";
     }
-    for (const auto & [device, bytes] : mtmd_get_memory_usage(vision.get())) {
+    if (vision) for (const auto & [device, bytes] : mtmd_get_memory_usage(vision.get())) {
         std::cerr << "memory vision backend=" << ggml_backend_dev_name(device) << " bytes=" << bytes << "\n";
     }
 }

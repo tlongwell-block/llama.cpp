@@ -51,7 +51,7 @@ public:
         if (!turn || !options.vap_model.empty()) { vap = load(source, options.vap_model, "vap", mtmd_turn::mode::vap, options.use_gpu); }
         if (!turn || !options.bc_model.empty()) { bc = load(source, options.bc_model, "bc", mtmd_turn::mode::backchannel, options.use_gpu); }
         if (!turn && !vap && !bc) { return; }
-        worker = std::thread([this] {
+        worker = std::thread([this, options] {
             for (;;) {
                 frame current;
                 {
@@ -61,14 +61,16 @@ public:
                     current = std::move(queue.front()); queue.pop_front();
                 }
                 try {
-                    if (current.reset) { for (auto * model : {turn.get(), vap.get(), bc.get()}) { if (model) { model->reset(); } } }
                     reading r;
+                    options.device_work([&] {
+                    if (current.reset) { for (auto * model : {turn.get(), vap.get(), bc.get()}) { if (model) { model->reset(); } } }
                     if (turn) {
                         const auto prediction = turn->process(current.user, current.system);
                         r.next_system = prediction.next_speaker[1]; r.backchannel = prediction.backchannel;
                     }
                     if (vap) { r.next_system = vap->process(current.user, current.system).next_speaker[1]; }
                     if (bc) { r.backchannel = bc->process(current.user, current.system).backchannel; }
+                    });
                     r.end = current.end; r.valid = true;
                     std::lock_guard<std::mutex> lock(mutex);
                     latest = r;

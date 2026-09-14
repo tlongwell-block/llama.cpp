@@ -7,9 +7,26 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <functional>
+#include <optional>
+#include <type_traits>
 
 struct frankie_options {
     static constexpr uint32_t default_output_tokens = 32768;
+    // A host engine may serialize each native GPU unit with its own worker.
+    // The callback must execute synchronously; audio/network callbacks stay outside it.
+    std::function<void(const std::function<void()> &)> execute_device;
+    template<class F> auto device_work(F && work) const -> decltype(work()) {
+        if (!execute_device || !use_gpu) { return work(); }
+        if constexpr (std::is_void_v<decltype(work())>) {
+            execute_device(work);
+        } else {
+            std::optional<decltype(work())> result;
+            execute_device([&] { result.emplace(work()); });
+            if (!result) { throw std::runtime_error("device executor must run synchronously"); }
+            return std::move(*result);
+        }
+    }
     bool use_gpu = true;
     bool text_encoder_gpu = true;
     int threads = 4;

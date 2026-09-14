@@ -24,7 +24,7 @@ class brain_session {
         explicit output_limit(const char * reason) : std::runtime_error(reason) {}
     };
     struct request;
-  private:
+  protected:
     mutable std::recursive_mutex compute_mutex;
     mutable std::atomic<unsigned> compute_waiters{0};
     std::unique_lock<std::recursive_mutex> lock_compute() const {
@@ -99,6 +99,11 @@ class brain_session {
     static constexpr size_t max_audio_segments = 128;
     std::atomic<bool> cancelled{ false };
     explicit brain_session(const std::string & package, const frankie_options & options = {});
+    virtual ~brain_session() = default;
+  protected:
+    enum class brain_backend { llama, external };
+    brain_session(const std::string & package, const frankie_options & options, brain_backend backend);
+  public:
     std::vector<float> encode_audio(const std::vector<float> & pcm16k, std::string * transcript = nullptr);
 
     using image_ptr = std::shared_ptr<mtmd_bitmap>;
@@ -120,10 +125,12 @@ class brain_session {
     };
 
     // Count formatted text and media rows before choosing a bounded history window.
-    size_t prompt_tokens(const request & request, const std::map<std::string, size_t> & pending_audio) const;
-    void reset(bool preserve_checkpoint = false);
-    void report_memory() const;
+    virtual size_t prompt_tokens(const request & request, const std::map<std::string, size_t> & pending_audio) const;
+    virtual void reset(bool preserve_checkpoint = false);
+    virtual void report_memory() const;
+    struct external_state { virtual ~external_state() = default; };
     struct saved_state {
+        std::shared_ptr<external_state> external;
         sequence_state sequence;
         std::shared_ptr<const sequence_state> checkpoint;
         std::string checkpoint_prefix, cached_prefix, partial_prefix, partial_marker;
@@ -132,18 +139,18 @@ class brain_session {
         size_t checkpoint_used, cached_used, partial_used;
         bool cache_valid;
     };
-    saved_state suspend_state();
-    void restore_state(saved_state state);
+    virtual saved_state suspend_state();
+    virtual void restore_state(saved_state state);
 
     // Append older ear rows while capture is open. The final request keeps these exact rows.
-    void precommit(const request & input, const std::string & marker, const std::vector<float> & rows, size_t count);
+    virtual void precommit(const request & input, const std::string & marker, const std::vector<float> & rows, size_t count);
     struct listener_reaction { int index = 4; std::array<float, 5> probabilities{}; };
-    listener_reaction probe_listener(const request & input);
-    void finish_audio(const request & input, const std::string & marker, std::vector<float> & rows);
+    virtual listener_reaction probe_listener(const request & input);
+    virtual void finish_audio(const request & input, const std::string & marker, std::vector<float> & rows);
     // Prefill static system/tools without an assistant generation header.
-    void warm_prefix(common_chat_templates_inputs input);
+    virtual void warm_prefix(common_chat_templates_inputs input);
     // Called after parsing each decoded token. The callback must copy retained rows.
     using stage_callback = std::function<void(const char *)>;
     using stream_callback = std::function<void(const response &, bool)>;
-    response generate(const request & request, const stream_callback & on_text = {}, const stage_callback & on_stage = {});
+    virtual response generate(const request & request, const stream_callback & on_text = {}, const stage_callback & on_stage = {});
 };

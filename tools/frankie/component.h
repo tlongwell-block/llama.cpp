@@ -83,7 +83,14 @@ class component {
         header.resize(bytes);
         read_file(gguf_get_data_offset(parent.get()) + gguf_get_tensor_offset(parent.get(), hid), header.data(), bytes);
         meta.reset(gguf_init_from_buffer(header.data(), header.size(), { true, nullptr }));
-        if (!meta || gguf_get_data_offset(meta.get()) != header.size()) {
+        if (!meta) { throw std::runtime_error("component header invalid"); }
+        const size_t data_offset = gguf_get_data_offset(meta.get());
+        // Metadata-only sidecars carry the tokenizer without a second brain.
+        // The GGUF reader leaves their offset unpadded; writers may align it.
+        const bool metadata_padding = gguf_get_n_tensors(meta.get()) == 0 && data_offset <= header.size() &&
+            GGML_PAD(data_offset, gguf_get_alignment(meta.get())) == header.size() &&
+            std::all_of(header.begin() + data_offset, header.end(), [](char value) { return value == 0; });
+        if (data_offset != header.size() && !metadata_padding) {
             throw std::runtime_error("component header invalid");
         }
         for (int64_t i = 0; i < gguf_get_n_tensors(meta.get()); ++i) {
