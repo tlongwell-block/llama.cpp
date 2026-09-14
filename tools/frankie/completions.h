@@ -24,7 +24,7 @@ class frankie_completions {
         std::string id, raw, sent, reasoning, error;
         const int64_t created = std::time(nullptr);
         llama_tokens prompt, draft;
-        size_t offset = 0, generated = 0, maximum = 512;
+        size_t offset = 0, generated = 0, maximum = frankie_options::default_output_tokens;
         size_t cached = 0, cache_at = 0;
         size_t drafted = 0, accepted = 0;
         llama_pos pos = 0;
@@ -506,7 +506,7 @@ class frankie_completions {
             }
             auto maximum = j->input.value("max_completion_tokens", json());
             if (maximum.is_null()) { maximum = j->input.value("max_tokens", json()); }
-            if (maximum.is_null()) { maximum = 512; }
+            if (maximum.is_null()) { maximum = j->maximum; }
             if (!maximum.is_number_integer() || maximum <= 0 || maximum > INT32_MAX) {
                 throw std::runtime_error("max_tokens/max_completion_tokens must be a positive 32-bit integer");
             }

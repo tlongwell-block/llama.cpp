@@ -40,7 +40,7 @@ including voice and all HTTP slots. Without `--http-ctx-size` (or with zero),
 the total is split evenly across those slots. An explicit `--http-ctx-size`
 sets each HTTP slot's limit; voice uses the remaining tokens. All limits include
 prompt and generated output tokens. `max_tokens` or `max_completion_tokens` is
-an output ceiling, capped to the space remaining after the formatted prompt.
+an output ceiling, defaulting to 32768 tokens and capped to the space remaining after the formatted prompt.
 Generation stops with `finish_reason: "length"` if it reaches that ceiling.
 Prompts that leave no output space are rejected with the exact token counts.
 Each HTTP slot supports up to 262144 tokens, and voice
@@ -267,7 +267,7 @@ Input uses VAD, in-speech ear prefill with a 20-frame lag, and speculative gener
 
 Backchannels use the shared MaAI graph at 10 Hz, the actual rendered speaker PCM, and a temporary brain probe restricted to listener reactions. They have separate bounded audio events and never create an assistant turn or execute a tool. The probe uses an existing llama.cpp device checkpoint and attention-suffix rollback, then restores it after selection. Normal speech supersedes listener audio.
 
-Default limits are 90 seconds per input utterance, 300 seconds of output audio per response, and 4096 answer tokens. Use `--max-utterance-seconds` (2..120), `--max-output-audio-seconds` (1..3600), and `--max-output-tokens N|inf` to change them. Realtime `session.max_output_tokens` also accepts a positive integer or `"inf"`. Reasoning has its separate budget. An overlong VAD capture is cleared, then capture resumes after silence; no partial user turn is published. Output exhaustion reports an incomplete response and keeps capture live. Immutable input checkpoints are shared with speculative work; recovery preserves the input prefix and excludes unspoken generation. There are at most 4096 history messages and 128 audio segments; history rolls over at safe boundaries within the actual context budget.
+Default limits are 90 seconds per input utterance, 300 seconds of output audio per response, and 32768 answer tokens. Use `--max-utterance-seconds` (2..120), `--max-output-audio-seconds` (1..3600), and `--max-output-tokens N|inf` to change them. The numeric token ceiling is capped to the voice context allowance. Realtime `session.max_output_tokens` also accepts a positive integer or `"inf"`. Reasoning has its separate budget. An overlong VAD capture is cleared, then capture resumes after silence; no partial user turn is published. Output exhaustion reports an incomplete response and keeps capture live. Immutable input checkpoints are shared with speculative work; recovery preserves the input prefix and excludes unspoken generation. There are at most 4096 history messages and 128 audio segments; history rolls over at safe boundaries within the actual context budget.
 
 Inline PNG/JPEG input uses the existing vision and M-RoPE path: at most 512 KiB, four megapixels, a 4096-pixel edge and four images in a session. Audio is mono PCM16 at 24 kHz.
 

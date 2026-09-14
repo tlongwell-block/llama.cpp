@@ -95,7 +95,7 @@ class brain_session {
 
     struct request {
         int                                      reasoning_budget = 0;
-        uint32_t                                 answer_limit = 4096;
+        uint32_t                                 answer_limit = frankie_options::default_output_tokens;
         size_t generation_tokens() const { return std::min(answer_limit ? answer_limit : 512u, 512u) + (reasoning_budget ? reasoning_budget + 16 : 0); }
         common_chat_templates_inputs              chat;
         std::map<std::string, image_ptr>          images;

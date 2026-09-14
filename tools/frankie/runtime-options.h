@@ -9,6 +9,7 @@
 #include <vector>
 
 struct frankie_options {
+    static constexpr uint32_t default_output_tokens = 32768;
     bool use_gpu = true;
     bool text_encoder_gpu = true;
     int threads = 4;
@@ -20,7 +21,7 @@ struct frankie_options {
     uint32_t context_tokens = 131072; // total shared KV pool
     uint32_t max_utterance_seconds = 90;
     uint32_t max_output_audio_seconds = 300;
-    uint32_t max_output_tokens = 4096;
+    uint32_t max_output_tokens = default_output_tokens;
     uint32_t speech_context_words = 100;
     std::string cache_type = "q4_0";
     std::string thinking = "none";
@@ -49,9 +50,7 @@ struct frankie_options {
         if (reserved + 4096 > context_tokens || context_tokens - reserved > 262144) {
             throw std::runtime_error("--ctx-size minus --http-slots * --http-ctx-size must leave 4096..262144 tokens for voice");
         }
-        if (max_output_tokens > voice_context_tokens()) {
-            throw std::runtime_error("--max-output-tokens exceeds the remaining voice context");
-        }
+        max_output_tokens = std::min(max_output_tokens, voice_context_tokens());
     }
 };
 
