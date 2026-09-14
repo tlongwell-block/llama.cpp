@@ -1263,6 +1263,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_max(const llama_ubatch & ubatch) const {
+    uint64_t result = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        uint64_t count = 0;
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const auto seq = ubatch.seq_id[i][j];
+            count += get_cells(seq).seq_size(seq);
+        }
+        result = std::max(result, count);
+    }
+    return std::min<uint64_t>(UINT32_MAX, GGML_PAD(result, 256));
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -2740,6 +2753,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_max() const {
+    return ubatches.empty() ? n_kv : std::min<uint32_t>(n_kv, kv->get_n_kv_max(ubatches[i_cur]));
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

@@ -328,6 +328,8 @@ struct realtime_session {
         }
         if (input_worker.joinable()) { input_worker.join(); }
         if (bc_worker.joinable()) { bc_worker.join(); }
+        try { brain.reset(); }
+        catch (const std::exception & e) { std::cerr << "voice cleanup: " << e.what() << "\n"; }
         if (std::getenv("FRANKIE_REPORT_MEMORY")) { brain.report_memory(); mouth.report_memory(); }
     }
 

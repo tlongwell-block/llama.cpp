@@ -99,13 +99,15 @@ MAKE_TEST(test_frankie_context_pool) {
         t.assert_equal("slots fit the total pool", total, options.voice_context_tokens() + slots * options.http_context_tokens);
         options.resolve_context();
         t.assert_equal("resolution is idempotent", voice, options.voice_context_tokens());
+        options.max_output_tokens = voice + 1;
+        options.resolve_context();
+        t.assert_equal("voice output ceiling uses remaining capacity", voice, options.max_output_tokens);
     }
     for (const auto & [total, slots, per_http, output] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>>{
             {0, 0, 0, 4096}, {4096, 2, 0, 4096}, {300000, 0, 0, 4096},
             {300000, 2, 150000, 4096}, {300000, 2, 200000, 4096},
             {300000, 2, 127, 4096}, {300000, 2, UINT32_MAX, 4096},
-            {UINT32_MAX, 8, 0, 4096}, {131072, UINT32_MAX, 0, 4096},
-            {300000, 2, 110000, 80001}}) {
+            {UINT32_MAX, 8, 0, 4096}, {131072, UINT32_MAX, 0, 4096}}) {
         frankie_options options;
         options.context_tokens = total;
         options.http_slots = slots;

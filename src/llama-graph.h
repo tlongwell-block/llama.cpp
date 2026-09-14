@@ -323,11 +323,7 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx) :
-        hparams(hparams),
-        cparams(cparams),
-        mctx(mctx) {
-    }
+            const llama_kv_cache_context * mctx);
     ~llm_graph_input_attn_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -356,6 +352,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    const uint32_t n_kv_max;
 };
 
 // V-less input for the KV cache

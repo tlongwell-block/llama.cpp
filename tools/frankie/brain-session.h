@@ -26,6 +26,17 @@ class brain_session {
     struct request;
   private:
     mutable std::recursive_mutex compute_mutex;
+    mutable std::atomic<unsigned> compute_waiters{0};
+    std::unique_lock<std::recursive_mutex> lock_compute() const {
+        std::unique_lock<std::recursive_mutex> lock(compute_mutex, std::defer_lock);
+        if (!lock.try_lock()) {
+            ++compute_waiters;
+            try { lock.lock(); }
+            catch (...) { --compute_waiters; throw; }
+            --compute_waiters;
+        }
+        return lock;
+    }
     std::function<void()> background_step;
     std::atomic<bool> speech_active{false};
     std::atomic<int64_t> speech_buffer_until_us{0};

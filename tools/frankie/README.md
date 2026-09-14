@@ -69,13 +69,18 @@ and an 18 MiB request-body limit. Bitmap dimension limits still apply.
 Text-only HTTP requests reuse matching prompt prefixes by default, including
 tool continuations. Each slot retains one prefix and a bounded recurrent/MTP
 checkpoint (about 150 MiB per cached 27B slot); model weights and the existing
-KV allocation are reused. Matching idle slots are preferred.
+KV allocation are reused. Matching idle slots are preferred; requests that have
+not started evaluation can exchange slot reservations to preserve both prefixes.
 The mutable assistant tail is evaluated again. `usage.prompt_tokens_details.cached_tokens`
 reports reused tokens, including in final SSE usage. Set `cache_prompt: false`
 to bypass caching. Changed prefixes, image requests, and cancelled or failed
 requests discard that slot's cache. Cache restoration failures fall back to
 fresh evaluation. Realtime separately retains its conversation prefix and audio
 precommit state; cache reuse never transfers conversation history between clients.
+Closing a voice connection clears its active KV rows while retaining the reusable
+system/tool checkpoint, so an unused voice sequence does not slow later HTTP work.
+Prompt caching avoids repeated prefill; decoding still attends to the retained
+context. Measure decode throughput separately from first-token latency.
 
 Realtime uses `conversation.item.create` user messages containing
 `{"type":"input_image","image_url":"data:image/png;base64,..."}` alongside
@@ -84,7 +89,13 @@ Both image interfaces accept `detail: "auto"`, `"low"`, or `"high"`; like the
 ordinary llama.cpp handler, preprocessing uses the model's configured image
 budget rather than OpenAI-specific resolution tiers.
 
-HTTP work advances between bounded brain steps. While requests are pending,
+Up to sixteen HTTP requests can wait for a slot in arrival order. A full waiting
+queue returns 429; normal slot handoff and disconnected clients do not leave
+slots reserved. Non-streamed replies do not build an unused SSE backlog.
+
+HTTP prefill and decode use separate batches, with bounded prefill work between
+decode batches. Waiting voice operations take priority at compute boundaries.
+While requests are pending,
 the speech producer may keep up to 800 ms of audio ahead to absorb compute
 bursts; voice-only buffering stays unchanged. Long prompts and images can
 still take time to produce their first text token. Contexts and cancellation

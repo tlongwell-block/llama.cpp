@@ -19,7 +19,7 @@ class frankie_completions {
     using json = nlohmann::ordered_json;
     struct job {
         json input;
-        bool chat = false, ready = false, done = false;
+        bool chat = false, streaming = false, ready = false, done = false;
         std::atomic<bool> cancelled{false};
         std::string id, raw, sent, reasoning, error;
         const int64_t created = std::time(nullptr);
@@ -45,6 +45,7 @@ class frankie_completions {
         json result;
 
         void send(const json & choice) {
+            if (!streaming) { return; }
             std::lock_guard<std::mutex> lock(mutex);
             if (events.size() >= 128) { cancelled = true; return; }
             events.push_back("data: " + json({{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"},
@@ -56,6 +57,7 @@ class frankie_completions {
     std::mutex mutex;
     std::condition_variable changed;
     std::vector<std::shared_ptr<job>> slots;
+    std::deque<std::shared_ptr<job>> waiting;
     struct prompt_cache {
         llama_tokens prefix;
         brain_session::branch_state state;
@@ -64,6 +66,7 @@ class frankie_completions {
     std::atomic<bool> stopping{false}, work{false};
     std::atomic<uint64_t> serial{0};
     size_t prefill_cursor = 0;
+    unsigned decode_steps = 0;
     std::thread worker;
 
     void prepare(job & j) {
@@ -165,7 +168,7 @@ class frankie_completions {
             size_t best = j.seq - 1, matched = 0;
             for (size_t i = 0; i < caches.size(); ++i) {
                 const auto & prefix = caches[i].prefix;
-                if ((!slots[i] || slots[i].get() == &j) && prefix.size() > matched && prefix.size() < j.prompt.size() &&
+                if ((!slots[i] || slots[i].get() == &j || !slots[i]->ready) && prefix.size() > matched && prefix.size() < j.prompt.size() &&
                     std::equal(prefix.begin(), prefix.end(), j.prompt.begin())) {
                     best = i;
                     matched = prefix.size();
@@ -173,6 +176,7 @@ class frankie_completions {
             }
             if (best != size_t(j.seq - 1)) {
                 std::swap(slots[best], slots[j.seq - 1]);
+                if (slots[j.seq - 1]) { slots[j.seq - 1]->seq = j.seq; }
                 j.seq = best + 1;
             }
             if (matched && clear(j, true)) {
@@ -221,13 +225,13 @@ class frankie_completions {
             {"usage", {{"prompt_tokens", j.prompt.size()}, {"completion_tokens", j.generated},
                        {"prompt_tokens_details", {{"cached_tokens", j.cached}}},
                        {"total_tokens", j.prompt.size() + j.generated}}}};
-        if (j.input.value("stream_options", json::object()).value("include_usage", false)) {
+        if (j.streaming && j.input.value("stream_options", json::object()).value("include_usage", false)) {
             auto usage = j.result;
             usage["object"] = j.chat ? "chat.completion.chunk" : "text_completion";
             usage["choices"] = json::array();
             j.events.push_back("data: " + usage.dump() + "\n\n");
         }
-        j.events.push_back("data: [DONE]\n\n");
+        if (j.streaming) { j.events.push_back("data: [DONE]\n\n"); }
         j.done = true;
         j.changed.notify_all();
     }
@@ -309,10 +313,27 @@ class frankie_completions {
         return !brain.speech_active.load() || brain.speech_buffer_until_us.load() - now >= reserve;
     }
 
+    void stream_output(job & j) {
+        if (!j.streaming) { return; }
+        auto parsed = j.chat ? common_chat_parse(j.raw, true, j.parser) : common_chat_msg{};
+        const auto & text = j.chat ? parsed.content : j.raw;
+        json delta = json::object();
+        if (text.compare(0, j.sent.size(), j.sent) != 0) { throw std::runtime_error("text parser retracted streamed output"); }
+        if (text.size() > j.sent.size()) { delta[j.chat ? "content" : "text"] = text.substr(j.sent.size()); j.sent = text; }
+        if (parsed.reasoning_content.size() > j.reasoning.size()) {
+            delta["reasoning_content"] = parsed.reasoning_content.substr(j.reasoning.size());
+            j.reasoning = parsed.reasoning_content;
+        }
+        if (!delta.empty()) {
+            j.send(j.chat ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
+                          : json{{"index", 0}, {"text", delta["text"]}, {"finish_reason", nullptr}});
+        }
+    }
+
     void step() {
-        if (!work.load() || !has_headroom()) { return; }
+        if (!work.load() || brain.compute_waiters.load() || !has_headroom()) { return; }
         std::lock_guard<std::recursive_mutex> compute_lock(brain.compute_mutex);
-        if (!has_headroom()) { return; }
+        if (brain.compute_waiters.load() || !has_headroom()) { return; }
         std::vector<std::shared_ptr<job>> active;
         { std::lock_guard<std::mutex> lock(mutex); active = slots; }
         set_abort_callback(false);
@@ -321,7 +342,18 @@ class frankie_completions {
             ~restore_abort() { owner.set_abort_callback(true); }
         } restore{*this};
         const auto * vocab = llama_model_get_vocab(brain.model.get());
-        if (brain.speculative) {
+        bool needs_prefill = false, needs_decode = false;
+        for (auto & slot : active) {
+            if (!slot || slot->done || slot->cancelled) { continue; }
+            try {
+                if (!slot->ready) { prepare(*slot); }
+                if (slot->offset < slot->prompt.size()) { needs_prefill = true; }
+                else { needs_decode = true; }
+            } catch (const std::exception & e) { fail(*slot, e.what()); }
+        }
+        const bool prefill_turn = needs_prefill && (!needs_decode || decode_steps >= 3);
+        decode_steps = prefill_turn ? 0 : std::min(decode_steps + 1, 3u);
+        if (brain.speculative && !prefill_turn) {
             for (auto & slot : active) {
                 if (!slot || slot->done || slot->cancelled || !slot->ready || slot->offset < slot->prompt.size()) { continue; }
                 auto & j = *slot;
@@ -358,13 +390,12 @@ class frankie_completions {
                 continue;
             }
             try {
-                if (!j.ready) { prepare(j); }
                 if (j.offset < j.prompt.size()) {
-                    if (prefilled) { continue; }
+                    if (!prefill_turn || prefilled) { continue; }
                     prefilled = true;
                     prefill_cursor = (slot_index + 1) % active.size();
-                    const size_t reserve = active.size() * (1 + brain.options.mtp_tokens);
-                    const size_t count = std::min(brain.speech_active.load() ? size_t(32) : size_t(128), llama_n_batch(brain.ctx.get()) - reserve);
+                    const size_t count = std::min<size_t>(llama_n_batch(brain.ctx.get()),
+                        brain.speech_active.load() ? 32 : needs_decode ? 64 : 128);
                     const auto media = j.media.find(j.offset);
                     if (media != j.media.end()) {
                         if (!j.image_batch && !has_headroom(600000)) { continue; }
@@ -381,6 +412,7 @@ class frankie_completions {
                     }
                     if (j.offset == j.prompt.size()) { outputs.push_back({slot, {batch.n_tokens - 1}, false}); }
                 } else {
+                    if (prefill_turn) { continue; }
                     output item{slot, {}, true};
                     common_batch_add(batch, j.pending, j.pos, {j.seq}, true);
                     item.indices.push_back(batch.n_tokens - 1);
@@ -431,26 +463,16 @@ class frankie_completions {
                             }
                         }
                         j.draft.clear();
+                        const char * finished = nullptr;
                         for (const auto token : ids) {
                             j.pending = token;
-                            if (llama_vocab_is_eog(vocab, token)) { finish(j, "stop"); break; }
+                            if (llama_vocab_is_eog(vocab, token)) { finished = "stop"; break; }
                             j.raw += common_token_to_piece(vocab, token, true);
                             ++j.generated;
-                            auto parsed = j.chat ? common_chat_parse(j.raw, true, j.parser) : common_chat_msg{};
-                            const auto & text = j.chat ? parsed.content : j.raw;
-                            json delta = json::object();
-                            if (text.compare(0, j.sent.size(), j.sent) != 0) { throw std::runtime_error("text parser retracted streamed output"); }
-                            if (text.size() > j.sent.size()) { delta[j.chat ? "content" : "text"] = text.substr(j.sent.size()); j.sent = text; }
-                            if (parsed.reasoning_content.size() > j.reasoning.size()) {
-                                delta["reasoning_content"] = parsed.reasoning_content.substr(j.reasoning.size());
-                                j.reasoning = parsed.reasoning_content;
-                            }
-                            if (!delta.empty()) {
-                                j.send(j.chat ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
-                                              : json{{"index", 0}, {"text", delta["text"]}, {"finish_reason", nullptr}});
-                            }
-                            if (j.generated >= j.maximum) { finish(j, "length"); break; }
+                            if (j.generated >= j.maximum) { finished = "length"; break; }
                         }
+                        stream_output(j);
+                        if (finished) { finish(j, finished); }
                     } catch (const std::exception & e) { fail(j, e.what()); }
                 }
             }
@@ -465,14 +487,18 @@ class frankie_completions {
             } }
         }
         std::lock_guard<std::mutex> lock(mutex);
+        bool released = false;
         for (auto & slot : slots) {
             if (slot && (slot->done || slot->cancelled.load())) {
+                if (!slot->done) { fail(*slot, "request cancelled"); }
                 clear(*slot, slot->done && slot->error.empty());
                 slot.reset();
+                released = true;
             }
         }
         work = std::any_of(slots.begin(), slots.end(), [](const auto & slot) { return bool(slot); });
         brain.http_pending = work.load();
+        if (released) { changed.notify_all(); }
     }
 
     void handle(const httplib::Request & request, httplib::Response & response) {
@@ -480,6 +506,7 @@ class frankie_completions {
         try {
             j->input = json::parse(request.body);
             j->chat = request.path == "/v1/chat/completions";
+            j->streaming = j->input.value("stream", false);
             if (j->chat) {
                 if (j->input.at("messages").dump().find("[FRANKIE_") != std::string::npos) {
                     throw std::invalid_argument("reserved media marker");
@@ -526,16 +553,30 @@ class frankie_completions {
             }
             j->id = (j->chat ? "chatcmpl-" : "cmpl-") + std::to_string(++serial);
             {
-                std::lock_guard<std::mutex> lock(mutex);
-                auto free = std::find(slots.begin(), slots.end(), nullptr);
-                if (free == slots.end()) { response.status = 429; throw std::runtime_error("all HTTP slots are busy"); }
+                std::unique_lock<std::mutex> lock(mutex);
+                if (waiting.size() >= 16) { response.status = 429; throw std::runtime_error("HTTP request queue is full"); }
+                waiting.push_back(j);
+                struct dequeue {
+                    frankie_completions & owner;
+                    std::shared_ptr<job> entry;
+                    ~dequeue() {
+                        auto & queue = owner.waiting;
+                        queue.erase(std::find(queue.begin(), queue.end(), entry));
+                        owner.changed.notify_all();
+                    }
+                } remove_waiter{*this, j};
+                auto free = slots.end();
+                while (waiting.front() != j || (free = std::find(slots.begin(), slots.end(), nullptr)) == slots.end()) {
+                    if (stopping.load()) { response.status = 503; throw std::runtime_error("server is stopping"); }
+                    if (request.is_connection_closed()) { j->cancelled = true; return; }
+                    changed.wait_for(lock, std::chrono::milliseconds(100));
+                }
                 j->seq = 1 + std::distance(slots.begin(), free);
                 *free = j;
                 work = true;
                 brain.http_pending = true;
             }
-            changed.notify_all();
-            if (j->input.value("stream", false)) {
+            if (j->streaming) {
                 response.set_chunked_content_provider("text/event-stream", [j](size_t, httplib::DataSink & sink) {
                     std::unique_lock<std::mutex> lock(j->mutex);
                     j->changed.wait_for(lock, std::chrono::milliseconds(100), [&] { return j->done || !j->events.empty(); });

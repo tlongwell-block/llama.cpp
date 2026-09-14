@@ -118,7 +118,7 @@ brain_session::brain_session(const std::string & package, const frankie_options 
 }
 
 std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, std::string * transcript) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     const auto started = std::chrono::steady_clock::now();
     if (pcm.empty() || pcm.size() > 16000 * options.max_utterance_seconds) {
         throw std::runtime_error("audio bounds");
@@ -226,7 +226,7 @@ void brain_session::decode_text(const std::string & text, int & pos, size_t & us
 // with learned ear rows during prefill. The server rejects markers in external
 // text, instructions and tool output. Recurrent state rolls back only to a full sequence checkpoint.
 void brain_session::reset(bool preserve_checkpoint) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     cache_valid = false;
     partial_prefix.clear();
     partial_marker.clear();
@@ -342,7 +342,7 @@ void brain_session::save_checkpoint(const std::string & prefix, int pos, size_t 
 }
 
 brain_session::saved_state brain_session::suspend_state() {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     saved_state saved;
     saved.sequence = capture_sequence();
     // Speculation also needs this immutable prefix; sharing avoids a large copy.
@@ -363,7 +363,7 @@ brain_session::saved_state brain_session::suspend_state() {
 }
 
 brain_session::listener_reaction brain_session::probe_listener(const request & input) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     if (partial_marker.empty() || partial_rows.size() < 8 * 5120) { return {}; }
     auto chat = input.chat;
     chat.enable_thinking = false;
@@ -416,7 +416,7 @@ brain_session::listener_reaction brain_session::probe_listener(const request & i
 }
 
 void brain_session::restore_state(saved_state saved) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     restore_sequence(saved.sequence);
     checkpoint = std::move(saved.checkpoint);
     checkpoint_prefix = std::move(saved.checkpoint_prefix);
@@ -434,7 +434,7 @@ void brain_session::restore_state(saved_state saved) {
 }
 
 void brain_session::warm_prefix(common_chat_templates_inputs input) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     if (input.messages.size() != 1 || input.messages[0].role != "system") {
         throw std::runtime_error("warm prefix requires only system context");
     }
@@ -623,7 +623,7 @@ void brain_session::prefill(const request & request, const std::string & prompt,
 }
 
 void brain_session::precommit(const request & input, const std::string & marker, const std::vector<float> & rows, size_t count) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     if (count == 0 || rows.size() % 5120 || count >= rows.size() / 5120 || count >= audio_row_limit()) {
         throw std::runtime_error("precommit row bounds");
     }
@@ -665,7 +665,7 @@ void brain_session::precommit(const request & input, const std::string & marker,
 }
 
 void brain_session::finish_audio(const request & input, const std::string & marker, std::vector<float> & rows) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     const auto formatted = common_chat_templates_apply(templates.get(), input.chat);
     if (marker == partial_marker && formatted.prompt.compare(0, partial_prefix.size(), partial_prefix) == 0 &&
         formatted.prompt.compare(partial_prefix.size(), marker.size(), marker) == 0) {
@@ -689,7 +689,7 @@ void brain_session::configure_thinking(common_params_sampling & sampling, const 
 }
 
 brain_session::response brain_session::generate(const request & request, const stream_callback & on_text, const stage_callback & on_stage) {
-    std::lock_guard<std::recursive_mutex> compute_lock(compute_mutex);
+    auto compute_lock = lock_compute();
     const auto & input      = request.chat;
     const auto & audio_rows = request.audio_rows;
     if (request.reasoning_budget < 0 || request.reasoning_budget > 32768 ||

@@ -601,7 +601,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    const int64_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+                    const bool sparse = n_kv_max > 0 && 4*n_kv_max <= K->ne[1];
+                    if (Q->ne[1] <= 2 || (cc >= GGML_CUDA_CC_BLACKWELL && sparse && Q->ne[1] <= 8)) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
