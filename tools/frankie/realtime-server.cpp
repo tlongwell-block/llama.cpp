@@ -531,8 +531,8 @@ struct realtime_session {
             throw std::runtime_error("choose audio or text output");
         }
         auto instructions = merged.at("instructions").get<std::string>();
-        if (instructions.size() > 16384 || instructions.find("[FRANKIE_") != std::string::npos) {
-            throw std::runtime_error("instructions bounds");
+        if (instructions.find("[FRANKIE_") != std::string::npos) {
+            throw std::runtime_error("instructions contain a reserved marker");
         }
         std::vector<common_chat_tool> tools;
         if (!merged["tools"].is_array() || merged["tools"].size() > 32) {

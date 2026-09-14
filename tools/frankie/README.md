@@ -28,6 +28,8 @@ build-frankie/bin/llama-frankie-realtime /path/to/frankie.gguf 18793 \
 
 The authenticated WebSocket endpoint is `/v1/realtime`. `/health` becomes ready after the mouth warm-up. Only one connection owns the voice session at a time. There is no automatic reconnect or replay of tool effects. `--host` defaults to `127.0.0.1`; set `--host 0.0.0.0` to accept LAN connections. The same bearer token authenticates HTTP and WebSocket requests.
 
+Realtime `session.instructions` has no separate byte limit. Instructions and tools must fit the configured voice context; the existing 4 MiB formatted-prompt and 18 MiB event limits still apply. Prefixes that exceed the context fail with `prefix_warm_failed` instead of being truncated. The `[FRANKIE_` prefix is reserved for internal media markers.
+
 For a mouth with a separate text encoder, such as Breeze, `--text-encoder-device cpu` keeps that encoder on the CPU while `--device gpu` runs the brain and acoustic models on the GPU. This leaves more VRAM for context and live-audio buffers without changing quantization. The default is `gpu`; measure the additional speech latency when selecting CPU placement. Qwen3-TTS has no separate text encoder, so this option does not change its execution.
 
 ### Experimental concurrent text and image requests
