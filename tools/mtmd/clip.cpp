@@ -1107,7 +1107,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             } break;
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             {
-                builder = std::make_unique<clip_graph_pockettts_spkenc>(ctx, img);
+                builder = std::make_unique<clip_graph_pockettts_spkenc>(ctx, img, params && params->state_out);
             } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
@@ -1907,11 +1907,11 @@ struct clip_model_loader {
                         // flow_lm defaults, see pocket_tts/default_parameters.py
                         hparams.flow_n_step       = 1;
                         hparams.gen_eos_threshold = -4.0f;
-                        if (hparams.gen_model_variant == "breeze") {
+                        if (hparams.gen_model_variant == "breeze" || hparams.gen_model_variant == "mimi") {
                             hparams.seanet_ratios = {4, 5, 6, 8};
                             hparams.seanet_n_stage = hparams.seanet_ratios.size();
                             hparams.mimi_downsample = 2;
-                            hparams.mimi_tfm_context = 8000;
+                            hparams.mimi_tfm_context = hparams.gen_model_variant == "mimi" ? 250 : 8000;
                         }
                     } break;
                 case PROJECTOR_TYPE_PADDLEOCR:
@@ -3040,7 +3040,7 @@ struct clip_model_loader {
                         }
                         model.gen_code_out_embd_w = get_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD, "weight"));
                         model.gen_code_embd_w = get_tensor(string_format(TN_A_GEN_CODE_EMBD, "weight"));
-                    } else {
+                    } else if (hparams.gen_model_variant != "mimi") {
                         model.spk_proj_w = get_tensor(string_format(TN_A_SPEAKER_PROJ, "weight"));
                     }
                 } break;
@@ -4511,6 +4511,7 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     switch (model.proj_type) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:  return list_c2w_state_slots(hparams, model);
         case PROJECTOR_TYPE_POCKETTTS_GEN: return list_pockettts_state_slots(hparams, model);
+        case PROJECTOR_TYPE_POCKETTTS_SPKENC: return list_mimi_encoder_state_slots(hparams, model);
         default:                           return {};
     }
 }
@@ -4610,9 +4611,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     auto set_pockettts_tfm_inputs = [&]() {
         const int64_t n_pos = ggml_nelements(get_inp_tensor("inp_pos"));
         GGML_ASSERT(n_pos > 0);
+        float base = 0;
+        const bool stream = params->state_out != nullptr;
+        if (stream && params->state_in && params->state_in->size() >= sizeof(base)) {
+            std::memcpy(&base, params->state_in->data(), sizeof(base));
+        }
         std::vector<int32_t> positions((size_t) n_pos);
         for (int64_t i = 0; i < n_pos; i++) {
-            positions[(size_t) i] = (int32_t) i;
+            positions[(size_t) i] = (int32_t) base + i;
         }
         set_input_i32("inp_pos", positions);
 
@@ -4621,12 +4627,20 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         GGML_ASSERT(n_pos <= max_pos && "pocket-tts speaker reference too long for a dense mask");
 
         const int64_t context = hparams.mimi_tfm_context;
-        std::vector<float> mask((size_t) n_pos * n_pos, -INFINITY);
+        const int64_t prefix = stream ? context - 1 : 0;
+        const bool ring = stream && hparams.gen_model_variant == "mimi";
+        const int64_t n_kv = ring ? context : prefix + n_pos;
+        if (ring) {
+            std::vector<int64_t> slots(n_pos);
+            for (int64_t i = 0; i < n_pos; ++i) { slots[i] = (int64_t(base) + i) % context; }
+            ggml_backend_tensor_set(get_inp_tensor("inp_cache_pos"), slots.data(), 0, slots.size() * sizeof(int64_t));
+        }
+        std::vector<float> mask((size_t) n_kv * n_pos, -INFINITY);
         for (int64_t q = 0; q < n_pos; q++) {
-            for (int64_t k = 0; k < n_pos; k++) {
-                const int64_t delta = q - k;
-                if (delta >= 0 && delta < context) {
-                    mask[(size_t) q * n_pos + k] = 0.0f;
+            for (int64_t k = 0; k < n_kv; k++) {
+                const int64_t delta = ring ? int64_t(base) + q - (k + std::max(int64_t(0), int64_t(base) + 1 - context)) : prefix + q - k;
+                if (delta >= 0 && delta < context && (ring || k + int64_t(base) >= prefix)) {
+                    mask[(size_t) q * n_kv + k] = 0.0f;
                 }
             }
         }
@@ -5270,6 +5284,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             {
                 set_pockettts_tfm_inputs();
+                if (params->state_out) { set_gen_state_in(); }
             } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
@@ -6134,7 +6149,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             return ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
-            return ctx->model.spk_proj_w ? ctx->model.spk_proj_w->ne[1] : ctx->model.gen_code_out_embd_w->ne[0];
+            return ctx->model.hparams.gen_model_variant == "mimi" ? ctx->model.hparams.projection_dim :
+                   ctx->model.spk_proj_w ? ctx->model.spk_proj_w->ne[1] : ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             return ctx->model.gen_input_lin_w->ne[1];
         case PROJECTOR_TYPE_PARAKEET:

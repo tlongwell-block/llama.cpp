@@ -4,7 +4,7 @@
 // mimi encoder (SEANet + transformer + downsample), then flow_lm.speaker_proj_weight
 
 // pre-norm block with layer scale on both residual paths, see mimi_transformer.py
-ggml_tensor * clip_graph_pockettts_spkenc::tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, ggml_tensor * inp_pos, ggml_tensor * kq_mask, int il) const {
+ggml_tensor * clip_graph_pockettts_spkenc::tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, ggml_tensor * inp_pos, ggml_tensor * kq_mask, int il, clip_graph_pockettts_seanet * state) const {
     ggml_tensor * inp = cur;
 
     cur = build_norm(cur, layer.ln_1_w, layer.ln_1_b, NORM_TYPE_NORMAL, eps, il);
@@ -18,11 +18,30 @@ ggml_tensor * clip_graph_pockettts_spkenc::tfm_layer_forward(ggml_tensor * cur, 
     Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
     Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
 
-    const int rope_type = model.mimi_quant_in[0] ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
+    const int rope_type = (model.mimi_quant_in[0] || hparams.gen_model_variant == "mimi") ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
     Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, d_head, rope_type, 0,
                          hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, d_head, rope_type, 0,
                          hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    if (state) {
+        const int64_t prefix = hparams.mimi_tfm_context - 1;
+        const auto append = [&](ggml_tensor * x, const std::string & name) {
+            if (hparams.gen_model_variant == "mimi") {
+                // Match the upstream continuous-Mimi fixed-cache export.
+                auto * full = ggml_set_rows(ctx0, ggml_dup(ctx0, state->state_in.at(name)),
+                    ggml_reshape_2d(ctx0, x, n_embd, n_pos), state->state_in.at("cache_pos"));
+                state->state_out.push_back({name, full});
+                return ggml_reshape_3d(ctx0, full, d_head, n_head, hparams.mimi_tfm_context);
+            }
+            auto * full = ggml_concat(ctx0, state->state_in.at(name), ggml_reshape_2d(ctx0, x, n_embd, n_pos), 1);
+            state->state_out.push_back({name, ggml_cont(ctx0,
+                ggml_view_2d(ctx0, full, n_embd, prefix, full->nb[1], n_pos * full->nb[1]))});
+            return ggml_reshape_3d(ctx0, full, d_head, n_head, prefix + n_pos);
+        };
+        Kcur = append(Kcur, "tfm_k_" + std::to_string(il));
+        Vcur = append(Vcur, "tfm_v_" + std::to_string(il));
+    }
 
     cur = build_attn(layer.o_w, nullptr, Qcur, Kcur, Vcur, kq_mask, kq_scale, il);
     cur = ggml_mul(ctx0, cur, layer.ls_1_w);
@@ -30,7 +49,7 @@ ggml_tensor * clip_graph_pockettts_spkenc::tfm_layer_forward(ggml_tensor * cur, 
 
     inp = cur;
     cur = build_norm(cur, layer.ln_2_w, layer.ln_2_b, NORM_TYPE_NORMAL, eps, il);
-    cur = build_ffn(cur, layer.ff_up_w, nullptr, nullptr, nullptr, layer.ff_down_w, nullptr, FFN_GELU, il);
+    cur = build_ffn(cur, layer.ff_up_w, nullptr, nullptr, nullptr, layer.ff_down_w, nullptr, hparams.gen_model_variant == "mimi" ? FFN_GELU_ERF : FFN_GELU, il);
     cur = ggml_mul(ctx0, cur, layer.ls_2_w);
     cur = ggml_add(ctx0, cur, inp);
 
@@ -43,6 +62,20 @@ ggml_cgraph * clip_graph_pockettts_spkenc::build() {
     ggml_tensor * cur = ggml_reshape_2d(ctx0, inp_raw, inp_raw->ne[0], inp_raw->ne[1]);
 
     clip_graph_pockettts_seanet seanet(*this);
+    if (streaming) {
+        for (const auto & slot : list_mimi_encoder_state_slots(hparams, model)) {
+            auto * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, slot.ne0, slot.ne1);
+            ggml_set_name(t, ("state_in_" + slot.name).c_str());
+            ggml_set_input(t);
+            seanet.state_in[slot.name] = t;
+        }
+    }
+    if (streaming && hparams.gen_model_variant == "mimi") {
+        auto * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp_raw->ne[0] / hparams.mimi_encoder_hop());
+        ggml_set_input(positions);
+        ggml_set_name(positions, "inp_cache_pos");
+        seanet.state_in["cache_pos"] = positions;
+    }
     cur = seanet.encode(cur);
     cb(cur, "mimi_enc", -1);
 
@@ -54,23 +87,26 @@ ggml_cgraph * clip_graph_pockettts_spkenc::build() {
     ggml_set_input(inp_pos);
 
     // the mimi transformer is causal with a sliding window, see _build_attention_mask()
-    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[1], cur->ne[1]);
+    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (streaming && hparams.gen_model_variant == "mimi" ? hparams.mimi_tfm_context :
+        cur->ne[1] + (streaming ? hparams.mimi_tfm_context - 1 : 0)), cur->ne[1]);
     ggml_set_name(kq_mask, "kq_mask");
     ggml_set_input(kq_mask);
 
     for (int il = 0; il < n_layer; il++) {
-        cur = tfm_layer_forward(cur, model.layers[il], inp_pos, kq_mask, il);
+        cur = tfm_layer_forward(cur, model.layers[il], inp_pos, kq_mask, il, streaming ? &seanet : nullptr);
     }
     cb(cur, "mimi_enc_tfm", -1);
 
     // downsample to the model frame rate, [512, T] -> [T, 512] -> [T / 16, 32]
     cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
-    cur = seanet.conv1d(cur, model.downsample_w, nullptr, hparams.mimi_downsample, 1, true);
+    cur = seanet.conv1d(cur, model.downsample_w, nullptr, hparams.mimi_downsample, 1, true, streaming ? "down" : "");
     cb(cur, "mimi_downsample", -1);
 
     // voice latent -> backbone embd
     cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
-    if (model.spk_proj_w) {
+    if (hparams.gen_model_variant == "mimi") {
+        // Continuous features before RVQ, shared by streaming acoustic heads.
+    } else if (model.spk_proj_w) {
         cur = build_mm(model.spk_proj_w, cur);
     } else {
         // Split RVQ: the semantic and acoustic quantizers start from the same latent.
@@ -100,6 +136,43 @@ ggml_cgraph * clip_graph_pockettts_spkenc::build() {
     }
     cb(cur, "spk_proj", -1);
 
+    if (streaming) {
+        seanet.state_out.push_back({"tfm_pos", ggml_scale_bias(ctx0, seanet.state_in.at("tfm_pos"), 1.0f,
+                                                             (float) inp_pos->ne[0])});
+        for (const auto & slot : seanet.state_out) {
+            ggml_set_name(slot.second, ("state_out_" + slot.first).c_str());
+            ggml_set_output(slot.second);
+            ggml_build_forward_expand(gf, slot.second);
+        }
+    }
     ggml_build_forward_expand(gf, cur);
+    if (hparams.gen_model_variant == "mimi") {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            auto * node = ggml_graph_node(gf, i);
+            if (node->op == GGML_OP_MUL_MAT) {
+                ggml_prec_set_src(node, GGML_PREC_F32, 1);
+                ggml_prec_set_acc(node, GGML_PREC_F32);
+            }
+        }
+    }
     return gf;
+}
+
+std::vector<c2w_state_slot> list_mimi_encoder_state_slots(const clip_hparams & hp, const clip_model & model) {
+    const auto & enc = model.seanet;
+    std::vector<c2w_state_slot> slots{{"tfm_pos", 1, 1}};
+    for (size_t i = 0; i < model.layers.size(); ++i) {
+        const auto n = model.layers[i].q_w->ne[1];
+        slots.push_back({"tfm_k_" + std::to_string(i), n, hp.mimi_tfm_context - (hp.gen_model_variant == "mimi" ? 0 : 1)});
+        slots.push_back({"tfm_v_" + std::to_string(i), n, hp.mimi_tfm_context - (hp.gen_model_variant == "mimi" ? 0 : 1)});
+    }
+    slots.push_back({"enc_in", enc.conv_in_w->ne[0] - 1, enc.conv_in_w->ne[1]});
+    for (int i = 0; i < hp.seanet_n_stage; ++i) {
+        const auto & stage = enc.stages[i];
+        slots.push_back({"enc_res_" + std::to_string(i), stage.res_conv1_w->ne[0] - 1, stage.res_conv1_w->ne[1]});
+        slots.push_back({"enc_down_" + std::to_string(i), stage.scale_conv_w->ne[0] - hp.seanet_ratios[i], stage.scale_conv_w->ne[1]});
+    }
+    slots.push_back({"enc_out", enc.conv_out_w->ne[0] - 1, enc.conv_out_w->ne[1]});
+    slots.push_back({"down", model.downsample_w->ne[0] - hp.mimi_downsample, model.downsample_w->ne[1]});
+    return slots;
 }

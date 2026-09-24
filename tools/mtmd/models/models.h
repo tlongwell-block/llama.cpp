@@ -361,10 +361,13 @@ struct clip_graph_pockettts_seanet : clip_graph {
 
 // mimi encoder + speaker_proj: reference waveform -> voice conditioning rows
 struct clip_graph_pockettts_spkenc : clip_graph {
-    clip_graph_pockettts_spkenc(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    clip_graph_pockettts_spkenc(clip_ctx * ctx, const clip_image_f32 & img, bool streaming = false)
+        : clip_graph(ctx, img), streaming(streaming) {}
     ggml_cgraph * build() override;
+    bool streaming;
 
-    ggml_tensor * tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, ggml_tensor * inp_pos, ggml_tensor * kq_mask, int il) const;
+    ggml_tensor * tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, ggml_tensor * inp_pos, ggml_tensor * kq_mask, int il,
+                                    clip_graph_pockettts_seanet * state = nullptr) const;
 };
 
 //
@@ -397,6 +400,7 @@ std::vector<c2w_state_slot> list_c2w_state_slots(const clip_hparams & hparams, c
 
 // same, for the streaming mimi decoder (pocket-tts GEN_WAV)
 std::vector<c2w_state_slot> list_pockettts_state_slots(const clip_hparams & hparams, const clip_model & model);
+std::vector<c2w_state_slot> list_mimi_encoder_state_slots(const clip_hparams & hparams, const clip_model & model);
 
 struct clip_graph_kimik25 : clip_graph {
     clip_graph_kimik25(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}

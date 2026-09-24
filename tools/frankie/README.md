@@ -1,6 +1,6 @@
 # Frankie Realtime
 
-This opt-in server runs Frankie's Qwen brain, Parakeet ear, bridges, Qwen3-TTS or Breeze voice, vision and turn-taking models through llama.cpp, mtmd and ggml. It accepts a single Frankie GGUF and binds to loopback. Buzz owns tools, permissions and conversation policy; the native server performs inference.
+This opt-in server runs Frankie's Qwen brain, Parakeet ear, bridges, Qwen3-TTS or Breeze voice, vision and turn-taking models through llama.cpp, mtmd and ggml. It accepts a single Frankie GGUF and binds to loopback. Clients own tools, permissions and conversation policy; the native server performs inference. All model components execute inside this one native process, with bounded workers for speech and turn detection.
 
 ## Build
 
@@ -31,6 +31,58 @@ The authenticated WebSocket endpoint is `/v1/realtime`. `/health` becomes ready 
 Realtime `session.instructions` has no separate byte limit. Instructions and tools must fit the configured voice context; the existing 4 MiB formatted-prompt and 18 MiB event limits still apply. Prefixes that exceed the context fail with `prefix_warm_failed` instead of being truncated. The `[FRANKIE_` prefix is reserved for internal media markers.
 
 For a mouth with a separate text encoder, such as Breeze, `--text-encoder-device cpu` keeps that encoder on the CPU while `--device gpu` runs the brain and acoustic models on the GPU. This leaves more VRAM for context and live-audio buffers without changing quantization. The default is `gpu`; measure the additional speech latency when selecting CPU placement. Qwen3-TTS has no separate text encoder, so this option does not change its execution.
+
+### Human backchannels and interruptions
+
+An optional MaAI BC-Det checkpoint distinguishes a listener nod from a new turn
+while assistant audio is playing. It is separate from the VAP-BC model that
+predicts when the assistant should backchannel. Convert the BC-Det checkpoint
+and its matching continuous Mimi encoder once; ONNX and PyTorch are needed only
+for conversion, never by the server:
+
+```sh
+python tools/frankie/convert-turn.py bc_det.pt bc-det.gguf --mimi mimi.onnx
+# Use an existing package unchanged:
+build/bin/llama-frankie-realtime frankie.gguf 18793 --bc-det-model bc-det.gguf
+# Or include the detector in a single distributable GGUF:
+python tools/frankie/pack.py --base frankie.gguf --bc-det bc-det.gguf --output frankie-v5.gguf
+```
+
+The F32 detector asset is approximately 162 MiB, plus bounded runtime state.
+Its continuous Mimi encoder reuses mtmd's streaming SEANet and transformer
+implementation; the detector reuses the native turn graph. CPU is the default
+for this worker, keeping microphone classification independent of GPU prefill.
+`--bc-det-device gpu` selects Metal or CUDA. Measure this choice with the mouth
+running: CPU speech work can also delay a CPU detector. No second inference
+process is used.
+
+Clients supply paired mono PCM16 at 24 kHz: `input_audio_buffer.append.audio`
+is microphone audio and the optional `playback_audio` field is audio actually
+rendered during the same interval, encoded identically. `playback` is an alias.
+Do not send future queued audio as playback. The worker processes 80 ms steps;
+two observations below 0.2 confirm an interruption after at least 96 ms of
+voice activity. After two backchannel observations at or above 0.2, the release
+threshold becomes 0.05. These are classifier rules, not guaranteed end-to-end
+latencies. Stale predictions (over 240 ms) or missing paired playback fall back
+to ordinary VAD interruption. Without the detector, the original VAD behavior
+is retained. `interrupt_response: false` disables automatic cancellation.
+
+Send `frankie.playback.position` periodically and `frankie.playback.finished`
+after output has finished and the device queue has drained. Both events contain
+`response_id`, `item_id`, and integer `audio_end_ms` measured from that item's
+first sample. Positions cannot exceed emitted audio. On
+`frankie.playback.clear`, discard queued audio for its `response_id`, reject late
+chunks from that response, and send the standard `conversation.item.truncate`
+with the actual played position and `content_index: 0`. Generation completion
+does not imply playback completion. A detected listener nod leaves playback running and
+does not publish a new user turn; a confirmed interruption retains microphone
+audio for the next turn and clears the interrupted response immediately.
+
+Truncated conversation history retains completed, heard phrases and a private
+playback notice, without inserting interruption annotations into spoken text.
+Empty unheard assistant messages are omitted when formatting model input, and
+realtime history does not replay previous reasoning blocks. HTTP history and
+thinking configuration are independent.
 
 ### Experimental concurrent text and image requests
 

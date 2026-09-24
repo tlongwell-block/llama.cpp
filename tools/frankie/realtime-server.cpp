@@ -1,5 +1,6 @@
 #include "base64.hpp"
 #include "brain-session.h"
+#include "backchannel-gate.h"
 #include "completions.h"
 #include "image-input.h"
 #include "common.h"
@@ -65,7 +66,7 @@ struct realtime_session {
     std::map<std::string, std::vector<float>> unencoded;
     std::map<std::string, size_t> audio_messages;
     std::map<std::string, size_t> emitted_samples;
-    std::set<std::string> truncated;
+    std::set<std::string> truncated, client_truncated;
     struct heard_phrase { size_t end; std::string text; };
     std::map<std::string, std::vector<heard_phrase>> phrase_history;
     std::map<std::string, size_t> heard_samples;
@@ -79,9 +80,67 @@ struct realtime_session {
                 text += phrase.text;
             }
         }
-        return text + " [interrupted by the user]";
+        return text;
     }
+    struct playback_state { std::string response; bool done = false, cleared = false; };
+    std::map<std::string, playback_state> playback;
+    std::string playback_item, overlap_item;
+    frankie_backchannel_gate interruption;
+    bool pending_overlap = false;
     bool speaking = false, dropping_input = false;
+
+    void save_cutoff(const std::string & id) {
+        truncated.insert(id);
+        auto found = audio_messages.find(id);
+        if (found != audio_messages.end()) {
+            request.chat.messages[found->second].content = heard_text(id);
+            request.playback_cutoffs.insert(found->second);
+        }
+    }
+
+    void clear_playback(const std::string & id) {
+        auto found = playback.find(id);
+        if (found == playback.end() || found->second.cleared) { return; }
+        found->second.cleared = true;
+        save_cutoff(id);
+        send({{"type", "frankie.playback.clear"}, {"response_id", found->second.response}, {"item_id", id}});
+        if (playback_item == id) { playback_item.clear(); }
+        if (busy && found->second.response == response_id) {
+            brain.cancelled = true;
+            mouth.cancelled = true;
+            changed.notify_all();
+        }
+    }
+
+    void playback_position(const json & event, bool finished) {
+        const auto id = event.at("item_id").get<std::string>();
+        auto found = playback.find(id);
+        if (found == playback.end() || event.at("response_id") != found->second.response ||
+            !event.at("audio_end_ms").is_number_integer()) {
+            throw std::runtime_error("invalid playback item or position");
+        }
+        const auto end = event.at("audio_end_ms").get<int64_t>();
+        const auto emitted = emitted_samples.at(id);
+        if (end < 0 || uint64_t(end) > (emitted + 23) / 24 || (finished && !found->second.done)) {
+            throw std::runtime_error("playback position out of bounds or response not finished");
+        }
+        if (found->second.cleared || truncated.count(id)) { return; }
+        const auto samples = std::min(emitted, size_t(end) * 24);
+        if (samples < heard_samples[id]) { return; }
+        heard_samples[id] = samples;
+        if (finished && samples + 24 >= emitted && playback_item == id) { playback_item.clear(); }
+    }
+
+    void start_speech() {
+        pending_overlap = false;
+        if (auto_interrupt) {
+            if (!overlap_item.empty()) { clear_playback(overlap_item); }
+            // Before the first PCM there is nothing to classify as a listener nod.
+            else if (busy) { brain.cancelled = true; mouth.cancelled = true; changed.notify_all(); }
+        }
+        send({{"type", "input_audio_buffer.speech_started"}, {"item_id", input_id},
+              {"audio_start_ms", (input_samples - audio.size() / 2) / 24}});
+    }
     bool server_vad = false, auto_response = false, auto_interrupt = false;
     int silence_ms = 240, silence_frames = 0, speech_frames = 0;
     float threshold = 0.5f;
@@ -129,6 +188,7 @@ struct realtime_session {
         brain.cancelled = true;
         mouth.cancelled = true;
         request.chat.messages.resize(turn->user_index);
+        request.playback_cutoffs.erase(request.playback_cutoffs.lower_bound(turn->user_index), request.playback_cutoffs.end());
         for (auto it = items.begin(); it != items.end();) {
             if (it->second.message >= turn->user_index) { it = items.erase(it); }
             else { ++it; }
@@ -289,13 +349,15 @@ struct realtime_session {
         request.reasoning_budget = frankie_thinking_budget(options.thinking);
         request.chat.enable_thinking = request.reasoning_budget > 0;
         request.chat.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        request.realtime_history = true;
+        request.chat.chat_template_kwargs["preserve_thinking"] = "false";
         common_chat_msg system;
         system.role    = "system";
         system.content = "You are Frankie. Respond briefly.";
         request.chat.messages.push_back(system);
         config = {
             {"max_output_tokens", options.max_output_tokens ? json(options.max_output_tokens) : json("inf")},
-            { "frankie", {{"duplex_audio", true}, {"vap", turns->has_vap()}, {"backchannels", turns->has_bc()}, {"max_output_audio_samples", uint64_t(max_output_audio_seconds) * 24000}} },
+            { "frankie", {{"duplex_audio", true}, {"vap", turns->has_vap()}, {"backchannels", turns->has_bc()}, {"human_backchannels", turns->has_detector()}, {"playback_feedback", true}, {"max_output_audio_samples", uint64_t(max_output_audio_seconds) * 24000}} },
             { "id",                "session_local"                                                             },
             { "type",              "realtime"                                                                  },
             { "model",             "frankie"                                                                   },
@@ -346,7 +408,7 @@ struct realtime_session {
         if (input_busy.load() || !pending_reaction) { return; }
         const auto reaction = *pending_reaction;
         pending_reaction.reset();
-        if (busy || bc_busy.load() || !speaking || !speech_frames || reaction.input != input_id ||
+        if (pending_overlap || busy || bc_busy.load() || !speaking || !speech_frames || reaction.input != input_id ||
             !connected || reaction.pick.index == 4) { return; }
         if (bc_worker.joinable()) { bc_worker.join(); }
         const auto id = next_id("aside_");
@@ -389,7 +451,7 @@ struct realtime_session {
 
     void precommit_audio() {
         // Keep the reader/VAD independent of model work. At most one snapshot is in flight.
-        if (busy || input_busy.load() || !speaking || !unencoded.empty()) { return; }
+        if (pending_overlap || busy || input_busy.load() || !speaking || !unencoded.empty()) { return; }
         for (const auto & call : pending_calls) { if (!call.second) { return; } }
         const size_t samples = audio.size() / 2;
         const size_t lag = 20, batch = 1;
@@ -659,7 +721,7 @@ struct realtime_session {
             for (const auto & call : message.tool_calls) { pending_calls.erase(call.id); }
         }
         for (auto it = audio_messages.begin(); it != audio_messages.end();) {
-            if (it->second < cut) { emitted_samples.erase(it->first); truncated.erase(it->first); phrase_history.erase(it->first); heard_samples.erase(it->first); it = audio_messages.erase(it); }
+            if (it->second < cut) { emitted_samples.erase(it->first); truncated.erase(it->first); client_truncated.erase(it->first); phrase_history.erase(it->first); heard_samples.erase(it->first); playback.erase(it->first); it = audio_messages.erase(it); }
             else { it->second -= cut - 1; ++it; }
         }
         for (auto it = items.begin(); it != items.end();) {
@@ -667,6 +729,9 @@ struct realtime_session {
             else { it->second.message -= cut - 1; ++it; }
         }
         if (!items.count(last_item_id)) { refresh_last_item(); }
+        std::set<size_t> cutoffs;
+        for (auto index : request.playback_cutoffs) { if (index >= cut) { cutoffs.insert(index - cut + 1); } }
+        request.playback_cutoffs = std::move(cutoffs);
         request.chat.messages.erase(request.chat.messages.begin() + 1, request.chat.messages.begin() + cut);
         std::cerr << "history_rollover removed_messages=" << cut - 1 << " \n";
     }
@@ -724,6 +789,7 @@ struct realtime_session {
         vad_frame.clear(); playback_frame.clear();
         vad->reset();
         speaking = false;
+        pending_overlap = false; overlap_item.clear();
         dropping_input = drop_until_silence;
         speech_frames = 0;
         silence_frames = 0;
@@ -744,8 +810,9 @@ struct realtime_session {
             throw std::runtime_error("audio buffer bounds");
         }
         std::string played(pcm.size(), 0);
-        if (event.contains("playback_audio")) {
-            const auto system = event.at("playback_audio").get<std::string>();
+        const char * playback_key = event.contains("playback_audio") ? "playback_audio" : "playback";
+        if (event.contains(playback_key)) {
+            const auto system = event.at(playback_key).get<std::string>();
             if (system.size() > 64000) { throw std::runtime_error("playback chunk too large"); }
             played = base64::decode(system);
             if (played.size() != pcm.size()) { throw std::runtime_error("duplex PCM lengths differ"); }
@@ -822,15 +889,45 @@ struct realtime_session {
                 input_id = next_id("item_");
                 std::cerr << input_id << " stage=speech_started input_ms=" << input_samples / 24 << " probability=" << probability << "\n";
                 precommit_samples = 0;
-                send({{"type", "input_audio_buffer.speech_started"}, {"item_id", input_id},
-                      {"audio_start_ms", (input_samples - audio.size() / 2) / 24}});
-                if (busy && auto_interrupt) {
-                    brain.cancelled = true;
-                    mouth.cancelled = true;
+                // Standard clients need not report device playback. Once their
+                // response is complete, preserve its history unless the client
+                // explicitly truncates it; absent feedback is not zero heard.
+                const auto previous = playback.find(playback_item);
+                if (previous != playback.end() && previous->second.done &&
+                    !heard_samples.count(playback_item) && !event.contains(playback_key)) {
+                    playback_item.clear();
                 }
+                overlap_item = playback_item;
+                interruption = {};
+                interruption.last_end = speech_start_samples * 2 / 3;
+                pending_overlap = auto_interrupt && !overlap_item.empty() && turns->has_detector() &&
+                                  event.contains(playback_key);
+                if (!pending_overlap) { start_speech(); }
             }
             if (speaking) {
                 silence_frames = speech ? 0 : silence_frames + 1;
+                if (pending_overlap) {
+                    const auto prediction = turns->current(input_samples / 24);
+                    const bool yield = prediction.detector_valid &&
+                        interruption.observe(prediction.human_backchannel, prediction.detector_end, speech);
+                    if (speech_frames >= 3 && (!prediction.detector_valid || yield)) {
+                        std::cerr << input_id << " stage=interrupt input_ms=" << input_samples / 24
+                                  << " onset_ms=" << speech_start_samples / 24
+                                  << " bc=" << prediction.human_backchannel
+                                  << " detector_valid=" << prediction.detector_valid
+                                  << " detector_age_ms=" << input_samples / 24 - prediction.detector_end / 16 << "\n";
+                        start_speech();
+                    } else {
+                        if (silence_frames * 32 >= silence_ms) {
+                            std::cerr << input_id << " stage=human_backchannel_ignored\n";
+                            // No speculative request exists for an unannounced listener nod.
+                            audio.clear(); speech_end_bytes = 0; precommit_samples = 0;
+                            input_id.clear(); speaking = false; pending_overlap = false;
+                            overlap_item.clear(); speech_frames = silence_frames = 0;
+                        }
+                        continue;
+                    }
+                }
                 if (tentative && !tentative->committed) {
                     tentative->resumed_frames = speech ? tentative->resumed_frames + 1 : 0;
                     if (tentative->resumed_frames >= 2 && !tentative->abandoned) {
@@ -876,16 +973,15 @@ struct realtime_session {
             throw std::runtime_error("invalid audio truncation");
         }
         const size_t samples = size_t(end) * 24;
-        if (heard_samples.count(id) && samples > heard_samples.at(id)) {
+        if (client_truncated.count(id) && heard_samples.count(id) && samples > heard_samples.at(id)) {
             throw std::runtime_error("cannot extend truncated audio");
         }
         heard_samples[id] = samples;
-        truncated.insert(id);
-        merge_false_start(id, samples);
-        auto found = audio_messages.find(id);
-        if (found != audio_messages.end()) {
-            request.chat.messages[found->second].content = heard_text(id);
-        }
+        client_truncated.insert(id);
+        save_cutoff(id);
+        // Never resume an old utterance after a confirmed interruption.
+        if (!turns->has_detector()) { merge_false_start(id, samples); }
+        if (playback_item == id) { playback_item.clear(); }
         send({{"type", "conversation.item.truncated"}, {"item_id", id}, {"content_index", 0}, {"audio_end_ms", end}});
     }
 
@@ -1202,6 +1298,8 @@ struct realtime_session {
                             released_turn = turn;
                         }
                         emitted_samples.emplace(item_id, 0);
+                        playback.emplace(item_id, playback_state{id});
+                        playback_item = item_id;
                     }
                     if (emitted_samples[item_id] + count > uint64_t(24000) * max_output_audio_seconds) {
                         throw brain_session::output_limit("max_output_audio");
@@ -1274,6 +1372,7 @@ struct realtime_session {
                         audio_messages[item_id] = request.chat.messages.size();
                         if (truncated.count(item_id)) {
                             result.message.content = heard_text(item_id);
+                            request.playback_cutoffs.insert(request.chat.messages.size());
                         }
                     }
                 }
@@ -1344,6 +1443,7 @@ struct realtime_session {
                 interrupted.role = "assistant";
                 interrupted.content = status == "incomplete" ? "[Response stopped at its output limit; no tool call was executed.]" : heard_text(item_id);
                 if (emitted_samples.count(item_id)) { audio_messages[item_id] = request.chat.messages.size(); }
+                if (truncated.count(item_id)) { request.playback_cutoffs.insert(request.chat.messages.size()); }
                 request.chat.messages.push_back(interrupted);
                 if (!item_id.empty()) {
                     remember_item({{"id", item_id}, {"type", "message"}, {"role", "assistant"}, {"status", "completed"},
@@ -1372,6 +1472,7 @@ struct realtime_session {
                 { "type",     "response.done" },
                 { "response", response        }
             });
+            if (playback.count(item_id)) { playback.at(item_id).done = true; }
             active_item_id.clear();
             busy = false;
         });
@@ -1411,6 +1512,10 @@ struct realtime_session {
                 }
                 if (type == "input_audio_buffer.append") {
                     append_audio(event);
+                    continue;
+                }
+                if (type == "frankie.playback.position" || type == "frankie.playback.finished") {
+                    playback_position(event, type == "frankie.playback.finished");
                     continue;
                 }
                 if (type == "conversation.item.truncate") {
@@ -1473,7 +1578,7 @@ int main(int argc, char ** argv) {
                          "  [--max-utterance-seconds N] [--max-output-audio-seconds N] [--max-output-tokens N|inf]\n"
                          "  [--voice WAV] [--voice-text-file TXT --voice-codes I32]\n"
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
-                         "  [--vap-model GGUF] [--bc-model GGUF]\n"
+                         "  [--vap-model GGUF] [--bc-model GGUF] [--bc-det-model GGUF] [--bc-det-device cpu|gpu]\n"
                          "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF]\n"
                          "--ctx-size is the total KV pool (default 131072). HTTP slots default to an equal share.\n"
                          "--http-ctx-size is per HTTP slot; voice uses the remainder of the total pool.\n"
@@ -1501,6 +1606,11 @@ int main(int argc, char ** argv) {
             else if (key == "--expression") { options.expression = value; }
             else if (key == "--vap-model") { options.vap_model = value; }
             else if (key == "--bc-model") { options.bc_model = value; }
+            else if (key == "--bc-det-model") { options.bc_detector = value; }
+            else if (key == "--bc-det-device") {
+                if (value != "cpu" && value != "gpu") { throw std::runtime_error("BC-Det device must be cpu or gpu"); }
+                options.bc_detector_gpu = value == "gpu";
+            }
             else if (key == "--batch-size") {
                 options.batch_size = frankie_unsigned(value);
                 if (!options.batch_size) { throw std::runtime_error("batch size must be positive"); }

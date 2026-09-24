@@ -6,7 +6,9 @@ namespace httplib::detail {
     bool write_websocket_frame(Stream &, ws::Opcode, const char *, size_t, bool, bool);
 }
 #include "../tools/frankie/speech-boundary.h"
+#include "../tools/frankie/backchannel-gate.h"
 #include "../tools/frankie/brain-output.h"
+#include "../tools/frankie/brain-session.h"
 #include "../tools/frankie/turn-session.h"
 #include "../tools/frankie/token-boundary.h"
 #include "../tools/frankie/image-input.h"
@@ -65,6 +67,22 @@ struct test_registry {
 
 
 #ifdef LLAMA_TEST_FRANKIE
+MAKE_TEST(test_frankie_backchannel_gate) {
+    frankie_backchannel_gate gate;
+    t.assert_true("one low observation waits", !gate.observe(0.1f, 80, true));
+    t.assert_true("duplicate observation cannot trigger", !gate.observe(0.1f, 80, true));
+    t.assert_true("ordinary speech yields on second observation", gate.observe(0.1f, 160, true));
+    gate = {};
+    t.assert_true("first nod observation holds", !gate.observe(0.3f, 80, true));
+    t.assert_true("confirmed nod holds", !gate.observe(0.3f, 160, true));
+    t.assert_true("nod release uses lower threshold", !gate.observe(0.1f, 240, true));
+    t.assert_true("one low nod tail holds", !gate.observe(0.01f, 320, true));
+    t.assert_true("silence clears consecutive evidence", !gate.observe(0, 400, false));
+    t.assert_true("resumed speech requires fresh evidence", !gate.observe(0.01f, 480, true));
+    t.assert_true("nod followed by real speech yields", gate.observe(0.01f, 560, true));
+    t.assert_true("out-of-order observation ignored", !gate.observe(0.01f, 520, true));
+}
+
 MAKE_TEST(test_frankie_context_pool) {
     t.assert_equal("output ceiling fits", size_t(65536), frankie_http_output_budget(47000, 65536, 128000));
     t.assert_equal("output ceiling uses remaining capacity", size_t(81000), frankie_http_output_budget(47000, 100000, 128000));
@@ -215,7 +233,39 @@ MAKE_TEST(test_frankie_websocket_fragments) {
         stalled, httplib::ws::Opcode::Text, "hello", 5, true, false));
 }
 
+MAKE_TEST(test_frankie_realtime_history) {
+    brain_session::request request;
+    common_chat_msg user, empty, heard, call;
+    user.role = "user"; user.content = "question";
+    empty.role = heard.role = call.role = "assistant";
+    heard.content = "First sentence.";
+    call.tool_calls.push_back({"lookup", "{}", "call_one"});
+    request.chat.messages = {user, empty, heard, call};
+    request.playback_cutoffs.insert(2);
+    t.assert_equal("HTTP history untouched", size_t(4), request.chat_input().messages.size());
+    request.realtime_history = true;
+    auto input = request.chat_input();
+    t.assert_equal("empty assistant omitted, notice inserted", size_t(4), input.messages.size());
+    t.assert_equal("heard text retained", std::string("First sentence."), input.messages[1].content);
+    t.assert_equal("notice is not spoken assistant text", std::string("user"), input.messages[2].role);
+    t.assert_equal("empty tool call retained", size_t(1), input.messages[3].tool_calls.size());
+    t.assert_equal("authoritative item positions untouched", size_t(4), request.chat.messages.size());
+    request.chat.messages[1].content = " \t\r\n";
+    t.assert_equal("whitespace-only assistant omitted", size_t(4), request.chat_input().messages.size());
+    request.playback_cutoffs = {3};
+    t.assert_equal("unfinished call has no intervening notice", size_t(3), request.chat_input().messages.size());
+    common_chat_msg result;
+    result.role = "tool"; result.tool_call_id = "call_one"; result.content = "result";
+    request.chat.messages.push_back(result);
+    input = request.chat_input();
+    t.assert_equal("tool result precedes playback notice", std::string("tool"), input.messages[3].role);
+    t.assert_equal("notice follows complete call group", std::string("user"), input.messages[4].role);
+}
+
 MAKE_TEST(test_frankie_speech_boundary) {
+    t.assert_equal("confirmed lookahead releases same phrase", size_t(0), frankie_speech_boundary("This is a sentence", 0, false, true));
+    t.assert_equal("lookahead after punctuation", size_t(19), frankie_speech_boundary("This is a sentence.", 0, false, true));
+    t.assert_equal("pending decimal does not cut", size_t(0), frankie_speech_boundary("It costs about 1.", 0, false, false));
     t.assert_equal("no three-word opener", size_t(0), frankie_speech_boundary("Let me check the machine", 0, false));
     t.assert_equal("no clause cut", size_t(0), frankie_speech_boundary("Let me check, then answer", 0, false));
     t.assert_equal("join short interjection", size_t(0), frankie_speech_boundary("Ha. That sounds", 0, false));
@@ -715,6 +765,52 @@ MAKE_TEST(test_turn_reference) {
         t.assert_equal(mode + " reset system", true, std::abs(again.next_speaker[1] - first.next_speaker[1]) < 1e-6f);
         t.assert_equal(mode + " reset BC", true, std::abs(again.backchannel - first.backchannel) < 1e-6f);
     }
+}
+
+MAKE_TEST(test_backchannel_reference) {
+    const char * root = std::getenv("MTMD_BACKCHANNEL_FIXTURE");
+    if (!root) { std::cout << "SKIP BC-Det parity: set MTMD_BACKCHANNEL_FIXTURE\n"; return; }
+    const std::string dir(root);
+    auto weights = load_component_fixture(dir + "/bc-det.gguf");
+    auto params = mtmd_context_params_default();
+    params.use_gpu = std::getenv("MTMD_COMPONENT_GPU");
+    params.n_threads = 4;
+    mtmd_backchannel detector(weights.get(), (dir + "/bc-det.gguf").c_str(), params);
+    std::ifstream input(dir + "/input.f32", std::ios::binary);
+    std::ifstream output(dir + "/output.f32", std::ios::binary);
+    std::ifstream encoder(dir + "/encoder.f32", std::ios::binary);
+    if (!input || !output || !encoder) { throw std::runtime_error("missing BC-Det fixture"); }
+    std::array<float, 1280> user{}, system{};
+    float worst_p = 0, worst_e = 0;
+    size_t steps = 0;
+    const auto start = std::chrono::steady_clock::now();
+    while (input.read(reinterpret_cast<char *>(user.data()), sizeof(user))) {
+        float expected;
+        std::array<float, 1024> features;
+        if (!input.read(reinterpret_cast<char *>(system.data()), sizeof(system)) ||
+            !output.read(reinterpret_cast<char *>(&expected), sizeof(expected)) ||
+            !encoder.read(reinterpret_cast<char *>(features.data()), sizeof(features))) {
+            throw std::runtime_error("short BC-Det reference");
+        }
+        const float actual = detector.process(user, system);
+        worst_p = std::max(worst_p, std::abs(expected - actual));
+        const auto encoded = detector.encoded();
+        for (size_t i = 0; i < features.size(); ++i) { worst_e = std::max(worst_e, std::abs(features[i] - encoded[i])); }
+        if (steps < 3 || steps % 40 == 0) {
+            std::cout << "bc-det step=" << steps << " p=" << actual << " expected=" << expected
+                      << " max_error=" << worst_p << " encoder=" << worst_e << "\n";
+        }
+        ++steps;
+    }
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::cout << "bc-det steps=" << steps << " mean_pair_ms=" << ms / std::max(size_t(1), steps)
+              << " max_probability_error=" << worst_p << " max_encoder_error=" << worst_e << "\n";
+    t.assert_true("cross both rolling windows", steps > 250);
+    t.assert_true("BC-Det probability parity", worst_p < 2e-4f);
+    t.assert_true("Mimi feature parity", worst_e < 2e-3f);
+    detector.reset();
+    user.fill(0); system.fill(0);
+    t.assert_equal("BC-Det reset skips first frame", -1.0f, detector.process(user, system));
 }
 
 MAKE_TEST(test_expression_reference) {

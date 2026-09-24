@@ -365,7 +365,7 @@ brain_session::saved_state brain_session::suspend_state() {
 brain_session::listener_reaction brain_session::probe_listener(const request & input) {
     auto compute_lock = lock_compute();
     if (partial_marker.empty() || partial_rows.size() < 8 * 5120) { return {}; }
-    auto chat = input.chat;
+    auto chat = input.chat_input();
     chat.enable_thinking = false;
     chat.add_generation_prompt = true;
     const auto formatted = common_chat_templates_apply(templates.get(), chat);
@@ -480,7 +480,7 @@ void brain_session::warm_prefix(common_chat_templates_inputs input) {
 }
 
 size_t brain_session::prompt_tokens(const request & request, const std::map<std::string, size_t> & pending_audio) const {
-    const auto formatted = common_chat_templates_apply(templates.get(), request.chat);
+    const auto formatted = common_chat_templates_apply(templates.get(), request.chat_input());
     const auto * vocab = llama_model_get_vocab(model.get());
     size_t used = 0, offset = 0;
     auto count_text = [&](const std::string & text) {
@@ -629,7 +629,7 @@ void brain_session::precommit(const request & input, const std::string & marker,
     }
     auto snapshot = input;
     snapshot.audio_rows[marker] = rows;
-    const auto formatted = common_chat_templates_apply(templates.get(), snapshot.chat);
+    const auto formatted = common_chat_templates_apply(templates.get(), snapshot.chat_input());
     const auto cut = formatted.prompt.find(marker);
     if (cut == std::string::npos || formatted.prompt.find(marker, cut + 1) != std::string::npos) {
         throw std::runtime_error("precommit marker missing or ambiguous");
@@ -666,7 +666,7 @@ void brain_session::precommit(const request & input, const std::string & marker,
 
 void brain_session::finish_audio(const request & input, const std::string & marker, std::vector<float> & rows) {
     auto compute_lock = lock_compute();
-    const auto formatted = common_chat_templates_apply(templates.get(), input.chat);
+    const auto formatted = common_chat_templates_apply(templates.get(), input.chat_input());
     if (marker == partial_marker && formatted.prompt.compare(0, partial_prefix.size(), partial_prefix) == 0 &&
         formatted.prompt.compare(partial_prefix.size(), marker.size(), marker) == 0) {
         if (rows.size() < partial_rows.size() + 5120) { throw std::runtime_error("final audio shorter than precommit"); }
@@ -690,7 +690,7 @@ void brain_session::configure_thinking(common_params_sampling & sampling, const 
 
 brain_session::response brain_session::generate(const request & request, const stream_callback & on_text, const stage_callback & on_stage) {
     auto compute_lock = lock_compute();
-    const auto & input      = request.chat;
+    const auto input        = request.chat_input();
     const auto & audio_rows = request.audio_rows;
     if (request.reasoning_budget < 0 || request.reasoning_budget > 32768 ||
         prompt_tokens(request, {}) + request.generation_tokens() > context_tokens()) {
@@ -714,10 +714,25 @@ brain_session::response brain_session::generate(const request & request, const s
     if (formatted.prompt.size() > 4 * 1024 * 1024) {
         throw std::runtime_error("formatted prompt too large");
     }
+    // A historical assistant turn need not retain the generation-only thinking
+    // header. Checkpoint the closed input so that change cannot replay all audio.
+    std::string prefix = formatted.prompt;
+    if (request.realtime_history) {
+        auto closed = input;
+        closed.add_generation_prompt = false;
+        auto candidate = common_chat_templates_apply(templates.get(), closed).prompt;
+        if (!candidate.empty() && formatted.prompt.compare(0, candidate.size(), candidate) == 0 &&
+            frankie_token_boundary(llama_model_get_vocab(model.get()), formatted.prompt, candidate.size())) {
+            prefix = std::move(candidate);
+        }
+    }
     int pos = 0;
     size_t used = 0;
     try {
-        prefill(request, formatted.prompt, pos, used, "", 0, on_stage);
+        prefill(request, prefix, pos, used, "", 0, on_stage);
+        save_checkpoint(prefix, pos, used);
+        if (on_stage) { on_stage("brain_checkpoint_done"); }
+        decode_text(formatted.prompt.substr(prefix.size()), pos, used);
     } catch (...) {
         partial_marker.clear();
         partial_rows.clear();
@@ -727,8 +742,6 @@ brain_session::response brain_session::generate(const request & request, const s
     partial_marker.clear();
     partial_rows.clear();
     if (on_stage) { on_stage("brain_prefill_done"); }
-    save_checkpoint(formatted.prompt, pos, used);
-    if (on_stage) { on_stage("brain_checkpoint_done"); }
     response               result;
     auto sampling = frankie_brain_sampling(input.enable_thinking);
     sampling.penalty_present = options.presence_penalty;
@@ -828,6 +841,10 @@ brain_session::response brain_session::generate(const request & request, const s
             }
         }
         pending = ids.back();
+        // The sampled lookahead can confirm a boundary without waiting for its
+        // forward pass. Its uncomputed feature row never enters the mouth.
+        const auto next = common_token_to_piece(vocab, pending, true);
+        result.boundary_hint = !next.empty() && next.find_first_of(" \t\r\n") == 0;
         // Copy every committed row before callbacks can pump HTTP work.
         if (on_text) { on_text(result, false); }
         if (background_step) { background_step(); }

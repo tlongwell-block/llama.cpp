@@ -29,6 +29,7 @@ def main():
     parser.add_argument('--voice-codes', type=Path, help='frame-major little-endian I32, 16 codebooks')
     for name in ('expression', 'turn', 'breeze'):
         parser.add_argument('--' + name, type=Path)
+    parser.add_argument('--bc-det', type=Path, help='native continuous Mimi plus MaAI human backchannel detector')
     args = parser.parse_args()
     temporary = args.output.with_name(args.output.name + '.incomplete')
     if args.output.exists() or temporary.exists():
@@ -48,6 +49,11 @@ def main():
                 not {'turn.vap_head.weight', 'turn.bc_head.weight', 'turn.now.weight'} <= tensors.keys() or
                 tensors['turn.encoder.downsample.1.weight'].shape.tolist() != [5, 256, 256]):
             raise ValueError('--turn must be a combined VAP-BC checkpoint from convert-turn.py')
+    if args.bc_det:
+        detector = gguf.GGUFReader(args.bc_det)
+        fields = {name: detector.get_field(name) for name in ('turn.mode', 'clip.gen.audio.model_variant')}
+        if any(field is None for field in fields.values()) or fields['turn.mode'].contents() != 'detection' or fields['clip.gen.audio.model_variant'].contents() != 'mimi':
+            raise ValueError('--bc-det must contain BC-Det and continuous Mimi from convert-turn.py --mimi')
     replacements = {}
     for item in args.component:
         name, path = item.split('=', 1)
@@ -83,10 +89,10 @@ def main():
             continue
         tensor_map[tensor.name] = (tensor.data, tensor.tensor_type)
         source_shapes[tensor.name] = tensor.shape.tolist()
-    for name in ('expression', 'turn', 'breeze'):
+    for name in ('expression', 'turn', 'breeze', 'bc_det'):
         path = getattr(args, name)
         if path:
-            if path.stat().st_size > 64 * 1024 * 1024: raise ValueError(name + ' asset too large')
+            if path.stat().st_size > (256 if name == 'bc_det' else 64) * 1024 * 1024: raise ValueError(name + ' asset too large')
             tensor_map[f'assets.{name}.gguf'] = (np.fromfile(path, np.int8), gguf.GGMLQuantizationType.I8)
             source_shapes[f'assets.{name}.gguf'] = [path.stat().st_size]
     if args.voice:

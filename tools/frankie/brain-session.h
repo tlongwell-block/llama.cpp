@@ -1,4 +1,6 @@
 #pragma once
+
+#include <set>
 #include "brain-output.h"
 #include "chat.h"
 #include "clip-impl.h"
@@ -109,11 +111,47 @@ class brain_session {
         uint32_t                                 answer_limit = frankie_options::default_output_tokens;
         size_t generation_tokens() const { return std::min(answer_limit ? answer_limit : 512u, 512u) + (reasoning_budget ? reasoning_budget + 16 : 0); }
         common_chat_templates_inputs              chat;
+        bool                                     realtime_history = false;
+        std::set<size_t>                          playback_cutoffs;
+        common_chat_templates_inputs chat_input() const {
+            auto input = chat;
+            if (!realtime_history) { return input; }
+            input.messages.clear();
+            std::set<size_t> notices;
+            for (auto index : playback_cutoffs) {
+                if (index >= chat.messages.size()) { continue; }
+                std::set<std::string> pending;
+                for (const auto & call : chat.messages[index].tool_calls) { pending.insert(call.id); }
+                size_t end = index;
+                while (!pending.empty() && end + 1 < chat.messages.size() && chat.messages[end + 1].role == "tool") {
+                    pending.erase(chat.messages[++end].tool_call_id);
+                }
+                // Never insert a user notice inside an unfinished call/result group.
+                if (pending.empty()) { notices.insert(end); }
+            }
+            for (size_t i = 0; i < chat.messages.size(); ++i) {
+                const auto & message = chat.messages[i];
+                if (message.role != "assistant" || message.content.find_first_not_of(" \t\r\n") != std::string::npos ||
+                    !message.tool_calls.empty()) {
+                    input.messages.push_back(message);
+                }
+                if (notices.count(i)) {
+                    common_chat_msg notice;
+                    notice.role = "user";
+                    notice.content = "[Audio playback notice: the preceding response was interrupted. "
+                        "Only the retained spoken text was heard; do not assume the rest was delivered. "
+                        "Respond to the user's new turn; resume an unfinished point only if appropriate.]";
+                    input.messages.push_back(std::move(notice));
+                }
+            }
+            return input;
+        }
         std::map<std::string, image_ptr>          images;
         std::map<std::string, std::vector<float>> audio_rows;
     };
 
     struct response {
+        bool            boundary_hint = false;
         brain_output    raw;
         common_chat_msg message;
         size_t content_offset = std::string::npos;

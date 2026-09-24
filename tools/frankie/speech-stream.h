@@ -108,7 +108,7 @@ class speech_stream {
         if (text.compare(0, committed.size(), committed) != 0) {
             throw std::runtime_error("streaming parser retracted spoken text");
         }
-        const size_t end = frankie_speech_boundary(text, committed.size(), last || !response.message.tool_calls.empty());
+        const size_t end = frankie_speech_boundary(text, committed.size(), last || !response.message.tool_calls.empty(), response.boundary_hint);
         if (end <= committed.size()) {
             return;
         }

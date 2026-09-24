@@ -30,7 +30,8 @@ struct frankie_options {
     float presence_penalty = 0.0f;
     std::string voice, voice_text, voice_codes;
     std::string expression;
-    std::string vap_model, bc_model;
+    std::string vap_model, bc_model, bc_detector;
+    bool bc_detector_gpu = false;
     std::string ear_model, talker_model, mouth_model;
 
     uint32_t voice_context_tokens() const {
