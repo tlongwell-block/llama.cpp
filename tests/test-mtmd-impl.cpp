@@ -2,9 +2,6 @@
 #ifdef LLAMA_TEST_FRANKIE
 #include "../tools/frankie/text-alignment.h"
 #include "../vendor/cpp-httplib/httplib.h"
-namespace httplib::ws::impl {
-    bool read_websocket_frame(Stream &, Opcode &, std::string &, bool &, bool, size_t);
-}
 namespace httplib::detail {
     bool write_websocket_frame(Stream &, ws::Opcode, const char *, size_t, bool, bool);
 }
@@ -201,7 +198,7 @@ MAKE_TEST(test_frankie_websocket_fragments) {
                 t.assert_equal("fragmented frame written", true, httplib::detail::write_websocket_frame(
                     stream, httplib::ws::Opcode::Text, expected.data(), expected.size(), true, mask));
                 httplib::ws::Opcode opcode; std::string actual; bool fin = false;
-                const bool read = httplib::ws::impl::read_websocket_frame(stream, opcode, actual, fin, mask, 100000);
+                const bool read = httplib::ws::impl::read_websocket_frame(stream, opcode, actual, fin, mask, 100000) == httplib::ws::impl::FrameRead::Ok;
                 t.assert_equal("fragmented frame read", true, read);
                 t.assert_equal("fragmented payload unchanged", expected, actual);
                 t.assert_equal("final frame preserved", true, fin);
@@ -212,7 +209,7 @@ MAKE_TEST(test_frankie_websocket_fragments) {
     eof.data = "\x81";
     httplib::ws::Opcode opcode; std::string actual; bool fin;
     t.assert_equal("truncated header rejected", false,
-        httplib::ws::impl::read_websocket_frame(eof, opcode, actual, fin, false, 1000));
+        httplib::ws::impl::read_websocket_frame(eof, opcode, actual, fin, false, 1000) == httplib::ws::impl::FrameRead::Ok);
     frankie_fragmented_stream stalled(0);
     t.assert_equal("zero-byte writer fails", false, httplib::detail::write_websocket_frame(
         stalled, httplib::ws::Opcode::Text, "hello", 5, true, false));
