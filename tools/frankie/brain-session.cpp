@@ -235,6 +235,7 @@ void brain_session::reset(bool preserve_checkpoint) {
     if (!preserve_checkpoint) {
         checkpoint.reset();
         checkpoint_prefix.clear();
+        prompt_counts.clear();
     }
     clear_sequence();
 }
@@ -485,8 +486,10 @@ size_t brain_session::prompt_tokens(const request & request, const std::map<std:
     size_t used = 0, offset = 0;
     auto count_text = [&](const std::string & text) {
         if (text.empty()) { return; }
-        const int n = llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, false, true);
-        used += size_t(n < 0 ? -n : n);
+        used += prompt_counts.get(text, [&] {
+            const int n = llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, false, true);
+            return size_t(n < 0 ? -n : n);
+        });
     };
     for (;;) {
         const auto marker = formatted.prompt.find("[FRANKIE_", offset);

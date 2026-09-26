@@ -67,6 +67,37 @@ struct test_registry {
 
 
 #ifdef LLAMA_TEST_FRANKIE
+MAKE_TEST(test_frankie_prompt_counts) {
+    frankie_prompt_counts cache(1024, 2);
+    size_t calls = 0;
+    auto count = [&](const std::string & text) {
+        return cache.get(text, [&] { ++calls; return text.size(); });
+    };
+    t.assert_equal("empty text needs no tokenizer", size_t(0), count(""));
+    t.assert_equal("new segment counted", size_t(3), count("one"));
+    count("two"); count("one"); count("six"); count("one");
+    t.assert_equal("recent segment survives entry eviction", size_t(3), calls);
+    count("two");
+    t.assert_equal("old segment must be recounted", size_t(4), calls);
+    const std::string oversized(1024, 'x');
+    count(oversized); count(oversized);
+    t.assert_equal("oversized segments are not retained", size_t(6), calls);
+    count("two");
+    t.assert_equal("oversized miss preserves useful entries", size_t(6), calls);
+    cache.clear(); count("two");
+    t.assert_equal("reset drops prior session text", size_t(7), calls);
+    frankie_prompt_counts bounded(1024);
+    for (const auto & text : {std::string(600, 'a'), std::string(600, 'b'), std::string(600, 'a')}) {
+        bounded.get(text, [&] { ++calls; return size_t(1); });
+    }
+    t.assert_equal("byte cap evicts independently of entry cap", size_t(10), calls);
+    frankie_prompt_counts exact;
+    for (const auto & text : {"tool result: one", "tool result: two", "tool result: one ", "tool result: one"}) {
+        exact.get(text, [&] { ++calls; return size_t(1); });
+    }
+    t.assert_equal("changed tool content and whitespace cannot alias", size_t(13), calls);
+}
+
 MAKE_TEST(test_frankie_backchannel_gate) {
     frankie_backchannel_gate gate;
     t.assert_true("one low observation waits", !gate.observe(0.1f, 80, true));
@@ -159,6 +190,16 @@ MAKE_TEST(test_frankie_long_token_boundary) {
     llama_model_ptr model(llama_model_init_from_user(source.metadata(), component::set_tensor, &source, params));
     if (!model) { throw std::runtime_error("missing brain vocabulary fixture"); }
     const auto * vocab = llama_model_get_vocab(model.get());
+    frankie_prompt_counts counts;
+    for (int round = 0; round < 3; ++round) {
+        for (const std::string text : {"<|im_start|>user\nHello.<|im_end|>\n", "Tool result: one", "Tool result: two", "", "\xc3\xa9\xe4\xb8\xad"}) {
+            auto tokenize = [&] {
+                const int n = llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, false, true);
+                return size_t(n < 0 ? -n : n);
+            };
+            t.assert_equal("memoized count matches model vocabulary", tokenize(), counts.get(text, tokenize));
+        }
+    }
     std::string prefix = "<|im_start|>user\n";
     for (int i = 0; i < 6000; ++i) { prefix += "abcdefghijklmnopqrstuvwxyz\n"; }
     prefix += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nhello";

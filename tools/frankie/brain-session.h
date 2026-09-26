@@ -9,6 +9,7 @@
 #include "mtmd-ear.h"
 #include "mtmd-helper.h"
 #include "runtime-options.h"
+#include "prompt-counts.h"
 #include "speculative.h"
 
 #include <array>
@@ -53,6 +54,7 @@ class brain_session {
     llama_context_ptr         draft_ctx;
     common_speculative_ptr    speculative;
     common_chat_templates_ptr templates;
+    mutable frankie_prompt_counts prompt_counts;
     struct sequence_state {
         std::vector<uint8_t> target, draft, boundary;
         size_t size() const { return target.size() + draft.size() + boundary.size(); }
