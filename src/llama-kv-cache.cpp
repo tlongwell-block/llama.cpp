@@ -1263,6 +1263,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_max(const llama_ubatch & ubatch) const {
+    uint64_t result = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        uint64_t count = 0;
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const auto seq = ubatch.seq_id[i][j];
+            count += get_cells(seq).seq_size(seq);
+        }
+        result = std::max(result, count);
+    }
+    return std::min<uint64_t>(UINT32_MAX, GGML_PAD(result, 256));
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1412,6 +1425,7 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
 
     ggml_set_input(k_idxs);
+    ggml_set_name(k_idxs, "attn_inp_k_idxs");
 
     return k_idxs;
 }
@@ -1428,6 +1442,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     }
 
     ggml_set_input(v_idxs);
+    ggml_set_name(v_idxs, "attn_inp_v_idxs");
 
     return v_idxs;
 }
@@ -2740,6 +2755,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_max() const {
+    return ubatches.empty() ? n_kv : std::min<uint32_t>(n_kv, kv->get_n_kv_max(ubatches[i_cur]));
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

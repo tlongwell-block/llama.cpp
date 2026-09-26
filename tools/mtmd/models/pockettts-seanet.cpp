@@ -1,4 +1,5 @@
 #include "models.h"
+#include "../mtmd-graph.h"
 
 // SEANet convolution stack of the mimi codec, see pocket_tts/modules/seanet.py
 //
@@ -38,7 +39,8 @@ ggml_tensor * clip_graph_pockettts_seanet::conv1d(ggml_tensor * x, ggml_tensor *
         x = ggml_pad_ext(ctx0, x, p_total, p_extra, 0, 0, 0, 0, 0, 0);
     }
 
-    ggml_tensor * y = ggml_conv_1d(ctx0, w, x, stride, 0, dilation);
+    ggml_tensor * y = hparams.gen_model_variant == "mimi" && dilation == 1 ?
+        mtmd_conv_1d_f32(ctx0, x, w, stride, 0) : ggml_conv_1d(ctx0, w, x, stride, 0, dilation);
     y = ggml_reshape_2d(ctx0, y, y->ne[0], y->ne[1]);
     if (b) {
         y = ggml_add(ctx0, y, ggml_reshape_2d(ctx0, b, 1, b->ne[0]));
@@ -111,22 +113,23 @@ ggml_tensor * clip_graph_pockettts_seanet::res_unit(ggml_tensor * x, const clip_
 
 ggml_tensor * clip_graph_pockettts_seanet::encode(ggml_tensor * x) const {
     const auto & seanet = model.seanet;
+    const bool stream = !state_in.empty();
 
-    ggml_tensor * cur = conv1d(x, seanet.conv_in_w, seanet.conv_in_b, 1, 1);
+    ggml_tensor * cur = conv1d(x, seanet.conv_in_w, seanet.conv_in_b, 1, 1, false, stream ? "enc_in" : "");
     cb(cur, "seanet_enc_in", -1);
 
     for (int i = 0; i < hparams.seanet_n_stage; i++) {
         const auto & stage  = seanet.stages[i];
         const int    stride = hparams.seanet_ratios[i];
 
-        cur = res_unit(cur, stage, 1);
+        cur = res_unit(cur, stage, 1, stream ? "enc_res_" + std::to_string(i) : "");
         cur = ggml_elu(ctx0, cur);
-        cur = conv1d(cur, stage.scale_conv_w, stage.scale_conv_b, stride, 1);
+        cur = conv1d(cur, stage.scale_conv_w, stage.scale_conv_b, stride, 1, false, stream ? "enc_down_" + std::to_string(i) : "");
         cb(cur, "seanet_enc_stage", i);
     }
 
     cur = ggml_elu(ctx0, cur);
-    cur = conv1d(cur, seanet.conv_out_w, seanet.conv_out_b, 1, 1);
+    cur = conv1d(cur, seanet.conv_out_w, seanet.conv_out_b, 1, 1, false, stream ? "enc_out" : "");
     cb(cur, "seanet_enc_out", -1);
 
     return cur;

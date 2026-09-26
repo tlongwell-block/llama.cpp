@@ -217,15 +217,19 @@ struct clip_ctx {
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
+        init_scheduler(ctx_params);
+        debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+    }
+
+    void init_scheduler(const clip_context_params & ctx_params) {
         sched.reset(
-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
+            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, true)
         );
 
         if (ctx_params.cb_eval != nullptr) {
             ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
         }
 
-        debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
     ~clip_ctx() {
@@ -976,6 +980,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_LING3VL:
+            {
+                builder = std::make_unique<clip_graph_ling3vl>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_EXAONE4_5:
             {
                 builder = std::make_unique<clip_graph_exaone4_5>(ctx, img);
@@ -1099,7 +1107,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             } break;
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             {
-                builder = std::make_unique<clip_graph_pockettts_spkenc>(ctx, img);
+                builder = std::make_unique<clip_graph_pockettts_spkenc>(ctx, img, params && params->state_out);
             } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
@@ -1121,7 +1129,16 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
+                int n_frames = 1; // the unselected waveform branch only needs a minimal reserve
+                if (params && gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+                    const size_t groups = ctx->model.gen_code_head_w->ne[2] + 1;
+                    if (!params->codes || params->codes->empty() || params->codes->size() % groups ||
+                        params->codes->size() / groups > (size_t) ctx->model.hparams.wav_tfm_swa) {
+                        throw std::runtime_error("invalid Qwen decoder frame count");
+                    }
+                    n_frames = (int) (params->codes->size() / groups);
+                }
+                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_frames);
             } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {
@@ -1160,6 +1177,9 @@ struct clip_model_loader {
     gguf_context_ptr ctx_gguf;
 
     std::string fname;
+    gguf_reader_callback_t reader = nullptr;
+    void * reader_user_data = nullptr;
+    uint64_t reader_size = 0;
 
     size_t model_size = 0; // in bytes
 
@@ -1174,8 +1194,12 @@ struct clip_model_loader {
     clip_model_loader(const char * fname,
             bool skip_tensors = false,
             mtmd_progress_callback progress_cb = nullptr,
-            void * progress_user_data = nullptr)
+            void * progress_user_data = nullptr,
+            gguf_reader_callback_t reader = nullptr,
+            void * reader_user_data = nullptr,
+            uint64_t reader_size = 0)
         : fname(fname),
+          reader(reader), reader_user_data(reader_user_data), reader_size(reader_size),
           progress_callback(progress_cb),
           progress_callback_user_data(progress_user_data) {
         struct ggml_context * meta = nullptr;
@@ -1185,7 +1209,12 @@ struct clip_model_loader {
             /*.ctx      = */ &meta,
         };
 
-        ctx_gguf = gguf_context_ptr(gguf_init_from_file(fname, params));
+        if (reader && reader_size == 0) {
+            throw std::runtime_error("model reader size must be positive");
+        }
+        ctx_gguf = gguf_context_ptr(reader
+            ? gguf_init_from_callback(reader, reader_user_data, 1024 * 1024, reader_size, params)
+            : gguf_init_from_file(fname, params));
         if (!ctx_gguf.get()) {
             throw std::runtime_error(string_format("%s: failed to load CLIP model from %s. Does this file exist?\n", __func__, fname));
         }
@@ -1331,6 +1360,7 @@ struct clip_model_loader {
                 }
             } else if (is_audio) {
                 get_u32(KEY_A_NUM_MEL_BINS, hparams.n_mel_bins);
+                get_string(KEY_GEN_AUDIO_VARIANT, hparams.gen_model_variant, false);
                 // some hparams are unused, but still need to set to avoid issues
                 hparams.image_size = 0;
                 hparams.patch_size = 1;
@@ -1408,9 +1438,14 @@ struct clip_model_loader {
             }
 
             // Load the vision/audio feature layer indices if they are explicitly provided
-            // NOTE: gguf conversions should standardize the values of the vision feature layer to
-            // be non-negative, since we use -1 to mark values as unset here.
+            // NOTE: gguf conversions should standardize the values of the vision feature layer to be non-negative, since we use -1 to mark values as unset here.
             get_arr_int(string_format(KEY_FEATURE_LAYERS, prefix), hparams.feature_layers, false);
+            for (const auto & v : hparams.feature_layers) {
+                if (v > (int) hparams.n_layer) {
+                    throw std::runtime_error(string_format("%s: feature layer index %d is out of range (n_layer: %d)",
+                                                           __func__, v, hparams.n_layer));
+                }
+            }
 
             // model-specific params
             switch (model.proj_type) {
@@ -1456,7 +1491,12 @@ struct clip_model_loader {
                         std::vector<int> wa_layer_indexes_vec;
                         get_arr_int(KEY_WIN_ATTN_LAYER_INDEXES, wa_layer_indexes_vec, false);
                         if (!wa_layer_indexes_vec.empty()) {
-                            hparams.insert_layer_id = wa_layer_indexes_vec[0];
+                            const int insert_lid = wa_layer_indexes_vec[0];
+                            if (insert_lid < 0 || insert_lid >= (int) hparams.n_layer) {
+                                throw std::runtime_error(string_format("%s: layer index %d is out of range (n_layer: %d)",
+                                                                       __func__, insert_lid, hparams.n_layer));
+                            }
+                            hparams.insert_layer_id = insert_lid;
                         }
                     } break;
                 case PROJECTOR_TYPE_INTERNVL:
@@ -1477,6 +1517,7 @@ struct clip_model_loader {
                     } break;
                 case PROJECTOR_TYPE_PARAKEET:
                     {
+                        get_bool("clip.audio.parakeet_mlx_frontend", hparams.parakeet_mlx_frontend, false);
                         get_u32(KEY_AUDIO_SUBSMPL_FACTOR, hparams.subsampling_factor);
                         GGML_ASSERT(hparams.subsampling_factor == 8 &&
                             "subsampling_factor must match the conv strides in clip_graph_parakeet::build()");
@@ -1651,6 +1692,7 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_QWEN2VL:
                 case PROJECTOR_TYPE_QWEN25VL:
                 case PROJECTOR_TYPE_QWEN3VL:
+                case PROJECTOR_TYPE_LING3VL:
                     {
                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
@@ -1834,7 +1876,7 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_QWEN3TTS_GEN:
                     {
                         // TODO: hardcoded for now, read from code_predictor_config instead
-                        hparams.rope_theta = 1000000.0f;
+                        hparams.rope_theta = hparams.gen_model_variant == "breeze" ? 500000.0f : 1000000.0f;
 
                         // code2wav params
                         hparams.wav_tfm_n_layer      = 8;
@@ -1865,6 +1907,12 @@ struct clip_model_loader {
                         // flow_lm defaults, see pocket_tts/default_parameters.py
                         hparams.flow_n_step       = 1;
                         hparams.gen_eos_threshold = -4.0f;
+                        if (hparams.gen_model_variant == "breeze" || hparams.gen_model_variant == "mimi") {
+                            hparams.seanet_ratios = {4, 5, 6, 8};
+                            hparams.seanet_n_stage = hparams.seanet_ratios.size();
+                            hparams.mimi_downsample = 2;
+                            hparams.mimi_tfm_context = hparams.gen_model_variant == "mimi" ? 250 : 8000;
+                        }
                     } break;
                 case PROJECTOR_TYPE_PADDLEOCR:
                     {
@@ -2102,10 +2150,31 @@ struct clip_model_loader {
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
-        auto fin = open_ifstream_binary(fname);
-        if (!fin) {
-            throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+        std::ifstream fin;
+        if (!reader) {
+            fin = open_ifstream_binary(fname);
+            if (!fin) { throw std::runtime_error("failed to open model file"); }
         }
+        auto read_bytes = [&](uint64_t offset, void * dst, size_t bytes) {
+            if (reader) {
+                if (offset > reader_size || bytes > reader_size - offset) {
+                    throw std::runtime_error("model tensor is outside reader bounds");
+                }
+                auto * out = static_cast<char *>(dst);
+                while (bytes) {
+                    const size_t chunk = std::min<size_t>(bytes, 1024 * 1024);
+                    if (reader(reader_user_data, out, offset, chunk) != chunk) {
+                        throw std::runtime_error("short model tensor read");
+                    }
+                    offset += chunk; out += chunk; bytes -= chunk;
+                }
+            } else {
+                fin.seekg(offset, std::ios::beg);
+                if (!fin.read(static_cast<char *>(dst), bytes)) {
+                    throw std::runtime_error("short model tensor read");
+                }
+            }
+        };
 
         // TODO @ngxson : support both audio and video in the future
         const char * prefix = model.modality == CLIP_MODALITY_AUDIO ? "a"
@@ -2201,8 +2270,7 @@ struct clip_model_loader {
 
             const size_t n_elems = n_bytes / sizeof(float);
             result.resize(n_elems);
-            fin.seekg(it->second, std::ios::beg);
-            fin.read(reinterpret_cast<char*>(result.data()), n_bytes);
+            read_bytes(it->second, result.data(), n_bytes);
             return result;
         };
 
@@ -2476,6 +2544,15 @@ struct clip_model_loader {
                     model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_LING3VL:
+                {
+                    model.mm_input_norm_w = get_tensor(TN_MM_INP_NORM);        // merger.norm
+                    model.mm_input_norm_b = get_tensor(TN_MM_INP_NORM_B);     // merger.norm
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));  // linear_proj.0
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));  // linear_proj.2
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
             case PROJECTOR_TYPE_MIMOVL:
@@ -2955,7 +3032,17 @@ struct clip_model_loader {
                 {
                     load_seanet(model.seanet, false);
                     model.downsample_w = get_tensor(string_format(TN_A_DOWNSAMPLE_CONV, "weight"));
-                    model.spk_proj_w   = get_tensor(string_format(TN_A_SPEAKER_PROJ, "weight"));
+                    if (hparams.gen_model_variant == "breeze") {
+                        for (int i = 0; i < 2; ++i) {
+                            model.mimi_quant_in[i] = get_tensor(string_format("a.rvq.%d.in.weight", i));
+                            model.mimi_quant_cb[i] = get_tensor(string_format("a.rvq.%d.codebook.weight", i));
+                            model.mimi_quant_norm[i] = get_tensor(string_format("a.rvq.%d.norm", i));
+                        }
+                        model.gen_code_out_embd_w = get_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD, "weight"));
+                        model.gen_code_embd_w = get_tensor(string_format(TN_A_GEN_CODE_EMBD, "weight"));
+                    } else if (hparams.gen_model_variant != "mimi") {
+                        model.spk_proj_w = get_tensor(string_format(TN_A_SPEAKER_PROJ, "weight"));
+                    }
                 } break;
             case PROJECTOR_TYPE_POCKETTTS_GEN:
                 {
@@ -3035,6 +3122,7 @@ struct clip_model_loader {
                     model.gen_code_head_w     = get_tensor(string_format(TN_A_GEN_CODE_HEAD,     "weight"));
                     model.gen_code_out_embd_w = get_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD, "weight"));
                     model.gen_code_norm_w     = get_tensor(string_format(TN_A_GEN_CODE_NORM,     "weight"));
+                    model.gen_code_rope_freqs = get_tensor("a.gen.code.rope_freqs.weight", false);
 
                     // code2wav: RVQ codes -> raw PCM, lives in the same ctx as code_predictor
                     {
@@ -3226,6 +3314,7 @@ struct clip_model_loader {
                     model.pos_embed          = get_tensor(string_format(TN_SAM_POS_EMBD,   "weight"));
                     model.patch_embed_proj_w = get_tensor(string_format(TN_SAM_PATCH_EMBD, "weight"));
                     model.patch_embed_proj_b = get_tensor(string_format(TN_SAM_PATCH_EMBD, "bias"));
+                    model.n_sam_layers = hparams.sam_n_layer;
                     model.sam_layers.resize(model.n_sam_layers);
                     for (int il = 0; il < model.n_sam_layers; ++il) {
                         auto & layer    = model.sam_layers[il];
@@ -3437,9 +3526,11 @@ struct clip_model_loader {
                         layer.norm_conv_b = get_tensor(string_format(TN_NORM_CONV, prefix, il, "bias"));
                     }
 
+                    if (!hparams.parakeet_mlx_frontend) {
                     model.mm_model_mlp_1_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 0, "weight"));
                     model.mm_model_mlp_2_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 1, "weight"));
                     model.mm_model_mlp_3_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 3, "weight"));
+                    }
                 } break;
             case PROJECTOR_TYPE_GRANITE_SPEECH:
                 {
@@ -3609,18 +3700,14 @@ struct clip_model_loader {
                     auto it_off = tensor_offset.find(t->name);
                     GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
                     const size_t offset = it_off->second;
-                    fin.seekg(offset, std::ios::beg);
-                    if (!fin) {
-                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
-                    }
                     size_t num_bytes = ggml_nbytes(cur);
                     if (ggml_backend_buft_is_host(buft)) {
                         // for the CPU and Metal backend, we can read directly into the tensor
-                        fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                        read_bytes(offset, cur->data, num_bytes);
                     } else {
                         // read into a temporary buffer first, then copy to device memory
                         read_buf.resize(num_bytes);
-                        fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
+                        read_bytes(offset, read_buf.data(), num_bytes);
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
                     }
                     data_loaded += num_bytes;
@@ -3679,7 +3766,7 @@ struct clip_model_loader {
     }
 
     static void init_ctx(clip_ctx & ctx_clip) {
-        ctx_clip.buf_compute_meta.resize(ctx_clip.max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+        ctx_clip.buf_compute_meta.resize(ctx_clip.max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(ctx_clip.max_nodes, false));
 
         // check batching support
         auto batch = get_dummy_batch(ctx_clip);
@@ -3762,7 +3849,9 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+            throw std::runtime_error("cannot allocate projector compute buffers");
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -3963,7 +4052,10 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         clip_model_loader loader(fname,
             /* skip_tensors */ false,
             ctx_params.progress_callback,
-            ctx_params.progress_callback_user_data);
+            ctx_params.progress_callback_user_data,
+            ctx_params.model_reader,
+            ctx_params.model_reader_user_data,
+            ctx_params.model_reader_size);
         bool skip_audio = false;
 
         if (loader.has_vision) {
@@ -3994,8 +4086,15 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             ctx_gen_audio = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_gen_audio->model, CLIP_MODALITY_GEN_AUDIO);
             loader.load_tensors(*ctx_gen_audio);
+            if (ctx_gen_audio->model.proj_type == PROJECTOR_TYPE_QWEN3TTS_GEN) {
+                // The depth decoder unrolls one transformer per residual codebook.
+                const auto & model = ctx_gen_audio->model;
+                ctx_gen_audio->max_nodes = std::max<int64_t>(ctx_gen_audio->max_nodes,
+                    2048 + 128 * (model.layers.size() + 1) * (model.gen_code_head_w->ne[2] + 1));
+                ctx_gen_audio->init_scheduler(ctx_params);
+            }
             // TODO: fix warmup
-            ctx_gen_audio->buf_compute_meta.resize(ctx_gen_audio->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+            ctx_gen_audio->buf_compute_meta.resize(ctx_gen_audio->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(ctx_gen_audio->max_nodes, false));
         }
 
     } catch (const std::exception & e) {
@@ -4038,6 +4137,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
@@ -4064,6 +4164,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
@@ -4144,6 +4245,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_MINIMAX_M3:
@@ -4353,8 +4455,8 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             {
                 // one conditioning row per 12.5Hz frame
-                const int hop = ctx->model.hparams.mimi_downsample * 120;
-                n_patches = img->nx() / hop;
+                const int hop = ctx->model.hparams.mimi_downsample * ctx->model.hparams.mimi_encoder_hop();
+                n_patches = (img->nx() + hop - 1) / hop;
             } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
@@ -4409,6 +4511,7 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     switch (model.proj_type) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:  return list_c2w_state_slots(hparams, model);
         case PROJECTOR_TYPE_POCKETTTS_GEN: return list_pockettts_state_slots(hparams, model);
+        case PROJECTOR_TYPE_POCKETTTS_SPKENC: return list_mimi_encoder_state_slots(hparams, model);
         default:                           return {};
     }
 }
@@ -4425,7 +4528,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {
-        clip_model_loader::warmup(*ctx, *params->imgs);
+        const auto flash_attn_type = ctx->flash_attn_type;
+        try {
+            clip_model_loader::warmup(*ctx, *params->imgs);
+        } catch (const std::exception & e) {
+            ctx->flash_attn_type = flash_attn_type;
+            LOG_ERR("%s: %s\n", __func__, e.what());
+            return false;
+        }
     }
 
     if (params->seed != ctx->rng_seed) {
@@ -4436,7 +4546,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+        return false;
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -4470,7 +4583,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
     };
 
-    auto set_input_i32 = [&get_inp_tensor](const char * name, std::vector<int32_t> & values) {
+    auto set_input_i32 = [&get_inp_tensor](const char * name, const std::vector<int32_t> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
@@ -4498,23 +4611,36 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     auto set_pockettts_tfm_inputs = [&]() {
         const int64_t n_pos = ggml_nelements(get_inp_tensor("inp_pos"));
         GGML_ASSERT(n_pos > 0);
+        float base = 0;
+        const bool stream = params->state_out != nullptr;
+        if (stream && params->state_in && params->state_in->size() >= sizeof(base)) {
+            std::memcpy(&base, params->state_in->data(), sizeof(base));
+        }
         std::vector<int32_t> positions((size_t) n_pos);
         for (int64_t i = 0; i < n_pos; i++) {
-            positions[(size_t) i] = (int32_t) i;
+            positions[(size_t) i] = (int32_t) base + i;
         }
         set_input_i32("inp_pos", positions);
 
         // the preprocessor truncates the waveform to keep this mask bounded
-        const int64_t max_pos = (int64_t) clip_hparams::pockettts_max_spk_seconds * hparams.audio_sample_rate / 120;
+        const int64_t max_pos = (int64_t) clip_hparams::pockettts_max_spk_seconds * hparams.audio_sample_rate / hparams.mimi_encoder_hop();
         GGML_ASSERT(n_pos <= max_pos && "pocket-tts speaker reference too long for a dense mask");
 
         const int64_t context = hparams.mimi_tfm_context;
-        std::vector<float> mask((size_t) n_pos * n_pos, -INFINITY);
+        const int64_t prefix = stream ? context - 1 : 0;
+        const bool ring = stream && hparams.gen_model_variant == "mimi";
+        const int64_t n_kv = ring ? context : prefix + n_pos;
+        if (ring) {
+            std::vector<int64_t> slots(n_pos);
+            for (int64_t i = 0; i < n_pos; ++i) { slots[i] = (int64_t(base) + i) % context; }
+            ggml_backend_tensor_set(get_inp_tensor("inp_cache_pos"), slots.data(), 0, slots.size() * sizeof(int64_t));
+        }
+        std::vector<float> mask((size_t) n_kv * n_pos, -INFINITY);
         for (int64_t q = 0; q < n_pos; q++) {
-            for (int64_t k = 0; k < n_pos; k++) {
-                const int64_t delta = q - k;
-                if (delta >= 0 && delta < context) {
-                    mask[(size_t) q * n_pos + k] = 0.0f;
+            for (int64_t k = 0; k < n_kv; k++) {
+                const int64_t delta = ring ? int64_t(base) + q - (k + std::max(int64_t(0), int64_t(base) + 1 - context)) : prefix + q - k;
+                if (delta >= 0 && delta < context && (ring || k + int64_t(base) >= prefix)) {
+                    mask[(size_t) q * n_kv + k] = 0.0f;
                 }
             }
         }
@@ -4564,7 +4690,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
         set_input_f32("inp_raw", inp_raw);
 
-    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
+    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV &&
+               params->gen_process != CLIP_GEN_PROCESS_EMBED_CODES) {
         // audio input. GEN_WAV is not here: it takes codes or feats, set in the switch below
         GGML_ASSERT(imgs.entries.size() == 1);
 
@@ -4649,8 +4776,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 //    -> https://huggingface.co/HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit
                 //    -> https://huggingface.co/HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit/blob/d66538faeba44480d0bfaa42145eef26f9423199/modeling_siglip.py#L316
                 std::vector<int32_t> positions(pos_h * pos_w);
-                int bucket_coords_h[1024];
-                int bucket_coords_w[1024];
+                // note: sized by the actual patch counts; a tall/wide image produces more
+                // than 1024 patches per side and a fixed [1024] array would be overrun
+                std::vector<int> bucket_coords_h(pos_h);
+                std::vector<int> bucket_coords_w(pos_w);
                 for (int i = 0; i < pos_h; i++){
                     bucket_coords_h[i] = std::floor(70.0*i/pos_h);
                 }
@@ -4693,8 +4822,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
                 // SigLIP position buckets (same as resampler path)
                 std::vector<int32_t> positions(pos_h * pos_w);
-                int bucket_coords_h[1024];
-                int bucket_coords_w[1024];
+                std::vector<int> bucket_coords_h(pos_h);
+                std::vector<int> bucket_coords_w(pos_w);
                 for (int i = 0; i < pos_h; i++){
                     bucket_coords_h[i] = std::floor(70.0*i/pos_h);
                 }
@@ -4779,6 +4908,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_GLM4V:
             {
                 const int merge_ratio = hparams.n_merge;
@@ -5154,6 +5284,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             {
                 set_pockettts_tfm_inputs();
+                if (params->state_out) { set_gen_state_in(); }
             } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
@@ -5268,7 +5399,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             } break;
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             {
-                if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+                if (params->gen_process == CLIP_GEN_PROCESS_EMBED_CODES) {
+                    const int64_t groups = model.gen_code_head_w->ne[2] + 1;
+                    if (!params->codes || params->codes->size() != (size_t) groups) { return false; }
+                    for (int64_t g = 0; g < groups; ++g) {
+                        const int64_t vocab = g == 0 ? model.gen_code_out_embd_w->ne[1] : model.gen_code_embd_w->ne[1];
+                        const int32_t code = (*params->codes)[g];
+                        if (code < 0 || code >= vocab) {
+                            LOG_ERR("%s: reference code out of range\n", __func__);
+                            return false;
+                        }
+                    }
+                    set_input_i32("inp_ref_codes", *params->codes);
+                } else if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
                     GGML_ASSERT(params->codes != nullptr);
 
                     // frame-major input to group-major, rear-padded with code 0 up to one window
@@ -5292,10 +5435,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                         }
                     }
 
-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
+                    std::vector<int32_t> codes(n_frames * n_codes);
                     for (int64_t f = 0; f < n_frames; f++) {
                         for (int64_t g = 0; g < n_codes; g++) {
-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
+                            codes[g * n_frames + f] = (*params->codes)[f * n_codes + g];
                         }
                     }
                     set_input_i32("inp_codes", codes);
@@ -5753,7 +5896,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     }
 
     // the last node is the embedding tensor, code2wav has no out_embd
-    ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+    ggml_tensor * embeddings = !params->out_embd ? nullptr :
+        params->gen_process == CLIP_GEN_PROCESS_EMBED_CODES ? ggml_graph_get_tensor(gf, "ref_code_embd") :
+        ggml_graph_node(gf, -1);
 
     if (embeddings != nullptr) {
         // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
@@ -5824,7 +5969,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
         const int64_t n_frames_w = hparams.wav_tfm_swa;
         const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
-        if (n_frames < n_frames_w) {
+        if (n_frames < n_frames_w && ctx->proj_type() != PROJECTOR_TYPE_QWEN3TTS_GEN) {
             const size_t hop = out_audio.size() / n_frames_w;
             out_audio.resize((size_t) n_frames * hop);
         }
@@ -5943,6 +6088,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN3VL:
             // main path + deepstack paths
             return ctx->model.mm_1_b->ne[0] * (1 + ctx->model.n_deepstack_layers);
+        case PROJECTOR_TYPE_LING3VL:
+            return ctx->model.mm_1_b->ne[0];
         case PROJECTOR_TYPE_MIMOVL:
             return ctx->model.mm_1_w->ne[1];
         case PROJECTOR_TYPE_STEP3VL:
@@ -6002,11 +6149,12 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             return ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
-            return ctx->model.spk_proj_w->ne[1];
+            return ctx->model.hparams.gen_model_variant == "mimi" ? ctx->model.hparams.projection_dim :
+                   ctx->model.spk_proj_w ? ctx->model.spk_proj_w->ne[1] : ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             return ctx->model.gen_input_lin_w->ne[1];
         case PROJECTOR_TYPE_PARAKEET:
-            return ctx->model.mm_1_w->ne[1];
+            return ctx->model.hparams.parakeet_mlx_frontend ? ctx->model.hparams.n_embd : ctx->model.mm_1_w->ne[1];
         default:
             GGML_ABORT("Unknown projector type");
     }
@@ -6036,6 +6184,7 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_LING3VL:
             return 2;
         default:
             return 1;
@@ -6056,8 +6205,14 @@ const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx) {
 
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {
     std::map<ggml_backend_dev_t, size_t> result = ctx->mem_usage;
-    for (auto & [dev, size] : ctx->mem_compute) {
-        result[dev] += size;
+    if (ctx->no_alloc) {
+        for (const auto & [dev, size] : ctx->mem_compute) { result[dev] += size; }
+    } else {
+        // Runtime audio graphs grow with input length; the initial reserve is
+        // only an estimate. Query the scheduler's currently retained buffers.
+        for (auto * backend : ctx->backend_ptrs) {
+            result[ggml_backend_get_device(backend)] += ggml_backend_sched_get_buffer_size(ctx->sched.get(), backend);
+        }
     }
     return result;
 }

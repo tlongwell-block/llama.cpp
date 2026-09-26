@@ -237,13 +237,19 @@ common_peg_parser common_chat_peg_builder::tag_with_safe_content(const std::stri
 }
 
 common_peg_parser common_chat_peg_builder::permute(const std::string &                    rule_prefix,
-                                                   const std::vector<common_peg_parser> & parsers) {
+                                                   const std::vector<common_peg_parser> & parsers,
+                                                   const std::vector<common_peg_parser> & optional_parsers) {
+    auto extras = optional_parsers.empty() ? eps() : zero_or_more(choice(optional_parsers));
     if (parsers.empty()) {
-        return eps();
+        return extras;
     }
 
     if (parsers.size() == 1 || parsers.size() > COMMON_CHAT_MAX_PERMUTE) {
-        return sequence(parsers);
+        auto result = extras;
+        for (const auto & parser : parsers) {
+            result = result + parser + extras;
+        }
+        return result;
     }
 
     std::map<uint32_t, common_peg_parser>      rules;
@@ -251,7 +257,7 @@ common_peg_parser common_chat_peg_builder::permute(const std::string &          
 
     remaining_of = [&](uint32_t remaining) -> common_peg_parser {
         if (remaining == 0) {
-            return eps();
+            return extras;
         }
 
         auto cached = rules.find(remaining);
@@ -267,7 +273,8 @@ common_peg_parser common_chat_peg_builder::permute(const std::string &          
             }
         }
 
-        return rules.emplace(remaining, rule(rule_prefix + "-" + std::to_string(remaining), alternatives)).first->second;
+        return rules.emplace(remaining, rule(rule_prefix + "-" + std::to_string(remaining),
+                                             optional_parsers.empty() ? alternatives : extras + alternatives)).first->second;
     };
 
     return remaining_of((1u << parsers.size()) - 1);
@@ -318,13 +325,13 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     bool is_content   = node.tag == common_chat_peg_builder::CONTENT;
 
     if (is_reasoning) { // GPT OSS can have more than 1 reasoning block, so concatenate here
-        result.reasoning_content += std::string(node.text);
+        result.reasoning_content += node.sanitized_text();
     }
 
     if (is_content) {
         // Concatenate content from multiple content nodes (e.g., when reasoning markers
         // are preserved before content markers in reasoning_format=NONE mode)
-        result.content += std::string(node.text);
+        result.content += node.sanitized_text();
     }
 
     // Handle tool-related tags (supporting both JSON and tagged formats)
@@ -343,6 +350,7 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
         pending_tool_call     = common_chat_tool_call();
         current_tool          = &pending_tool_call.value();
         arg_count             = 0;
+        arg_names.clear();
         args_buffer.clear();
         closing_quote_pending = false;
     }
@@ -386,6 +394,10 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     }
 
     if (is_arg_name && current_tool) {
+        const auto name = trim(node.text);
+        if (!arg_names.insert(std::string(name)).second) {
+            throw std::runtime_error("duplicate tool argument: " + std::string(name));
+        }
         std::string arg_entry;
         if (arg_count > 0) {
             arg_entry = ",";
@@ -488,7 +500,7 @@ common_peg_parser common_chat_peg_builder::standard_constructed_tools(
         }
         const auto &   function = tool_def.at("function");
         std::string    name     = function.at("name");
-        ordered_json   params   = function.contains("parameters") ? function.at("parameters") : ordered_json::object();
+        ordered_json   params   = common_chat_tool_parameters(function);
 
         // Build argument parsers
         auto args = eps();
@@ -565,7 +577,7 @@ common_peg_parser common_chat_peg_builder::python_style_tool_calls(
         }
         const auto &   function = tool_def.at("function");
         std::string    name     = function.at("name");
-        ordered_json   params   = function.contains("parameters") ? function.at("parameters") : ordered_json::object();
+        ordered_json   params   = common_chat_tool_parameters(function);
 
         auto args = eps();
         if (params.contains("properties") && !params["properties"].empty()) {
@@ -640,7 +652,7 @@ common_peg_parser common_chat_peg_builder::build_json_tools_function_is_key(
         }
         const auto &   function = tool_def.at("function");
         std::string    name     = function.at("name");
-        ordered_json   params   = function.contains("parameters") ? function.at("parameters") : ordered_json::object();
+        ordered_json   params   = common_chat_tool_parameters(function);
 
         // Build inner object fields
         std::vector<common_peg_parser> inner_fields;
@@ -726,7 +738,7 @@ common_peg_parser common_chat_peg_builder::build_json_tools_nested_keys(
         }
         const auto &   function = tool_def.at("function");
         std::string    name     = function.at("name");
-        ordered_json   params   = function.contains("parameters") ? function.at("parameters") : ordered_json::object();
+        ordered_json   params   = common_chat_tool_parameters(function);
 
         auto nested_name = literal("\"" + nested_name_field + "\"") + space() + literal(":") + space() +
                           atomic(literal("\"") + tool_name(literal(name)) + literal("\""));
@@ -795,7 +807,7 @@ common_peg_parser common_chat_peg_builder::build_json_tools_flat_keys(
         }
         const auto &   function = tool_def.at("function");
         std::string    name     = function.at("name");
-        ordered_json   params   = function.contains("parameters") ? function.at("parameters") : ordered_json::object();
+        ordered_json   params   = common_chat_tool_parameters(function);
 
         auto tool_name_ = name_key_parser + space() + literal(":") + space() +
                          atomic(literal("\"") + tool_name(literal(name)) + literal("\""));
@@ -1058,12 +1070,12 @@ void common_chat_peg_gemma4_mapper::visit(const common_peg_ast_arena & arena, co
     const auto & node = arena.get(id);
 
     if (node.tag == "reasoning") {
-        result.reasoning_content += std::string(node.text);
+        result.reasoning_content += node.sanitized_text();
         return;
     }
 
     if (node.tag == "content") {
-        result.content += std::string(node.text);
+        result.content += node.sanitized_text();
         return;
     }
 
@@ -1206,12 +1218,12 @@ void common_chat_peg_minimax_m3_mapper::visit(const common_peg_ast_arena & arena
     const auto & node = arena.get(id);
 
     if (node.tag == common_chat_peg_builder::REASONING) {
-        result.reasoning_content += std::string(node.text);
+        result.reasoning_content += node.sanitized_text();
         return;
     }
 
     if (node.tag == common_chat_peg_builder::CONTENT) {
-        result.content += std::string(node.text);
+        result.content += node.sanitized_text();
         return;
     }
 

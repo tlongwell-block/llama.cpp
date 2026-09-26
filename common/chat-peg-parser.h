@@ -5,6 +5,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 class common_chat_peg_mapper {
@@ -24,6 +25,7 @@ class common_chat_peg_mapper {
       std::optional<common_chat_tool_call> pending_tool_call;  // Tool call waiting for name
       common_chat_tool_call *              current_tool          = nullptr;
       int                                  arg_count             = 0;
+      std::set<std::string>                 arg_names;
       bool                                 closing_quote_pending = false;
       std::string                          args_buffer;  // Buffer to delay arguments until tool name is known
 
@@ -107,8 +109,9 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     common_peg_parser tool_arg_json_value(const common_peg_parser & p) { return tag(TOOL_ARG_VALUE, p); }
 
 
-    // Matches every parser exactly once, in any order.
-    common_peg_parser permute(const std::string & rule_prefix, const std::vector<common_peg_parser> & parsers);
+    // Match required parsers once, with optional parsers allowed between them.
+    common_peg_parser permute(const std::string & rule_prefix, const std::vector<common_peg_parser> & parsers,
+                             const std::vector<common_peg_parser> & optional_parsers = {});
 
     // Return a parser that parses the prefix of a string, up to a given delimiter.
     common_peg_parser prefix(const std::string & s, const std::string & delimiter = {});

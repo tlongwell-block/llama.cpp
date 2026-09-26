@@ -472,6 +472,9 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* model_reader */ nullptr,
+        /* model_reader_user_data */ nullptr,
+        /* model_reader_size */ 0,
     };
     return params;
 }
@@ -577,13 +580,16 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* model_reader */ ctx_params.model_reader,
+            /* model_reader_user_data */ ctx_params.model_reader_user_data,
+            /* model_reader_size */ ctx_params.model_reader_size,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         ctx_gen_a = res.ctx_gen_a;
-        if (!ctx_v && !ctx_a) {
+        if (!ctx_v && !ctx_a && !ctx_gen_a) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
@@ -600,7 +606,7 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
-        int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
+        int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a ? ctx_a : ctx_gen_a);
         if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
             throw std::runtime_error(string_format(
                 "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
@@ -694,6 +700,7 @@ struct mtmd_context {
             case PROJECTOR_TYPE_QWEN2VL:
             case PROJECTOR_TYPE_QWEN25VL:
             case PROJECTOR_TYPE_QWEN3VL:
+            case PROJECTOR_TYPE_LING3VL:
             case PROJECTOR_TYPE_MIMOVL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
@@ -1928,6 +1935,36 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
 
     *out = {};
 
+    if (inp->type == MTMD_GEN_PROCESS_TYPE_EMBED_CODES) {
+        if (mtmd_gen_audio_get_info(ctx).type != MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
+            LOG_ERR("%s: code embedding requires Qwen3-TTS\n", __func__);
+            return 1;
+        }
+        if (!inp->codes || inp->n_codes != 16) {
+            LOG_ERR("%s: code embedding requires one 16-code frame\n", __func__);
+            return 1;
+        }
+        std::vector<int32_t> codes(inp->codes, inp->codes + inp->n_codes);
+        clip_image_f32 dummy;
+        dummy.set_size({1, 1}, false, true);
+        dummy.cpy_buf(std::vector<float>(1, 0.0f));
+        clip_image_f32_batch batch;
+        batch.is_audio = true;
+        batch.entries.push_back(std::move(dummy));
+        std::vector<float> embd((size_t) clip_n_mmproj_embd(ctx_clip));
+        clip_encode_params params;
+        params.imgs = &batch;
+        params.n_threads = ctx->n_threads;
+        params.gen_process = CLIP_GEN_PROCESS_EMBED_CODES;
+        params.codes = &codes;
+        params.out_embd = &embd;
+        params.seed = inp->seed;
+        if (!clip_encode(ctx_clip, &params)) { return 1; }
+        ctx->gen_out_embd = std::move(embd);
+        out->embd = ctx->gen_out_embd.data();
+        return 0;
+    }
+
     if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
         const size_t n_embd = (size_t) clip_n_mmproj_embd(ctx_clip);
 
@@ -2195,6 +2232,13 @@ bool mtmd_support_vision(const mtmd_context * ctx) {
 
 bool mtmd_support_audio(const mtmd_context * ctx) {
     return ctx->ctx_a != nullptr;
+}
+
+void mtmd_release_audio_encoder(mtmd_context * ctx) {
+    if (!ctx) { return; }
+    ctx->audio_preproc.reset();
+    clip_free(ctx->ctx_a);
+    ctx->ctx_a = nullptr;
 }
 
 int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
@@ -2700,6 +2744,15 @@ static void stub_log_callback(enum ggml_log_level, const char *, void *) {
     // do nothing
 }
 
+std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const mtmd_context * ctx) {
+    std::map<ggml_backend_dev_t, size_t> result;
+    if (!ctx) { return result; }
+    for (auto * clip : {ctx->ctx_v, ctx->ctx_a, ctx->ctx_gen_a}) {
+        if (clip) { for (const auto & [dev, size] : clip_get_mem_usage(clip)) { result[dev] += size; } }
+    }
+    return result;
+}
+
 std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_fname,
                                                             struct mtmd_context_params ctx_params) {
     mtmd::context_ptr ctx;
@@ -2712,19 +2765,7 @@ std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_f
         mtmd_log_set(stub_log_callback, nullptr); // suppress logging
         ctx.reset(new mtmd_context(mmproj_fname, nullptr, ctx_params, true));
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
-        std::map<ggml_backend_dev_t, size_t> total_mem;
-        auto merge = [&](const struct clip_ctx * c) {
-            for (auto & [dev, size] : clip_get_mem_usage(c)) {
-                total_mem[dev] += size;
-            }
-        };
-        if (ctx->ctx_v) {
-            merge(ctx->ctx_v);
-        }
-        if (ctx->ctx_a) {
-            merge(ctx->ctx_a);
-        }
-        return total_mem;
+        return mtmd_get_memory_usage(ctx.get());
     } catch (const std::exception & e) {
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
         LOG_ERR("%s: error: %s\n", __func__, e.what());

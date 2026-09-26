@@ -14,6 +14,10 @@ find_package(Threads REQUIRED)
 
 add_library(mtmd
             mtmd.cpp
+            mtmd-turn.cpp
+            mtmd-vad.cpp
+            mtmd-side.cpp
+            mtmd-ear.cpp
             mtmd-audio.cpp
             mtmd-image.cpp
             mtmd.h
@@ -55,6 +59,7 @@ add_library(mtmd
             models/qwen2vl.cpp
             models/minimax-m3.cpp
             models/qwen3vl.cpp
+            models/ling3vl.cpp
             models/mimovl.cpp
             models/qwen3a.cpp
             models/mimo-audio.cpp

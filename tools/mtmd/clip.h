@@ -58,6 +58,9 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    gguf_reader_callback_t model_reader = nullptr;
+    void * model_reader_user_data = nullptr;
+    uint64_t model_reader_size = 0;
 };
 
 struct clip_init_result {
@@ -91,6 +94,7 @@ enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
     CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
+    CLIP_GEN_PROCESS_EMBED_CODES, // one codec frame to talker embedding
 };
 struct clip_encode_params {
     int n_threads = 1;

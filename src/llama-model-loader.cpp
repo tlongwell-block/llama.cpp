@@ -685,6 +685,13 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
         }
 
+        // mmap places tensors at their file offsets, so an embedded GGUF must be aligned in the file too
+        const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+        if (use_mmap && gguf_get_data_offset(metadata) % tensor_align != 0) {
+            throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
+                __func__, gguf_get_data_offset(metadata), tensor_align));
+        }
+
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
@@ -1172,8 +1179,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
-            size_data -= nbytes;
-            n_created++;
+            if (!files.empty()) {
+                size_data -= nbytes;
+                n_created++;
+            }
 
             return nullptr;
         }
@@ -1288,6 +1297,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_type type = GGML_TYPE_F32;
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+        const int64_t inventory = gguf_find_key(metadata, "general.tensor_inventory_complete");
+        if (inventory >= 0) {
+            if (gguf_get_kv_type(metadata, inventory) != GGUF_TYPE_BOOL) {
+                throw std::runtime_error("general.tensor_inventory_complete must be boolean");
+            }
+            if (gguf_get_val_bool(metadata, inventory) && tid == -1) {
+                if (flags & TENSOR_NOT_REQUIRED) { return nullptr; }
+                throw std::runtime_error(format("missing required tensor: %s", tn.str().c_str()));
+            }
+        }
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
         }
@@ -1319,7 +1338,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) {
+            return nullptr;
+        }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());

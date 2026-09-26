@@ -933,9 +933,12 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
-            if (no_alloc) {
-                galloc->buffers[i] = NULL;
-            } else {
+            for (int j = i; j < galloc->n_buffers; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    galloc->buffers[j] = NULL;
+                }
+            }
+            if (!no_alloc) {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
@@ -1007,6 +1010,12 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    // A failed reserve can leave an up-to-date plan with missing buffers.
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            return true;
+        }
+    }
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
