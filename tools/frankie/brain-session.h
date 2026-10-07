@@ -86,6 +86,7 @@ class brain_session {
     size_t cached_used = 0;
     bool cache_valid = false;
     frankie_options options;
+    int final_layer = -1;
     std::string partial_prefix, partial_marker;
     std::vector<float> partial_rows;
     int partial_pos = 0;

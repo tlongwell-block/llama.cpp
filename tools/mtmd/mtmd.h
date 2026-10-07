@@ -411,6 +411,8 @@ struct mtmd_gen_inp {
     float   top_p;
     uint32_t seed; // UINT32_MAX for random
     float    temp; // sampling temperature, or noise scale for flow-matching decoders
+    const float * uncond_embd; // Breeze guidance: the unconditional hidden state, n_text_embd elements, or null
+    float    cfg_scale;        // with uncond_embd: logits = uncond + cfg_scale * (cond - uncond)
 
     // for MTMD_GEN_PROCESS_TYPE_GEN_WAV
     // pass either codes (discrete) or feats (continuous), depending on the pipeline

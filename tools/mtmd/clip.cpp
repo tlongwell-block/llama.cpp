@@ -1129,6 +1129,8 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
+                const float temp  = params ? params->temp : 0.0f;
+                const float cfg   = params ? params->cfg_scale : 1.0f;
                 int n_frames = 1; // the unselected waveform branch only needs a minimal reserve
                 if (params && gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
                     const size_t groups = ctx->model.gen_code_head_w->ne[2] + 1;
@@ -1138,7 +1140,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                     }
                     n_frames = (int) (params->codes->size() / groups);
                 }
-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_frames);
+                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_frames, temp, cfg);
             } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {
@@ -4087,10 +4089,10 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_gen_audio->model, CLIP_MODALITY_GEN_AUDIO);
             loader.load_tensors(*ctx_gen_audio);
             if (ctx_gen_audio->model.proj_type == PROJECTOR_TYPE_QWEN3TTS_GEN) {
-                // The depth decoder unrolls one transformer per residual codebook.
+                // The depth decoder unrolls one transformer per residual codebook, twice with guidance.
                 const auto & model = ctx_gen_audio->model;
                 ctx_gen_audio->max_nodes = std::max<int64_t>(ctx_gen_audio->max_nodes,
-                    2048 + 128 * (model.layers.size() + 1) * (model.gen_code_head_w->ne[2] + 1));
+                    2048 + 2 * 128 * (model.layers.size() + 1) * (model.gen_code_head_w->ne[2] + 1));
                 ctx_gen_audio->init_scheduler(ctx_params);
             }
             // TODO: fix warmup

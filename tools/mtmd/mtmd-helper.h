@@ -243,6 +243,14 @@ struct mtmd_helper_gen_audio_inp {
 
     // Breeze continuous prompts can follow an existing sequence without replaying its KV.
     llama_pos n_past;
+
+    // Breeze guidance: an unconditional continuous prompt on its own sequence, generated in step
+    // with the main one. Every logit is then uncond + cfg_scale * (cond - uncond).
+    const float * uncond_prompt_embd;
+    size_t        n_uncond_prompt_embd;
+    llama_seq_id  uncond_seq_id;
+    llama_pos     uncond_n_past;
+    float         cfg_scale;
 };
 
 MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(
@@ -273,6 +281,12 @@ MTMD_API int32_t mtmd_helper_gen_audio_step_gen(
                         const float *  h_state_in,
                         const float ** h_state_out,
                         bool * out_stop);
+
+// Breeze: the backbone's logits for the next first codebook, guided when an unconditional
+// prompt was set; valid after step_prompt() returns 0 and after each frame, null otherwise
+MTMD_API const float * mtmd_helper_gen_audio_get_logits(
+                        mtmd_helper_gen_audio * ctx,
+                        int32_t * n_vocab);
 
 // out_data valid until next get_output() or reset() call
 // out_n_samples (optional, can be NULL) receives the number of generated PCM samples
@@ -338,6 +352,9 @@ struct gen_audio {
     }
     int32_t step_gen(llama_token sampled, const float * h_state, const float ** h_state_out, bool * out_stop = nullptr) {
         return mtmd_helper_gen_audio_step_gen(ctx.get(), sampled, h_state, h_state_out, out_stop);
+    }
+    const float * get_logits(int32_t * n_vocab) {
+        return mtmd_helper_gen_audio_get_logits(ctx.get(), n_vocab);
     }
     int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples = nullptr) {
         return mtmd_helper_gen_audio_get_output(ctx.get(), out_sample_rate, out_data, out_data_len, out_n_samples);

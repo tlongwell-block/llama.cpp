@@ -248,8 +248,9 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
 };
 
 struct clip_graph_qwen3tts_gen : clip_graph {
-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p, int n_frames)
-        : clip_graph(ctx, img), gen_process(gen_process), n_frames(n_frames), top_k(top_k), top_p(top_p) {}
+    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p, int n_frames,
+                            float temp = 0.0f, float cfg_scale = 1.0f)
+        : clip_graph(ctx, img), gen_process(gen_process), n_frames(n_frames), top_k(top_k), top_p(top_p), temp(temp), cfg_scale(cfg_scale) {}
     ggml_cgraph * build() override;
 
     // which sub-graph build() constructs, fixed at graph-build time
@@ -259,18 +260,24 @@ struct clip_graph_qwen3tts_gen : clip_graph {
     // sampling params, fixed at graph-build time (GEN_CODE only)
     int   top_k;
     float top_p;
+    float temp;      // Breeze only: depth sampling temperature, 0 keeps 1
+    float cfg_scale; // != 1: two lanes, the second unconditional, mixed before sampling
 
     //
     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
     // MTP-style code predictor, one token per codebook
     //
     struct code_gen : clip_graph {
-        code_gen(const clip_graph & parent, int top_k, float top_p)
-            : clip_graph(parent), top_k(top_k), top_p(top_p) {}
+        code_gen(const clip_graph & parent, int top_k, float top_p, float temp, float cfg_scale)
+            : clip_graph(parent), top_k(top_k), top_p(top_p), temp(temp), cfg_scale(cfg_scale) {}
         ggml_cgraph * build() override { GGML_ABORT("call prefill()/step() instead"); }
 
         int   top_k;
         float top_p;
+        float temp;
+        float cfg_scale;
+
+        ggml_tensor * guide(ggml_tensor * cond, ggml_tensor * uncond) const;
 
         ggml_tensor * cache_set(ggml_tensor * cache, int row_idx, ggml_tensor * value) const;
         ggml_tensor * do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const;
@@ -290,19 +297,16 @@ struct clip_graph_qwen3tts_gen : clip_graph {
                 int pos,
                 int il) const;
 
-        void prefill(
+        ggml_tensor * prefill(
                 std::vector<ggml_tensor *> & k_cache,
                 std::vector<ggml_tensor *> & v_cache,
-                ggml_tensor *& out_code_cache,
                 ggml_tensor * h_state,
-                ggml_tensor * code0_embd,
-                ggml_tensor * inp_rand) const;
+                ggml_tensor * code0_embd) const;
 
         ggml_tensor * step(
                 std::vector<ggml_tensor *> & k_cache,
                 std::vector<ggml_tensor *> & v_cache,
                 ggml_tensor * out_code_cache,
-                ggml_tensor * inp_rand,
                 int step_idx) const;
     };
 

@@ -207,6 +207,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
+    if (!cparams.embeddings_nextn_masked) {
+        res->t_layer_inp[n_layer] = cur; // the final state, one row per token
+    }
 
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);

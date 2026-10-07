@@ -333,6 +333,7 @@ struct realtime_session {
     realtime_session(brain_session & b, mouth_session & m, httplib::ws::WebSocket & s, const std::string & package, const frankie_options & options) :
         brain(b), mouth(m), socket(s), max_utterance_seconds(options.max_utterance_seconds),
         max_output_audio_seconds(options.max_output_audio_seconds), vad_source(package, "vad") {
+        mouth.reset_speech_context();  // a new session starts from the voice reference
         ggml_context * raw = nullptr;
         std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
             gguf_init_from_callback(component::callback, &vad_source, 1024 * 1024, vad_source.size(), { false, &raw }), gguf_free);
@@ -1578,6 +1579,7 @@ int main(int argc, char ** argv) {
                          "  [--max-utterance-seconds N] [--max-output-audio-seconds N] [--max-output-tokens N|inf]\n"
                          "  [--voice WAV] [--voice-text-file TXT --voice-codes I32]\n"
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
+                         "  [--delivery GGUF] [--speech-hold-words N]\n"
                          "  [--vap-model GGUF] [--bc-model GGUF] [--bc-det-model GGUF] [--bc-det-device cpu|gpu]\n"
                          "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF]\n"
                          "--ctx-size is the total KV pool (default 131072). HTTP slots default to an equal share.\n"
@@ -1604,6 +1606,8 @@ int main(int argc, char ** argv) {
             else if (key == "--voice-text-file") { options.voice_text = value; }
             else if (key == "--voice-codes") { options.voice_codes = value; }
             else if (key == "--expression") { options.expression = value; }
+            else if (key == "--delivery") { options.delivery = value; }
+            else if (key == "--speech-hold-words") { options.speech_hold_words = frankie_unsigned(value); }
             else if (key == "--vap-model") { options.vap_model = value; }
             else if (key == "--bc-model") { options.bc_model = value; }
             else if (key == "--bc-det-model") { options.bc_detector = value; }

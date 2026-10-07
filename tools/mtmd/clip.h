@@ -112,6 +112,7 @@ struct clip_encode_params {
     std::vector<float> * out_feats = nullptr; // continuous counterpart of out_codes
     uint32_t seed = UINT32_MAX;               // UINT32_MAX for random
     float   temp = 0.0f;                      // sampling temperature, noise scale for flow-matching decoders
+    float   cfg_scale = 1.0f;                 // != 1: imgs holds the conditional then the unconditional hidden state
     bool * out_is_eos = nullptr;
 
     // GEN_WAV

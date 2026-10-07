@@ -27,7 +27,7 @@ def main():
     parser.add_argument('--voice', type=Path)
     parser.add_argument('--voice-text-file', type=Path)
     parser.add_argument('--voice-codes', type=Path, help='frame-major little-endian I32, 16 codebooks')
-    for name in ('expression', 'turn', 'breeze'):
+    for name in ('expression', 'turn', 'breeze', 'delivery'):
         parser.add_argument('--' + name, type=Path)
     parser.add_argument('--bc-det', type=Path, help='native continuous Mimi plus MaAI human backchannel detector')
     args = parser.parse_args()
@@ -89,7 +89,7 @@ def main():
             continue
         tensor_map[tensor.name] = (tensor.data, tensor.tensor_type)
         source_shapes[tensor.name] = tensor.shape.tolist()
-    for name in ('expression', 'turn', 'breeze', 'bc_det'):
+    for name in ('expression', 'turn', 'breeze', 'delivery', 'bc_det'):
         path = getattr(args, name)
         if path:
             if path.stat().st_size > (256 if name == 'bc_det' else 64) * 1024 * 1024: raise ValueError(name + ' asset too large')

@@ -119,6 +119,7 @@ public:
     // set out_stop on end-of-speech, h_state_out must be null if no frame is generated
     virtual int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) = 0;
     virtual int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) = 0;
+    virtual const float * get_logits(int32_t * n_vocab) { *n_vocab = 0; return nullptr; }
 
 protected:
     llama_context * lctx;
@@ -187,17 +188,47 @@ public:
         prompt_batch.reset();
         n_prompt = 0;
         prompt_pos = 0;
+        uncond_embd_buf.clear();
+        uncond_batch.reset();
+        n_uncond = 0;
+        uncond_prompt_pos = 0;
+        uncond_seq = -1;
+        uncond_pos = 0;
+        cfg_scale = 1.0f;
+        h_uncond.clear();
+        logits_buf.clear();
+        uncond_logits.clear();
     }
 
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
         reset();
         seq_id = inp->seq_id;
         const bool breeze = info.model_variant && std::string(info.model_variant) == "breeze";
-        if (inp->n_past < 0 || (!breeze && inp->n_past) || uint32_t(inp->n_past) >= llama_n_ctx(lctx)) { return 1; }
+        // Breeze's sliding speech window keeps RoPE positions increasing past evicted rows
+        if (inp->n_past < 0 || (!breeze && inp->n_past) || inp->n_past > (1 << 30)) { return 1; }
         pos = inp->n_past;
+        if (inp->uncond_prompt_embd || inp->n_uncond_prompt_embd) {
+            // Breeze guidance: both lanes keep their own history on their own sequences.
+            if (!breeze || !inp->uncond_prompt_embd || !inp->n_uncond_prompt_embd || !inp->prompt_embd ||
+                !std::isfinite(inp->cfg_scale) || inp->cfg_scale <= 0.0f || inp->uncond_seq_id == inp->seq_id ||
+                inp->uncond_seq_id < 0 || inp->uncond_n_past < 0 || inp->uncond_n_past > (1 << 30) ||
+                inp->n_uncond_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx), 32768)) {
+                LOG_ERR("mtmd_helper_gen_audio: invalid unconditional speech prompt\n");
+                return 1;
+            }
+            const size_t count = inp->n_uncond_prompt_embd * n_embd;
+            if (!std::all_of(inp->uncond_prompt_embd, inp->uncond_prompt_embd + count, [](float x) { return std::isfinite(x); })) {
+                return 1;
+            }
+            uncond_embd_buf.assign(inp->uncond_prompt_embd, inp->uncond_prompt_embd + count);
+            n_uncond = inp->n_uncond_prompt_embd;
+            uncond_seq = inp->uncond_seq_id;
+            uncond_pos = inp->uncond_n_past;
+            cfg_scale = inp->cfg_scale;
+        }
         if (breeze || inp->prompt_embd || inp->n_prompt_embd) {
             if (!breeze || !inp->prompt_embd || !inp->n_prompt_embd ||
-                inp->n_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx) - pos, 32768) ||
+                inp->n_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx), 32768) ||
                 inp->prompt_len || inp->speaker_ref || inp->target_offset || inp->ref_text ||
                 inp->ref_codes || inp->ref_codec_embd || inp->speaker_offset) {
                 LOG_ERR("mtmd_helper_gen_audio: invalid continuous speech prompt\n");
@@ -405,6 +436,12 @@ public:
         if (mrope) prompt_batch->set_position_mrope_1d(pos, seq_id);
         else       prompt_batch->set_position_normal(pos, seq_id);
         prompt_pos = 0;
+        if (n_uncond) {
+            if (mrope) { return 1; }
+            uncond_batch.reset(new decode_embd_batch(uncond_embd_buf.data(), n_uncond, 1, n_embd));
+            uncond_batch->set_position_normal(uncond_pos, uncond_seq);
+            uncond_prompt_pos = 0;
+        }
         const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
         if (!std::isfinite(inp->code_temperature) || inp->code_temperature < 0) { return 1; }
         code_temperature = inp->code_temperature > 0 ? inp->code_temperature : def.temp;
@@ -418,7 +455,7 @@ public:
     int32_t step_prompt(int32_t n_batch) override {
         GGML_ASSERT(n_batch > 0);
         if (prompt_pos >= n_prompt) {
-            return 0;
+            return step_uncond_prompt(n_batch);
         }
         const int32_t n_tokens_batch = std::min(n_batch, n_prompt - prompt_pos);
         llama_batch batch_view = prompt_batch->get_view(prompt_pos, n_tokens_batch);
@@ -440,9 +477,68 @@ public:
             // prompt fully processed, its embedding buffer is no longer needed
             prompt_batch.reset();
             prompt_embd_buf.clear();
+            keep_outputs(-1, h_state_buf, logits_buf);
+            return n_uncond ? n_uncond : 0;
+        }
+        return n_prompt - prompt_pos + n_uncond;
+    }
+
+    // the unconditional lane's prompt, after the conditional one
+    int32_t step_uncond_prompt(int32_t n_batch) {
+        if (uncond_prompt_pos >= n_uncond) {
             return 0;
         }
-        return n_prompt - prompt_pos;
+        const int32_t count = std::min(n_batch, n_uncond - uncond_prompt_pos);
+        llama_batch view = uncond_batch->get_view(uncond_prompt_pos, count);
+        if (uncond_prompt_pos + count == n_uncond) {
+            view.logits[count - 1] = 1;
+        }
+        if (llama_decode(lctx, view) != 0) {
+            LOG_ERR("mtmd_helper_gen_audio: unconditional prompt decode failed\n");
+            return -1;
+        }
+        uncond_pos        += count;
+        uncond_prompt_pos += count;
+        if (uncond_prompt_pos < n_uncond) {
+            return n_uncond - uncond_prompt_pos;
+        }
+        uncond_batch.reset();
+        uncond_embd_buf.clear();
+        keep_outputs(-1, h_uncond, uncond_logits);
+        return 0;
+    }
+
+    // copies one output row's hidden state and logits
+    void keep_outputs(int32_t i, std::vector<float> & hidden, std::vector<float> & logits) {
+        const float * h = llama_get_embeddings_ith(lctx, i);
+        const float * l = llama_get_logits_ith(lctx, i);
+        if (h) {
+            hidden.assign(h, h + n_embd);
+        } else {
+            hidden.clear();
+        }
+        if (l) {
+            logits.assign(l, l + llama_vocab_n_tokens(vocab));
+        } else {
+            logits.clear();
+        }
+    }
+
+    const float * get_logits(int32_t * n_vocab) override {
+        *n_vocab = 0;
+        if (logits_buf.empty() || (n_uncond && uncond_logits.size() != logits_buf.size())) {
+            return nullptr;
+        }
+        if (n_uncond) {
+            mixed_logits.resize(logits_buf.size());
+            for (size_t i = 0; i < logits_buf.size(); ++i) {
+                mixed_logits[i] = uncond_logits[i] + cfg_scale * (logits_buf[i] - uncond_logits[i]);
+            }
+        } else {
+            mixed_logits = logits_buf;
+        }
+        *n_vocab = (int32_t) mixed_logits.size();
+        return mixed_logits.data();
     }
 
     int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) override {
@@ -461,7 +557,12 @@ public:
         mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
         inp.type  = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
         inp.code0 = sampled - codec_0;
-        inp.embd  = const_cast<float *>(h_state_in);
+        // after a continuous prompt the lanes' own hidden states drive the depth decoder
+        inp.embd  = const_cast<float *>(h_state_buf.size() == (size_t) n_embd ? h_state_buf.data() : h_state_in);
+        if (n_uncond) {
+            inp.uncond_embd = h_uncond.data();
+            inp.cfg_scale   = cfg_scale;
+        }
         inp.temp = code_temperature;
         inp.top_k = top_k;
         inp.top_p = top_p;
@@ -482,6 +583,29 @@ public:
         std::vector<float> fb(out.embd, out.embd + n_embd);
         for (int i = 0; i < n_embd; i++) fb[(size_t) i] += overlay[(size_t) i];
 
+        if (n_uncond) {
+            // the same frame feeds both lanes, each at its own position on its own sequence
+            fb.insert(fb.end(), fb.begin(), fb.end());
+            decode_embd_batch pair(fb.data(), 2, 1, n_embd);
+            llama_seq_id lanes[2] = { seq_id, uncond_seq };
+            for (int i = 0; i < 2; ++i) {
+                pair.batch.pos[i]      = i ? uncond_pos : pos;
+                pair.batch.n_seq_id[i] = 1;
+                pair.batch.seq_id[i]   = &lanes[i];
+                pair.batch.logits[i]   = 1;
+            }
+            pos++;
+            uncond_pos++;
+            if (llama_decode(lctx, pair.batch) != 0) {
+                LOG_ERR("mtmd_helper_gen_audio: decode failed\n");
+                return 1;
+            }
+            keep_outputs(0, h_state_buf, logits_buf);
+            keep_outputs(1, h_uncond, uncond_logits);
+            *h_state_out = h_state_buf.data();
+            return 0;
+        }
+
         const int n_pos_per_embd = mrope ? 4 : 1;
         decode_embd_batch batch_embd(fb.data(), 1, n_pos_per_embd, n_embd);
         if (mrope) batch_embd.set_position_mrope_1d(pos, seq_id);
@@ -494,8 +618,7 @@ public:
             return 1;
         }
 
-        const float * he = llama_get_embeddings_ith(lctx, -1);
-        h_state_buf.assign(he, he + n_embd);
+        keep_outputs(-1, h_state_buf, logits_buf);
         *h_state_out = h_state_buf.data();
 
         return 0;
@@ -653,6 +776,15 @@ private:
     std::vector<float>   audio_pcm;
     std::vector<float> overlay;
     std::vector<float> h_state_buf;
+    // Breeze guidance: the unconditional lane, and both lanes' last logits
+    std::vector<float> uncond_embd_buf;
+    std::unique_ptr<decode_embd_batch> uncond_batch;
+    int n_uncond = 0;
+    int uncond_prompt_pos = 0;
+    llama_seq_id uncond_seq = -1;
+    int uncond_pos = 0;
+    float cfg_scale = 1.0f;
+    std::vector<float> h_uncond, logits_buf, uncond_logits, mixed_logits;
     mtmd_helper_gen_audio_outtype out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
     std::vector<char> out_buf;
 };
@@ -1229,6 +1361,11 @@ int32_t mtmd_helper_gen_audio_step_gen(mtmd_helper_gen_audio * ctx, llama_token 
         *out_stop = stop;
     }
     return ret;
+}
+
+const float * mtmd_helper_gen_audio_get_logits(mtmd_helper_gen_audio * ctx, int32_t * n_vocab) {
+    *n_vocab = 0;
+    return ctx->pipeline ? ctx->pipeline->get_logits(n_vocab) : nullptr;
 }
 
 int32_t mtmd_helper_gen_audio_get_output(mtmd_helper_gen_audio * ctx, int32_t * out_sample_rate,

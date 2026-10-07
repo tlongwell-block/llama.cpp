@@ -103,6 +103,11 @@ brain_session::brain_session(const std::string & package, const frankie_options 
         if (!speculative) { throw std::runtime_error("MTP initialization failed"); }
     }
     llama_set_embeddings_layer_inp(ctx.get(), 17, true);
+    if (!options.delivery.empty() || brain_source.has_asset("assets.delivery.gguf")) {
+        // Brain-led delivery reads the final state of every spoken token.
+        final_layer = llama_model_n_layer(model.get());
+        llama_set_embeddings_layer_inp(ctx.get(), final_layer, true);
+    }
     auto vp                   = mtmd_context_params_default();
     vp.use_gpu                = options.use_gpu;
     vp.n_threads              = options.threads;
@@ -815,6 +820,8 @@ brain_session::response brain_session::generate(const request & request, const s
         drafted_tokens += draft.size();
         accepted_tokens += committed - 1;
         const float * rows = llama_get_embeddings_layer_inp(ctx.get(), 17);
+        const float * finals = final_layer < 0 ? nullptr : llama_get_embeddings_layer_inp(ctx.get(), final_layer);
+        const size_t width = finals ? llama_model_n_embd(model.get()) : 0;
         for (size_t j = 0; j < committed; ++j) {
             const llama_token token = j ? ids[j - 1] : pending;
             std::array<float, 5120> row;
@@ -837,6 +844,14 @@ brain_session::response brain_session::generate(const request & request, const s
                 // Reasoning never feeds the voice bridge. Retain only audible/answer rows.
                 result.raw.ends.push_back(result.raw.text.size());
                 result.raw.hidden.push_back(row);
+                if (finals) {
+                    const float * f = finals + j * width;
+                    if (!std::all_of(f, f + width, [](float v) { return std::isfinite(v); })) {
+                        throw std::runtime_error("nonfinite final state");
+                    }
+                    result.raw.width = width;
+                    result.raw.final.insert(result.raw.final.end(), f, f + width);
+                }
             }
             if (!result.message.content.empty() && (result.content_offset == std::string::npos ||
                 result.raw.text.compare(result.content_offset, result.message.content.size(), result.message.content) != 0)) {

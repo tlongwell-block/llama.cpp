@@ -1968,9 +1968,15 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
     if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
         const size_t n_embd = (size_t) clip_n_mmproj_embd(ctx_clip);
 
+        // with guidance, the conditional then the unconditional hidden state, one graph
+        const bool guided = inp->uncond_embd && inp->cfg_scale > 0.0f && inp->cfg_scale != 1.0f;
+        std::vector<float> lanes(inp->embd, inp->embd + n_embd);
+        if (guided) {
+            lanes.insert(lanes.end(), inp->uncond_embd, inp->uncond_embd + n_embd);
+        }
         clip_image_f32 hidden_state;
-        hidden_state.set_size({(int) n_embd, 1}, false, true);
-        hidden_state.cpy_buf(std::vector<float>(inp->embd, inp->embd + n_embd));
+        hidden_state.set_size({(int) lanes.size(), 1}, false, true);
+        hidden_state.cpy_buf(std::move(lanes));
 
         clip_image_f32_batch batch;
         batch.is_audio = true;
@@ -1993,6 +1999,7 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
         params.top_p         = inp->top_p;
         params.seed          = inp->seed;
         params.temp          = inp->temp;
+        params.cfg_scale     = guided ? inp->cfg_scale : 1.0f;
         params.out_is_eos    = &is_eos;
 
         if (!clip_encode(ctx_clip, &params)) {

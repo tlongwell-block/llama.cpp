@@ -28,7 +28,8 @@ class speech_stream {
     std::string committed;
 
     void consume() {
-        mouth.reset_speech_context();
+        // Frankie's newest speech carries over between replies (held speech); a failure starts over.
+        mouth.hold_speech();
         try {
             for (;;) {
                 brain_session::response phrase;
@@ -64,7 +65,7 @@ class speech_stream {
             failure = std::current_exception();
             changed.notify_all();
         }
-        mouth.reset_speech_context();
+        if (failure) { mouth.reset_speech_context(); } else { mouth.hold_speech(); }
     }
 
   public:

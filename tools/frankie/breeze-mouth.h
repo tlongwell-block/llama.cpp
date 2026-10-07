@@ -9,6 +9,7 @@ class breeze_mouth {
     std::unique_ptr<mtmd_backend> projection;
     std::vector<float> voice;
     std::vector<float> voice_eos;
+    int instruction_cut = -1;
 
     std::vector<float> project(const float * rows, size_t count) {
         ggml_context_ptr work(ggml_init({1024 * 1024, nullptr, true}));
@@ -129,6 +130,46 @@ class breeze_mouth {
         }
         const auto prompt = "[S0]<ins_bos>" + instruction + ".<ins_eos>" + text;
         return encode_text(prompt);
+    }
+
+    // Brain-led delivery's two lanes: the plain "[S0]text" (unconditional), and the same with
+    // learned instruction rows where an instruction's tokens would start (MTPLX _learned_prompt).
+    std::vector<float> unconditioned(const std::string & text) {
+        if (text.empty() || text.size() > 8192) { throw std::runtime_error("Breeze spoken text bounds"); }
+        return encode_text("[S0]" + text);
+    }
+
+    std::vector<float> learned(const std::vector<float> & plain, const std::vector<float> & rows) {
+        if (instruction_cut < 0) {
+            std::vector<llama_token> ids(32);
+            const auto * vocab = llama_model_get_vocab(model.get());
+            const std::string probe = "[S0]<ins_bos>x<ins_eos>", mark = "<ins_bos>";
+            const int count = llama_tokenize(vocab, probe.data(), probe.size(), ids.data(), ids.size(), true, true);
+            llama_token ins = LLAMA_TOKEN_NULL;
+            if (llama_tokenize(vocab, mark.data(), mark.size(), &ins, 1, false, true) != 1 || count <= 0) {
+                throw std::runtime_error("Breeze instruction marker");
+            }
+            const auto at = std::find(ids.begin(), ids.begin() + count, ins);
+            if (at == ids.begin() + count) { throw std::runtime_error("Breeze instruction marker"); }
+            instruction_cut = at - ids.begin();
+        }
+        const size_t cut = size_t(instruction_cut) * 2048;
+        if (rows.empty() || rows.size() % 2048 || plain.size() < cut) { throw std::runtime_error("Breeze learned prompt"); }
+        std::vector<float> out(plain.begin(), plain.begin() + cut);
+        out.insert(out.end(), rows.begin(), rows.end());
+        out.insert(out.end(), plain.begin() + cut, plain.end());
+        return out;
+    }
+
+    size_t prefix_rows() const { return voice.size() / 2048; }
+
+    // Breeze text tokens, as MTPLX counts them for a phrase's frame budget
+    size_t token_count(const std::string & text) const {
+        std::vector<llama_token> ids(text.size() + 16);
+        const int count = llama_tokenize(llama_model_get_vocab(model.get()), text.data(), text.size(),
+                                         ids.data(), ids.size(), true, true);
+        if (count <= 0 || count > 512) { throw std::runtime_error("Breeze spoken span token bounds"); }
+        return count;
     }
 
     bool supports_context() const { return voice_eos.size() == 2048; }

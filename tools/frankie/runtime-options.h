@@ -23,6 +23,7 @@ struct frankie_options {
     uint32_t max_output_audio_seconds = 300;
     uint32_t max_output_tokens = default_output_tokens;
     uint32_t speech_context_words = 100;
+    uint32_t speech_hold_words = 0; // Frankie's newest speech kept from one reply to the next (sliding context only)
     std::string cache_type = "q4_0";
     std::string thinking = "none";
     std::string http_thinking = "none";
@@ -30,6 +31,7 @@ struct frankie_options {
     float presence_penalty = 0.0f;
     std::string voice, voice_text, voice_codes;
     std::string expression;
+    std::string delivery; // brain-led delivery asset, overriding the package's
     std::string vap_model, bc_model, bc_detector;
     bool bc_detector_gpu = false;
     std::string ear_model, talker_model, mouth_model;
