@@ -121,6 +121,9 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// floats per row returned by llama_get_embeddings_layer_inp (n_embd, or the whole hyper-connection stream)
+LLAMA_API int32_t llama_model_n_embd_layer_inp(const struct llama_model * model);
+
 //
 // model/context data extraction
 //

@@ -35,6 +35,7 @@ struct frankie_options {
     std::string vap_model, bc_model, bc_detector;
     bool bc_detector_gpu = false;
     std::string ear_model, talker_model, mouth_model;
+    std::string brain_model; // a standalone brain GGUF, loaded instead of the package's brain (vision then off)
 
     uint32_t voice_context_tokens() const {
         return context_tokens - http_slots * http_context_tokens;

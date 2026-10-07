@@ -45,10 +45,18 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     auto mp         = llama_model_default_params();
     mp.n_gpu_layers = options.use_gpu ? 99 : 0;
     mp.load_mtp = options.mtp_tokens != 0;
-    model.reset(llama_model_init_from_user(brain_source.metadata(), component::set_tensor, &brain_source, mp));
+    if (options.brain_model.empty()) {
+        model.reset(llama_model_init_from_user(brain_source.metadata(), component::set_tensor, &brain_source, mp));
+    } else {
+        // A standalone brain maps from disk, so lazily read tables (the Flash n-gram rows) stay on disk.
+        model.reset(llama_model_load_from_file(options.brain_model.c_str(), mp));
+    }
     if (!model) {
         throw std::runtime_error("brain load failed");
     }
+    // The ear's rows are the 27B brain's width; any other brain hears the ear's transcript instead.
+    text_brain = llama_model_n_embd(model.get()) != 5120;
+    std::cerr << "Frankie brain interface=" << (text_brain ? "text" : "neural") << "\n";
     auto cp              = llama_context_default_params();
     cp.n_ctx             = options.context_tokens;
     cp.n_seq_max         = 1 + options.http_slots;
@@ -102,11 +110,16 @@ brain_session::brain_session(const std::string & package, const frankie_options 
         speculative.reset(common_speculative_init(sp, cp.n_seq_max));
         if (!speculative) { throw std::runtime_error("MTP initialization failed"); }
     }
-    llama_set_embeddings_layer_inp(ctx.get(), 17, true);
+    if (!text_brain) { llama_set_embeddings_layer_inp(ctx.get(), 17, true); }
     if (!options.delivery.empty() || brain_source.has_asset("assets.delivery.gguf")) {
         // Brain-led delivery reads the final state of every spoken token.
         final_layer = llama_model_n_layer(model.get());
         llama_set_embeddings_layer_inp(ctx.get(), final_layer, true);
+    }
+    templates = common_chat_templates_init(model.get(), "");
+    if (!options.brain_model.empty()) {
+        std::cerr << "Frankie vision off: the package projector belongs to the package brain\n";
+        return;
     }
     auto vp                   = mtmd_context_params_default();
     vp.use_gpu                = options.use_gpu;
@@ -119,7 +132,6 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     if (!vision || !mtmd_support_vision(vision.get())) {
         throw std::runtime_error("vision load failed");
     }
-    templates = common_chat_templates_init(model.get(), "");
 }
 
 std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, std::string * transcript) {
@@ -168,6 +180,7 @@ std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, s
 }
 
 brain_session::image_ptr brain_session::decode_image(const std::vector<unsigned char> & bytes) {
+    if (!vision) { throw std::runtime_error("image input unavailable: vision is off"); }
     int nx = 0, ny = 0, nc = 0;
     if (bytes.empty() || bytes.size() > 10 * 1024 * 1024 ||
         !stbi_info_from_memory(bytes.data(), bytes.size(), &nx, &ny, &nc) || nx <= 0 || ny <= 0 || nx > 4096 ||
@@ -185,6 +198,12 @@ brain_session::image_ptr brain_session::decode_image(const std::vector<unsigned 
         throw std::runtime_error("image decode failed");
     }
     return image;
+}
+
+const std::string & brain_session::heard(const request & input, const std::string & marker) {
+    const auto text = input.audio_text.find(marker);
+    if (text == input.audio_text.end()) { throw std::runtime_error("no transcript for audio marker"); }
+    return text->second;
 }
 
 void brain_session::decode_text(const std::string & text, int & pos, size_t & used) {
@@ -506,7 +525,9 @@ size_t brain_session::prompt_tokens(const request & request, const std::map<std:
         const auto audio = request.audio_rows.find(key);
         const auto pending = pending_audio.find(key);
         const auto image = request.images.find(key);
-        if (audio != request.audio_rows.end()) { used += audio->second.size() / 5120; }
+        if (audio != request.audio_rows.end()) {
+            if (text_brain) { count_text(heard(request, key)); } else { used += audio->second.size() / 5120; }
+        }
         else if (pending != pending_audio.end()) { used += pending->second; }
         else if (image != request.images.end()) {
             mtmd_input_part part{};
@@ -621,6 +642,11 @@ void brain_session::prefill(const request & request, const std::string & prompt,
         if (found == audio_rows.end()) {
             throw std::runtime_error("unknown audio marker");
         }
+        if (text_brain) {
+            decode_text(heard(request, key), pos, used);
+            offset = end + 1;
+            continue;
+        }
         const auto & rows = found->second;
         const size_t nf = key == stop_marker ? stop_rows : rows.size() / 5120;
         const size_t start = partial && key == partial_marker ? partial_rows.size() / 5120 : 0;
@@ -631,6 +657,7 @@ void brain_session::prefill(const request & request, const std::string & prompt,
 }
 
 void brain_session::precommit(const request & input, const std::string & marker, const std::vector<float> & rows, size_t count) {
+    if (text_brain) { return; }  // a transcript is not final until the turn is
     auto compute_lock = lock_compute();
     if (count == 0 || rows.size() % 5120 || count >= rows.size() / 5120 || count >= audio_row_limit()) {
         throw std::runtime_error("precommit row bounds");
@@ -819,15 +846,17 @@ brain_session::response brain_session::generate(const request & request, const s
         pos += committed;
         drafted_tokens += draft.size();
         accepted_tokens += committed - 1;
-        const float * rows = llama_get_embeddings_layer_inp(ctx.get(), 17);
+        const float * rows = text_brain ? nullptr : llama_get_embeddings_layer_inp(ctx.get(), 17);
         const float * finals = final_layer < 0 ? nullptr : llama_get_embeddings_layer_inp(ctx.get(), final_layer);
-        const size_t width = finals ? llama_model_n_embd(model.get()) : 0;
+        const size_t width = finals ? llama_model_n_embd_layer_inp(model.get()) : 0;
         for (size_t j = 0; j < committed; ++j) {
             const llama_token token = j ? ids[j - 1] : pending;
-            std::array<float, 5120> row;
-            std::copy_n(rows + j * row.size(), row.size(), row.begin());
-            for (float v : row) {
-                if (!std::isfinite(v)) { throw std::runtime_error("nonfinite hidden state"); }
+            std::array<float, 5120> row{};
+            if (rows) {
+                std::copy_n(rows + j * row.size(), row.size(), row.begin());
+                for (float v : row) {
+                    if (!std::isfinite(v)) { throw std::runtime_error("nonfinite hidden state"); }
+                }
             }
             result.raw.text += common_token_to_piece(vocab, token, true);
             ++generated_tokens;
@@ -843,7 +872,7 @@ brain_session::response brain_session::generate(const request & request, const s
                 }
                 // Reasoning never feeds the voice bridge. Retain only audible/answer rows.
                 result.raw.ends.push_back(result.raw.text.size());
-                result.raw.hidden.push_back(row);
+                if (rows) { result.raw.hidden.push_back(row); }
                 if (finals) {
                     const float * f = finals + j * width;
                     if (!std::all_of(f, f + width, [](float v) { return std::isfinite(v); })) {
@@ -916,7 +945,9 @@ void brain_session::report_memory() const {
     for (const auto & [device, bytes] : clip_get_mem_usage(encoder.get())) {
         std::cerr << "memory parakeet backend=" << ggml_backend_dev_name(device) << " bytes=" << bytes << "\n";
     }
-    for (const auto & [device, bytes] : mtmd_get_memory_usage(vision.get())) {
-        std::cerr << "memory vision backend=" << ggml_backend_dev_name(device) << " bytes=" << bytes << "\n";
+    if (vision) {
+        for (const auto & [device, bytes] : mtmd_get_memory_usage(vision.get())) {
+            std::cerr << "memory vision backend=" << ggml_backend_dev_name(device) << " bytes=" << bytes << "\n";
+        }
     }
 }

@@ -195,6 +195,7 @@ struct realtime_session {
         }
         refresh_last_item();
         request.audio_rows.erase("[FRANKIE_AUDIO_" + turn->input + "]");
+        request.audio_text.erase("[FRANKIE_AUDIO_" + turn->input + "]");
         send({{"type", "conversation.item.deleted"}, {"item_id", turn->input}});
         audio_messages.erase(id);
         audio.insert(audio.begin(), turn->capture.begin(), turn->capture.end());
@@ -451,6 +452,8 @@ struct realtime_session {
     }
 
     void precommit_audio() {
+        // A text brain waits for the whole transcript, so there are no rows to commit early.
+        if (brain.hears_text()) { return; }
         // Keep the reader/VAD independent of model work. At most one snapshot is in flight.
         if (pending_overlap || busy || input_busy.load() || !speaking || !unencoded.empty()) { return; }
         for (const auto & call : pending_calls) { if (!call.second) { return; } }
@@ -712,6 +715,9 @@ struct realtime_session {
             const auto & message = request.chat.messages[i];
             for (auto it = request.audio_rows.begin(); it != request.audio_rows.end();) {
                 if (message.content.find(it->first) != std::string::npos) { it = request.audio_rows.erase(it); } else { ++it; }
+            }
+            for (auto it = request.audio_text.begin(); it != request.audio_text.end();) {
+                if (message.content.find(it->first) != std::string::npos) { it = request.audio_text.erase(it); } else { ++it; }
             }
             for (auto it = unencoded.begin(); it != unencoded.end();) {
                 if (message.content.find(it->first) != std::string::npos) { it = unencoded.erase(it); } else { ++it; }
@@ -1174,6 +1180,7 @@ struct realtime_session {
                 if (input_published) { return; }
                 for (const auto & input : captured) {
                     request.audio_rows[input.first] = snapshot.audio_rows.at(input.first);
+                    request.audio_text[input.first] = snapshot.audio_text.at(input.first);
                     unencoded.erase(input.first);
                     const std::string prefix = "[FRANKIE_AUDIO_";
                     const auto user_id = input.first.substr(prefix.size(), input.first.size() - prefix.size() - 1);
@@ -1243,6 +1250,7 @@ struct realtime_session {
                     }
                     brain.finish_audio(snapshot, input.first, rows);
                     snapshot.audio_rows.emplace(input.first, std::move(rows));
+                    snapshot.audio_text.emplace(input.first, transcript);
                     transcripts.emplace(input.first, std::move(transcript));
                 }
                 if (turn && brain.prompt_tokens(snapshot, {}) + snapshot.generation_tokens() > brain.context_tokens()) {
@@ -1581,7 +1589,7 @@ int main(int argc, char ** argv) {
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
                          "  [--delivery GGUF] [--speech-hold-words N]\n"
                          "  [--vap-model GGUF] [--bc-model GGUF] [--bc-det-model GGUF] [--bc-det-device cpu|gpu]\n"
-                         "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF]\n"
+                         "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF] [--brain-model GGUF]\n"
                          "--ctx-size is the total KV pool (default 131072). HTTP slots default to an equal share.\n"
                          "--http-ctx-size is per HTTP slot; voice uses the remainder of the total pool.\n"
                          "WAV alone uses the native reference encoder. Breeze transcribes it with the packaged ear.\n"
@@ -1637,6 +1645,7 @@ int main(int argc, char ** argv) {
             else if (key == "--ear-model") { options.ear_model = value; }
             else if (key == "--talker-model") { options.talker_model = value; }
             else if (key == "--mouth-model") { options.mouth_model = value; }
+            else if (key == "--brain-model") { options.brain_model = value; }
             else if (key == "--side-scale") { options.side_scale = frankie_float(value); }
             else if (key == "--presence-penalty") { options.presence_penalty = frankie_float(value); }
             else { throw std::runtime_error("unknown option: " + key); }

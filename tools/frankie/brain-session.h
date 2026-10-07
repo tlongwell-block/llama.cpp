@@ -87,6 +87,7 @@ class brain_session {
     bool cache_valid = false;
     frankie_options options;
     int final_layer = -1;
+    bool text_brain = false;
     std::string partial_prefix, partial_marker;
     std::vector<float> partial_rows;
     int partial_pos = 0;
@@ -96,7 +97,10 @@ class brain_session {
                  const std::string & stop_marker, size_t stop_rows, const std::function<void(const char *)> & on_stage);
     void save_checkpoint(const std::string & prefix, int pos, size_t used);
     void                      decode_text(const std::string & text, int & pos, size_t & used);
+    static const std::string & heard(const request & input, const std::string & marker);
   public:
+    // A brain without the ear's 5120-wide rows (Flash) hears each audio turn as its transcript.
+    bool hears_text() const { return text_brain; }
     int64_t audio_lead_ms() const { return http_pending.load() ? 800 : 240; }
     size_t audio_row_limit() const { return (options.max_utterance_seconds * 1000 + 79) / 80 + 2; }
     size_t context_tokens() const { return options.voice_context_tokens(); }
@@ -151,6 +155,7 @@ class brain_session {
         }
         std::map<std::string, image_ptr>          images;
         std::map<std::string, std::vector<float>> audio_rows;
+        std::map<std::string, std::string>        audio_text;  // the ear's transcript per marker, for a text brain
     };
 
     struct response {

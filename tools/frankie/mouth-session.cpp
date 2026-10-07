@@ -290,7 +290,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         throw std::runtime_error("empty spoken response");
     }
     spoken = spoken.substr(begin, end - begin);
-    if (spoken.size() > 8192 || brain.hidden.size() != brain.ends.size()) {
+    if (spoken.size() > 8192 || (!brain.hidden.empty() && brain.hidden.size() != brain.ends.size())) {
         throw std::runtime_error("response shape/bounds");
     }
     size_t lead = response.content_offset == std::string::npos ? brain.text.find(spoken) : response.content_offset + begin;
@@ -300,9 +300,12 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
     const frankie_normalized_text normalized(spoken);
     std::array<float, 2048> speaker_offset{};
     int emotion = style ? style->emotion : -1;
+    // Brain-led delivery replaces the expression head: Breeze then hears learned rows, not an emotion prompt.
+    const bool guided = delivery && !style;
     if (expression && style && style->emotion >= 0) {
         speaker_offset = expression->direction(style->emotion);
-    } else if (expression && !style) {
+    } else if (expression && !style && !guided) {
+        if (brain.hidden.empty()) { throw std::runtime_error("the expression head needs layer-17 brain states"); }
         std::array<float, 5120> pooled{};
         size_t count = 0;
         const frankie_text_offsets offsets(brain.text);
@@ -326,7 +329,6 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
     std::vector<float> target, plain;
     size_t words = 0, breeze_tokens = 0;
     float guidance = 1.0f;
-    const bool guided = delivery && !style;
     if (breeze) {
         const auto text = frankie_spoken_numbers(normalized.text);
         const frankie_text_offsets offsets(text);
