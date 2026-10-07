@@ -255,9 +255,40 @@ The Qwen3-TTS path does not yet encode arbitrary WAVs into ICL codec IDs. WAV-on
 
 Breeze retains the acoustic backbone's evaluated text/audio KV rows between completed speech chunks in one response. Each continuation appends an end-of-speech row and the new text, then uses the existing depth decoder and streaming codec. Previous speech is neither re-encoded nor replayed. This is a runtime change; compatible GGUF weights and custom voice references work without conversion. Qwen3-TTS keeps its existing behavior.
 
-The default `--speech-context-words 100` bounds the retained speech history. Set it to `0` to disable reuse, or choose up to `1000` words. Before a chunk would exceed that word count or the existing 2048-row mouth context, the runtime starts again from the voice reference. It reserves room for the current chunk's maximum audio length. This refreshes whole chunks of history rather than shifting old KV rows. Completed history above 100,000,000 bytes of logical KV state is discarded. The native mouth reuses its fixed KV allocation, so enabling continuity does not allocate another cache; temporary inference buffers are separate from this retained-state limit.
+The default `--speech-context-words 100` bounds the retained speech history. Set it to `0` to disable reuse, or choose up to `1000` words. Before a chunk would exceed that word count, or the mouth's row limit (the smaller of 4096 rows and 384,000,000 bytes of logical KV state), the runtime evicts the oldest whole phrases from the cache and keeps the rest; positions keep increasing, so retained phrases are not re-evaluated. It reserves room for the current chunk's maximum audio length (`min(384, max(75, 12 * text tokens))` frames). An immediate end of speech is retried once from the reference.
 
-New responses, interruptions, errors and backchannels clear the history. Packages without the Breeze end-of-speech conditioning row use independent chunks. Breeze expands short integer text into English words before its text encoder; conversation transcripts and interruption offsets retain the brain's original text.
+`--speech-hold-words N` (default `0`, at most the context) keeps Frankie's newest whole phrases, up to N words, from one reply to the next so the next reply continues in the same voice. Asides run on a separate sequence and never disturb held speech. Frankie v9 uses `--speech-context-words 250 --speech-hold-words 40`.
+
+New sessions, interruptions, errors and backchannels clear the history; without held words, so do new responses. Packages without the Breeze end-of-speech conditioning row use independent chunks. Breeze expands short integer text into English words before its text encoder; conversation transcripts and interruption offsets retain the brain's original text.
+
+### Brain-led delivery (Frankie v9)
+
+With a delivery asset, the brain chooses how Breeze speaks each phrase. The brain's final state over the phrase is read against 16 feeling and 24 word directions with length calibration; an adapter turns the readings into weights over a bank of learned Breeze instruction rows and a guidance strength between 3 and 4. The weighted rows enter Breeze's prompt, and classifier-free guidance runs the conditioned and unconditioned prompts as two sequences in one batch, mixing every codebook's logits before sampling (repetition penalty 1.1 on the first codebook, top-k 50, temperature 0.9). A hold keeps a strong feeling across phrases and lets a new one override it, resetting the speech context. This replaces the expression head, which is skipped while delivery is active. It matches the MTPLX Frankie demo: on saved MTPLX phrase states the native reader reproduces every weight and strength exactly (27B 70/70, Flash 69/69).
+
+```sh
+# folder: directions.npz, words.npz, calib-{feelings,words}.npz, adapter.npz,
+# optional flash-scale.npz, rows/NAME.slot.safetensors
+python tools/frankie/convert-delivery.py /path/to/delivery-folder delivery.gguf
+python tools/frankie/pack.py --base frankie-breeze.gguf --delivery delivery.gguf --output frankie-v9.gguf
+# or override the package's asset at run time:
+build-frankie/bin/llama-frankie-realtime frankie-breeze.gguf 18793 --device gpu \
+  --delivery delivery.gguf --speech-context-words 250 --speech-hold-words 40
+```
+
+Each delivery asset is trained against one brain's final state; use the 27B asset with the 27B brain and the Flash asset with the Flash brain.
+
+### Flash brain (Frankie v9)
+
+The Flash variant pairs the Breeze mouth with the Qwen3.8-Flash-Next brain (`qwen4exp`: 48 layers, 512 experts, hyper-connections). Its MLX release has no BF16 copy, so `convert-flash-mlx.py` reads the MLX checkpoint directly. MLX 4-bit group-32 matrices become Q4_1 bit for bit (only the scale/offset width changes, BF16 to F16); 8-bit tensors are dequantized to F16; conv kernels are written as F32. The vision tower and the MTP head are not written. The output is about 115 GB, and conversion peaks around 13 GB of memory.
+
+```sh
+python tools/frankie/convert-flash-mlx.py /path/to/mlx/brain --outfile brain-flash-q4_1.gguf
+build-frankie/bin/llama-frankie-realtime frankie-breeze.gguf 18793 --device gpu \
+  --brain-model brain-flash-q4_1.gguf --delivery delivery-flash.gguf \
+  --speech-context-words 250 --speech-hold-words 40
+```
+
+`--brain-model` loads a standalone brain GGUF (memory-mapped) in place of the package's brain; the rest of the package is unchanged. A brain whose width is not the trained 5120 uses the text interface: user audio reaches it as the ear's Parakeet transcript, precommit is skipped, and no layer-17 rows feed the bridge. Vision is off, and image inputs are rejected. Delivery reads the final hyper-connection stream before the last mixer (10240 values per row). The complete Flash system maps about 115 GB; plan device memory for it alone.
 
 ## Quantization and package assembly
 
