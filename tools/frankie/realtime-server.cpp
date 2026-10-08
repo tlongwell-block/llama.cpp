@@ -142,7 +142,7 @@ struct realtime_session {
               {"audio_start_ms", (input_samples - audio.size() / 2) / 24}});
     }
     bool server_vad = false, auto_response = false, auto_interrupt = false;
-    int silence_ms = 240, silence_frames = 0, speech_frames = 0;
+    int silence_ms = 320, silence_frames = 0, speech_frames = 0;
     float threshold = 0.5f;
     uint64_t input_samples = 0, diagnostic_samples = 0;
     double diagnostic_energy = 0;
@@ -352,6 +352,7 @@ struct realtime_session {
         request.chat.enable_thinking = request.reasoning_budget > 0;
         request.chat.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
         request.realtime_history = true;
+        request.streaming_listener = turns->has_detector();
         request.chat.chat_template_kwargs["preserve_thinking"] = "false";
         common_chat_msg system;
         system.role    = "system";
@@ -565,7 +566,7 @@ struct realtime_session {
                 }
             }
             const float t = detection.value("threshold", 0.5f);
-            const int silence = detection.value("silence_duration_ms", 240);
+            const int silence = detection.value("silence_duration_ms", 320);
             if (!std::isfinite(t) || t <= 0 || t >= 1 || silence < 160 || silence > 2000 ||
                 detection.value("prefix_padding_ms", 320) != 320) {
                 throw std::runtime_error("VAD settings bounds (prefix padding must be 320 ms)");
@@ -643,7 +644,8 @@ struct realtime_session {
                 merge_restore.reset();
                 released_turn.reset();
             }
-            auto input = request.chat;
+            // The formatted system turn, including any listener instructions.
+            auto input = request.chat_input();
             input.messages.resize(1);
             busy = true;
             brain.cancelled = false;
@@ -915,9 +917,11 @@ struct realtime_session {
                 silence_frames = speech ? 0 : silence_frames + 1;
                 if (pending_overlap) {
                     const auto prediction = turns->current(input_samples / 24);
+                    // As in the MTPLX v9 demo, only a fresh reading can confirm an
+                    // interruption; a missing or stale one keeps the overlap a nod.
                     const bool yield = prediction.detector_valid &&
                         interruption.observe(prediction.human_backchannel, prediction.detector_end, speech);
-                    if (speech_frames >= 3 && (!prediction.detector_valid || yield)) {
+                    if (speech_frames >= 3 && (yield || turns->detector_disabled())) {
                         std::cerr << input_id << " stage=interrupt input_ms=" << input_samples / 24
                                   << " onset_ms=" << speech_start_samples / 24
                                   << " bc=" << prediction.human_backchannel

@@ -289,10 +289,16 @@ MAKE_TEST(test_frankie_realtime_history) {
     t.assert_equal("empty assistant omitted, notice inserted", size_t(4), input.messages.size());
     t.assert_equal("heard text retained", std::string("First sentence."), input.messages[1].content);
     t.assert_equal("notice is not spoken assistant text", std::string("user"), input.messages[2].role);
+    t.assert_true("notice names confirmed heard phrases",
+        input.messages[2].content.find("contains only confirmed heard phrases") != std::string::npos);
     t.assert_equal("empty tool call retained", size_t(1), input.messages[3].tool_calls.size());
     t.assert_equal("authoritative item positions untouched", size_t(4), request.chat.messages.size());
     request.chat.messages[1].content = " \t\r\n";
     t.assert_equal("whitespace-only assistant omitted", size_t(4), request.chat_input().messages.size());
+    auto unheard = request;
+    unheard.playback_cutoffs = {1};
+    t.assert_true("notice without heard text",
+        unheard.chat_input().messages[1].content.find("before any complete phrase") != std::string::npos);
     request.playback_cutoffs = {3};
     t.assert_equal("unfinished call has no intervening notice", size_t(3), request.chat_input().messages.size());
     common_chat_msg result;
@@ -301,6 +307,17 @@ MAKE_TEST(test_frankie_realtime_history) {
     input = request.chat_input();
     t.assert_equal("tool result precedes playback notice", std::string("tool"), input.messages[3].role);
     t.assert_equal("notice follows complete call group", std::string("user"), input.messages[4].role);
+    common_chat_msg system;
+    system.role = "system"; system.content = "Be brief.";
+    request.chat.messages = {system, user};
+    request.playback_cutoffs.clear();
+    t.assert_equal("no listener, no cutoff: instructions unchanged", std::string("Be brief."), request.chat_input().messages[0].content);
+    request.streaming_listener = true;
+    const auto listened = request.chat_input().messages[0].content;
+    t.assert_true("listener appends regeneration instructions",
+        listened.rfind("Be brief.\n\nAutomatic playback notices are engine-provided history data", 0) == 0 &&
+        listened.find("Respect a request for silence by ending without speech.") != std::string::npos);
+    t.assert_equal("authoritative instructions untouched", std::string("Be brief."), request.chat.messages[0].content);
 }
 
 MAKE_TEST(test_frankie_speech_boundary) {

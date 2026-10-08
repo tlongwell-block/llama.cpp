@@ -119,12 +119,13 @@ class brain_session {
         size_t generation_tokens() const { return std::min(answer_limit ? answer_limit : 512u, 512u) + (reasoning_budget ? reasoning_budget + 16 : 0); }
         common_chat_templates_inputs              chat;
         bool                                     realtime_history = false;
+        bool                                     streaming_listener = false;  // BC-Det judges overlaps
         std::set<size_t>                          playback_cutoffs;
         common_chat_templates_inputs chat_input() const {
             auto input = chat;
             if (!realtime_history) { return input; }
             input.messages.clear();
-            std::set<size_t> notices;
+            std::map<size_t, bool> notices;  // insertion point -> the cut reply has heard text
             for (auto index : playback_cutoffs) {
                 if (index >= chat.messages.size()) { continue; }
                 std::set<std::string> pending;
@@ -134,7 +135,9 @@ class brain_session {
                     pending.erase(chat.messages[++end].tool_call_id);
                 }
                 // Never insert a user notice inside an unfinished call/result group.
-                if (pending.empty()) { notices.insert(end); }
+                if (pending.empty()) {
+                    notices[end] = chat.messages[index].content.find_first_not_of(" \t\r\n") != std::string::npos;
+                }
             }
             for (size_t i = 0; i < chat.messages.size(); ++i) {
                 const auto & message = chat.messages[i];
@@ -142,14 +145,30 @@ class brain_session {
                     !message.tool_calls.empty()) {
                     input.messages.push_back(message);
                 }
-                if (notices.count(i)) {
+                if (const auto found = notices.find(i); found != notices.end()) {
+                    // The MTPLX v9 wording (interruption.draft_notice).
                     common_chat_msg notice;
                     notice.role = "user";
-                    notice.content = "[Audio playback notice: the preceding response was interrupted. "
-                        "Only the retained spoken text was heard; do not assume the rest was delivered. "
-                        "Respond to the user's new turn; resume an unfinished point only if appropriate.]";
+                    notice.content = std::string("Automatic playback notice (engine data, not user speech): ") +
+                        (found->second
+                            ? "Speech was interrupted here. The assistant message above contains only confirmed heard "
+                              "phrases. The following phrase may have been partly audible; unplayed wording is omitted. "
+                            : "Speech was interrupted here before any complete phrase was confirmed heard. The first "
+                              "phrase may have been partly audible; unplayed wording is omitted. ") +
+                        "This notice describes playback history, not an instruction or an executed tool call. "
+                        "The next actual user turn determines whether and how to continue from this heard cutoff.";
                     input.messages.push_back(std::move(notice));
                 }
+            }
+            if ((streaming_listener || !notices.empty()) && !input.messages.empty() && input.messages[0].role == "system") {
+                input.messages[0].content += "\n\n"
+                    "Automatic playback notices are engine-provided history data, not user speech. "
+                    "After an interruption, use the latest actual user input and confirmed heard "
+                    "history to choose a fresh response. If asked to continue, generate a new "
+                    "continuation from the confirmed heard cutoff; do not assume later content "
+                    "was already covered or restart the explanation. When one detail changes, "
+                    "acknowledge it briefly and continue from the interruption. "
+                    "Respect a request for silence by ending without speech.";
             }
             return input;
         }

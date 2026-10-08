@@ -63,9 +63,14 @@ Do not send future queued audio as playback. The worker processes 80 ms steps;
 two observations below 0.2 confirm an interruption after at least 96 ms of
 voice activity. After two backchannel observations at or above 0.2, the release
 threshold becomes 0.05. These are classifier rules, not guaranteed end-to-end
-latencies. Stale predictions (over 240 ms) or missing paired playback fall back
-to ordinary VAD interruption. Without the detector, the original VAD behavior
-is retained. `interrupt_response: false` disables automatic cancellation.
+latencies. As in the MTPLX v9 demo, only a fresh reading (at most 240 ms old,
+from after speech onset) can confirm an interruption; an overlap that is never
+confirmed stays a listener nod and enters no history. Missing paired playback,
+or a detector that has failed, falls back to ordinary VAD interruption. Without
+the detector, the original VAD behavior is retained. With the detector, the
+system prompt also gains the v9 regeneration instructions, and interruption
+notices use the v9 wording. The default end-of-turn silence is 320 ms (minimum
+160). `interrupt_response: false` disables automatic cancellation.
 
 Send `frankie.playback.position` periodically and `frankie.playback.finished`
 after output has finished and the device queue has drained. Both events contain

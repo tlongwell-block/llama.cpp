@@ -86,6 +86,10 @@ private:
             std::lock_guard<std::mutex> lock(mutex);
             return latest;
         }
+        bool disabled() {
+            std::lock_guard<std::mutex> lock(mutex);
+            return failed;
+        }
     };
     std::unique_ptr<stream> turn_stream, detector_stream;
     static std::unique_ptr<mtmd_turn> load(component & source, const std::string & path,
@@ -172,6 +176,8 @@ public:
     bool has_vap() const { return bool(turn) || bool(vap); }
     bool has_bc() const { return bool(turn) || bool(bc); }
     bool has_detector() const { return bool(detector); }
+    // A detector whose worker failed never reads again; callers fall back to VAD.
+    bool detector_disabled() const { return detector_stream && detector_stream->disabled(); }
     void append(const std::array<float, 512> & user, const std::array<float, 512> & system) {
         if (turn_stream) { turn_stream->append(user, system); }
         if (detector_stream) { detector_stream->append(user, system); }
