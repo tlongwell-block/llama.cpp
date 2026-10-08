@@ -41,7 +41,7 @@ def main():
     parser.add_argument('input', type=Path, help='generator_streaming.pth')
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
-    from audioseal import AudioSeal
+    from audioseal import AudioSeal  # type: ignore[import-not-found, ty:unresolved-import]
     model = AudioSeal.load_generator(str(args.input), nbits=16).eval().cpu()
     if model.frame_size != 320 or model.msg_processor is None or model.normalizer is not None:
         raise ValueError('Expected the 16-bit streaming generator with 320-sample frames and no normalizer')

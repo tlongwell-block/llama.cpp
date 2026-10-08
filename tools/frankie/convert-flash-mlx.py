@@ -23,7 +23,9 @@ import argparse
 import json
 import logging
 import sys
+from functools import partial
 from pathlib import Path
+from typing import Callable, cast
 
 import numpy as np
 import torch
@@ -210,24 +212,29 @@ class FlashMLXModel(Qwen4ExpTextModel):
         shape = w_shape[:-1] + [w_shape[-1] * 8]
         for new_name, idx in self.row_map(name, shape):
             self.verify_q4(base)
+            chunks: list[Callable[[], np.ndarray]]
             if idx is None:
                 n = shape[0]
                 step = max(1, (1 << 28) // int(np.prod(shape[1:])))   # ~256M weights per chunk
-                chunks = [lambda a=a, b=min(n, a + step): q4_1_blocks(
-                    self.ckpt.rows(f"{base}.weight", a, b), self.ckpt.rows(f"{base}.scales", a, b),
-                    self.ckpt.rows(f"{base}.biases", a, b)) for a in range(0, n, step)]
+                chunks = [partial(self.q4_rows, base, a, min(n, a + step)) for a in range(0, n, step)]
                 out_rows = n
             else:
-                chunks = [lambda idx=idx: q4_1_blocks(
-                    to_numpy(self.ckpt.get(f"{base}.weight"))[idx], to_numpy(self.ckpt.get(f"{base}.scales"))[idx],
-                    to_numpy(self.ckpt.get(f"{base}.biases"))[idx])]
+                chunks = [partial(self.q4_picked, base, idx)]
                 out_rows = len(idx)
             out_shape = [out_rows] + shape[1:]
             byte_shape = tuple(gguf.quant_shape_to_byte_shape(tuple(out_shape), Q4_1))
-            self.gguf_writer.add_tensor(new_name, gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8),
+            self.gguf_writer.add_tensor(new_name, cast(np.ndarray, gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)),
                                         raw_shape=byte_shape, raw_dtype=Q4_1)
             logger.info(f"{new_name:<40} MLX 4-bit --> Q4_1, shape = {{{', '.join(map(str, reversed(out_shape)))}}}"
                         + ("" if idx is None else " (rows reordered)"))
+
+    def q4_rows(self, base: str, a: int, b: int) -> np.ndarray:
+        return q4_1_blocks(self.ckpt.rows(f"{base}.weight", a, b), self.ckpt.rows(f"{base}.scales", a, b),
+                           self.ckpt.rows(f"{base}.biases", a, b))
+
+    def q4_picked(self, base: str, idx: np.ndarray) -> np.ndarray:
+        return q4_1_blocks(to_numpy(self.ckpt.get(f"{base}.weight"))[idx], to_numpy(self.ckpt.get(f"{base}.scales"))[idx],
+                           to_numpy(self.ckpt.get(f"{base}.biases"))[idx])
 
     def verify_q4(self, base: str):
         """The repack is exact up to bf16->f16 on d and m; prove it on the first rows."""
@@ -251,12 +258,10 @@ class FlashMLXModel(Qwen4ExpTextModel):
             raise ValueError(f"n-gram table is {meta}, only 4-bit group 32 is handled")
         self.verify_q4("ngram")
         step = 1 << 21
-        chunks = [lambda a=a, b=min(rows, a + step): q4_1_blocks(
-            self.ckpt.rows("ngram.weight", a, b), self.ckpt.rows("ngram.scales", a, b),
-            self.ckpt.rows("ngram.biases", a, b)) for a in range(0, rows, step)]
+        chunks: list[Callable[[], np.ndarray]] = [partial(self.q4_rows, "ngram", a, min(rows, a + step)) for a in range(0, rows, step)]
         byte_shape = tuple(gguf.quant_shape_to_byte_shape((rows, dim), Q4_1))
         name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD] + ".weight"
-        self.gguf_writer.add_tensor(name, gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8),
+        self.gguf_writer.add_tensor(name, cast(np.ndarray, gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)),
                                     raw_shape=byte_shape, raw_dtype=Q4_1)
         self.gguf_writer.add_embedding_length_per_layer_input(dim)
         logger.info(f"{name:<40} MLX 4-bit --> Q4_1, shape = {{{dim}, {rows}}}")
