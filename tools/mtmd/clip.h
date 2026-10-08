@@ -121,6 +121,7 @@ struct clip_encode_params {
     std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
     const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
     std::vector<uint8_t> *       state_out = nullptr; // state for the next call
+    bool reset_attention = false;                     // zero the tfm_* slots of state_in, keep the rest
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
 

@@ -2060,6 +2060,7 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
     params.out_audio   = &ctx->gen_out_audio;
     params.state_in    = inp->state_data ? &in_state : nullptr;
     params.state_out   = &ctx->gen_out_state;
+    params.reset_attention = inp->reset_attention;
 
     if (!clip_encode(ctx_clip, &params)) {
         LOG_ERR("%s: clip_encode failed (code2wav)\n", __func__);

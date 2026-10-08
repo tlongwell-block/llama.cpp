@@ -422,6 +422,7 @@ struct mtmd_gen_inp {
     size_t        n_feats;
     const char * state_data;
     size_t       state_size;
+    bool         reset_attention; // keep state_data's convolution history, start attention cold
 };
 
 struct mtmd_gen_out {

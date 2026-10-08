@@ -214,6 +214,7 @@ void mouth_session::reset_speech_context() {
     clear_speech_context();
     held.clear();
     reply_start = false;
+    codec_warm = false;
 }
 
 // Between replies: keep the newest whole phrases, at most speech_hold_words words, so the next
@@ -221,6 +222,7 @@ void mouth_session::reset_speech_context() {
 void mouth_session::hold_speech() {
     std::lock_guard<std::mutex> lock(execution);
     reply_start = true;
+    codec_warm = false; // the decoder starts every reply cold
     if (!options.speech_hold_words) {
         clear_speech_context();
         return;
@@ -512,6 +514,11 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         input.top_p         = 1.0f;
         input.seed          = 42;
         input.out_type      = MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM;
+        // Codec context (MTPLX "convolution"): a reply's phrases share the decoder's convolution state.
+        // Asides, retries and anything after an unfinished phrase decode cold.
+        input.continue_codec = breeze && !style && !attempt && codec_warm;
+        codec_warm = false; // set again only when this phrase finishes cleanly
+        if (options.codec_context && breeze && !style) { std::cerr << "Breeze codec: " << (input.continue_codec ? "continued" : "cold") << "\n"; }
         if (is_cancelled()) {
             throw std::runtime_error("cancelled");
         }
@@ -594,6 +601,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         throw std::runtime_error("mouth output bounds or unfinished");
     }
     if (rendered.size() != size_t(samples)) { throw std::runtime_error("incomplete rendered PCM"); }
+    codec_warm = options.codec_context && breeze && !style && stop && frames > 0 && frames < max_frames;
     if (seq == 2) {
         llama_memory_seq_rm(memory, 2, -1, -1);
     } else if (windowed) {

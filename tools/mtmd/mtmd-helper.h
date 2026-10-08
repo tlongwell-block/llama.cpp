@@ -251,6 +251,10 @@ struct mtmd_helper_gen_audio_inp {
     llama_seq_id  uncond_seq_id;
     llama_pos     uncond_n_past;
     float         cfg_scale;
+
+    // Breeze codec context: keep the previous phrase's decoder convolution state (attention
+    // restarts), instead of decoding this phrase from a cold decoder.
+    bool continue_codec;
 };
 
 MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(

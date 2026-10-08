@@ -1587,7 +1587,7 @@ int main(int argc, char ** argv) {
                          "  [--max-utterance-seconds N] [--max-output-audio-seconds N] [--max-output-tokens N|inf]\n"
                          "  [--voice WAV] [--voice-text-file TXT --voice-codes I32]\n"
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
-                         "  [--delivery GGUF] [--speech-hold-words N]\n"
+                         "  [--delivery GGUF] [--speech-hold-words N] [--codec-context off|convolution]\n"
                          "  [--vap-model GGUF] [--bc-model GGUF] [--bc-det-model GGUF] [--bc-det-device cpu|gpu]\n"
                          "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF] [--brain-model GGUF]\n"
                          "--ctx-size is the total KV pool (default 131072). HTTP slots default to an equal share.\n"
@@ -1616,6 +1616,10 @@ int main(int argc, char ** argv) {
             else if (key == "--expression") { options.expression = value; }
             else if (key == "--delivery") { options.delivery = value; }
             else if (key == "--speech-hold-words") { options.speech_hold_words = frankie_unsigned(value); }
+            else if (key == "--codec-context") {
+                if (value != "off" && value != "convolution") { throw std::runtime_error("codec context must be off or convolution"); }
+                options.codec_context = value == "convolution";
+            }
             else if (key == "--vap-model") { options.vap_model = value; }
             else if (key == "--bc-model") { options.bc_model = value; }
             else if (key == "--bc-det-model") { options.bc_detector = value; }

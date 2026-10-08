@@ -259,6 +259,8 @@ The default `--speech-context-words 100` bounds the retained speech history. Set
 
 `--speech-hold-words N` (default `0`, at most the context) keeps Frankie's newest whole phrases, up to N words, from one reply to the next so the next reply continues in the same voice. Asides run on a separate sequence and never disturb held speech. Frankie v9 uses `--speech-context-words 250 --speech-hold-words 40`.
 
+`--codec-context convolution` (default `off`) lets a reply's phrases share the Breeze decoder's convolution history, so each phrase picks up where the last one's waveform ended. The decoder's attention still starts cold at every phrase, and every reply, retry and aside starts fully cold, as do phrases after one that did not finish. This is MTPLX's `MTPLX_FRANKIE_CODEC_CONTEXT=convolution`; against MLX code2wav the native decoder matches at 58 to 64 dB SNR in both modes.
+
 New sessions, interruptions, errors and backchannels clear the history; without held words, so do new responses. Packages without the Breeze end-of-speech conditioning row use independent chunks. Breeze expands short integer text into English words before its text encoder; conversation transcripts and interruption offsets retain the brain's original text.
 
 ### Brain-led delivery (Frankie v9)

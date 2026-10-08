@@ -4592,13 +4592,16 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
     };
 
-    // upload the decoder state from the previous call, or zero-fill on a cold start
+    // upload the decoder state from the previous call, or zero-fill on a cold start.
+    // reset_attention zero-fills only the transformer slots: tfm_pos 0 masks every cached key
+    // and restarts RoPE, while the convolution histories carry on.
     auto set_gen_state_in = [&]() {
         size_t offset = 0;
         for (const auto & slot : list_gen_state_slots(hparams, model)) {
             ggml_tensor * t = get_inp_tensor(("state_in_" + slot.name).c_str());
             const size_t nb = ggml_nbytes(t);
-            if (params->state_in && params->state_in->size() >= offset + nb) {
+            const bool attention = slot.name.rfind("tfm_", 0) == 0;
+            if (params->state_in && params->state_in->size() >= offset + nb && !(params->reset_attention && attention)) {
                 ggml_backend_tensor_set(t, params->state_in->data() + offset, 0, nb);
             } else {
                 std::vector<uint8_t> zeros(nb, 0);

@@ -41,6 +41,8 @@ class mouth_session {
     std::unique_ptr<frankie_delivery> delivery;
     frankie_hold held;
     bool reply_start = false;
+    // Codec context: the last phrase of this reply finished cleanly, so the next one may continue its decoder
+    bool codec_warm = false;
     std::mt19937 rng{1900};
     void clear_speech_context();
     void evict_oldest_phrase();

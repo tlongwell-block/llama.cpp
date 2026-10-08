@@ -198,12 +198,15 @@ public:
         h_uncond.clear();
         logits_buf.clear();
         uncond_logits.clear();
+        attention_cold = false;
     }
 
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
+        std::vector<uint8_t> codec = std::move(c2w_state);
         reset();
         seq_id = inp->seq_id;
         const bool breeze = info.model_variant && std::string(info.model_variant) == "breeze";
+        if (inp->continue_codec && !breeze) { return 1; }
         // Breeze's sliding speech window keeps RoPE positions increasing past evicted rows
         if (inp->n_past < 0 || (!breeze && inp->n_past) || inp->n_past > (1 << 30)) { return 1; }
         pos = inp->n_past;
@@ -243,6 +246,12 @@ public:
             codec_0 = 0;
             codec_eos = 2051;
             overlay.assign(n_embd, 0.0f);
+            if (inp->continue_codec && !codec.empty()) {
+                // Codec context: the decoder's convolutions continue from the previous phrase,
+                // its attention starts over (MTPLX CodecContext "convolution").
+                c2w_state = std::move(codec);
+                attention_cold = true;
+            }
             return prepare_prompt(inp);
         }
         if (!inp->prompt || inp->prompt_len > 131072 || inp->ref_text_len > 131072 ||
@@ -723,6 +732,7 @@ private:
         inp.seed       = seed; // same seed as gen_code, else clip reseeds mid-generation
         inp.state_data = c2w_state.empty() ? nullptr : (const char *) c2w_state.data();
         inp.state_size = c2w_state.size();
+        inp.reset_attention = attention_cold;
         mtmd_gen_out out{};
         if (mtmd_gen_audio_process(mctx, &inp, &out) != 0) {
             LOG_ERR("mtmd_helper_gen_audio: gen_wav process failed\n");
@@ -730,6 +740,7 @@ private:
         }
         audio_pcm.insert(audio_pcm.end(), out.audio, out.audio + out.n_samples);
         c2w_state.assign(out.state_data, out.state_data + out.state_size);
+        attention_cold = false;
         codes_buf.clear();
         return true;
     }
@@ -773,6 +784,7 @@ private:
     uint32_t seed  = UINT32_MAX;
     std::vector<int32_t> codes_buf;
     std::vector<uint8_t> c2w_state;
+    bool attention_cold = false; // the next GEN_WAV keeps c2w_state's convolutions only
     std::vector<float>   audio_pcm;
     std::vector<float> overlay;
     std::vector<float> h_state_buf;

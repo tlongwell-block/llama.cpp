@@ -24,6 +24,7 @@ struct frankie_options {
     uint32_t max_output_tokens = default_output_tokens;
     uint32_t speech_context_words = 100;
     uint32_t speech_hold_words = 0; // Frankie's newest speech kept from one reply to the next (sliding context only)
+    bool codec_context = false; // Breeze: the decoder's convolutions continue from phrase to phrase within a reply
     std::string cache_type = "q4_0";
     std::string thinking = "none";
     std::string http_thinking = "none";
