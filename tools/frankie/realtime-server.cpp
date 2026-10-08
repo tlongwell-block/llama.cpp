@@ -7,6 +7,7 @@
 #include "cpp-httplib/httplib.h"
 #include "mouth-session.h"
 #include "speech-stream.h"
+#include "watermark.h"
 #include "mtmd-vad.h"
 #include "turn-session.h"
 #include "nlohmann/json.hpp"
@@ -33,6 +34,7 @@ struct realtime_session {
     static constexpr size_t max_item_ids = 65536;
     brain_session &             brain;
     mouth_session &             mouth;
+    frankie_watermark *         watermark; // AudioSeal on every response's speech; null when off
     httplib::ws::WebSocket &    socket;
     brain_session::request      request;
     uint32_t max_utterance_seconds, max_output_audio_seconds;
@@ -331,8 +333,9 @@ struct realtime_session {
         });
     }
 
-    realtime_session(brain_session & b, mouth_session & m, httplib::ws::WebSocket & s, const std::string & package, const frankie_options & options) :
-        brain(b), mouth(m), socket(s), max_utterance_seconds(options.max_utterance_seconds),
+    realtime_session(brain_session & b, mouth_session & m, frankie_watermark * w, httplib::ws::WebSocket & s, const std::string & package,
+                     const frankie_options & options) :
+        brain(b), mouth(m), watermark(w), socket(s), max_utterance_seconds(options.max_utterance_seconds),
         max_output_audio_seconds(options.max_output_audio_seconds), vad_source(package, "vad") {
         mouth.reset_speech_context();  // a new session starts from the voice reference
         ggml_context * raw = nullptr;
@@ -360,7 +363,7 @@ struct realtime_session {
         request.chat.messages.push_back(system);
         config = {
             {"max_output_tokens", options.max_output_tokens ? json(options.max_output_tokens) : json("inf")},
-            { "frankie", {{"duplex_audio", true}, {"vap", turns->has_vap()}, {"backchannels", turns->has_bc()}, {"human_backchannels", turns->has_detector()}, {"playback_feedback", true}, {"max_output_audio_samples", uint64_t(max_output_audio_seconds) * 24000}} },
+            { "frankie", {{"duplex_audio", true}, {"vap", turns->has_vap()}, {"backchannels", turns->has_bc()}, {"human_backchannels", turns->has_detector()}, {"playback_feedback", true}, {"watermark", watermark ? "audioseal-residual16" : "off"}, {"max_output_audio_samples", uint64_t(max_output_audio_seconds) * 24000}} },
             { "id",                "session_local"                                                             },
             { "type",              "realtime"                                                                  },
             { "model",             "frankie"                                                                   },
@@ -1277,7 +1280,8 @@ struct realtime_session {
                 const auto inference_start = std::chrono::steady_clock::now();
                 auto elapsed_ms = [&] { return std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - inference_start).count(); };
-                auto emit_audio = [&](const float * samples, size_t count) {
+                auto emit_pcm = [&](const float * samples, size_t count) {
+                    if (!count) { return; }
                     await_authorization(turn);
                     if (!audio_clock) { audio_clock = std::chrono::steady_clock::now(); }
                     const auto due = *audio_clock + std::chrono::milliseconds(std::max(int64_t(0), int64_t(scheduled_samples / 24) - brain.audio_lead_ms()));
@@ -1324,6 +1328,19 @@ struct realtime_session {
                     scheduled_samples += count;
                     send(delta);
                 };
+                // As in the v9 demo: one causal watermark stream per response, after the
+                // final mouth PCM and before PCM16. Phrase marks keep source positions,
+                // which the sample-conserving stream maps one to one onto output.
+                std::optional<frankie_watermark::stream> marking;
+                if (watermark && audio_output) { marking.emplace(*watermark); }
+                uint64_t speech_samples = 0;
+                auto emit_audio = [&](const float * samples, size_t count) {
+                    speech_samples += count;
+                    if (!marking) { return emit_pcm(samples, count); }
+                    if (brain.cancelled.load()) { throw std::runtime_error("cancelled"); }
+                    const auto marked = marking->push(samples, count);
+                    emit_pcm(marked.data(), marked.size());
+                };
                 const bool pipelined = audio_output;
                 std::unique_ptr<speech_stream> speech;
                 if (pipelined) {
@@ -1331,7 +1348,7 @@ struct realtime_session {
                         std::lock_guard<std::mutex> guard(state);
                         auto & phrases = phrase_history[item_id];
                         if (phrases.size() >= 512) { throw std::runtime_error("phrase history limit"); }
-                        phrases.push_back({emitted_samples.at(item_id), text});
+                        phrases.push_back({speech_samples, text});
                     });
                 }
                 auto result = brain.generate(snapshot, speech ? brain_session::stream_callback([&](const auto & part, bool last) {
@@ -1343,6 +1360,11 @@ struct realtime_session {
                 }
                 if (speech) {
                     speech->finish();
+                }
+                if (marking) {
+                    if (brain.cancelled.load()) { throw std::runtime_error("cancelled"); }
+                    const auto tail = marking->finish();
+                    emit_pcm(tail.data(), tail.size());
                 }
                 await_authorization(turn);
                 std::unique_lock<std::mutex> lock(state);
@@ -1591,7 +1613,7 @@ int main(int argc, char ** argv) {
                          "  [--max-utterance-seconds N] [--max-output-audio-seconds N] [--max-output-tokens N|inf]\n"
                          "  [--voice WAV] [--voice-text-file TXT --voice-codes I32]\n"
                          "  [--side-scale N] [--presence-penalty N] [--expression GGUF]\n"
-                         "  [--delivery GGUF] [--speech-hold-words N] [--codec-context off|convolution]\n"
+                         "  [--delivery GGUF] [--speech-hold-words N] [--codec-context off|convolution] [--watermark GGUF]\n"
                          "  [--vap-model GGUF] [--bc-model GGUF] [--bc-det-model GGUF] [--bc-det-device cpu|gpu]\n"
                          "  [--ear-model GGUF] [--talker-model GGUF] [--mouth-model GGUF] [--brain-model GGUF]\n"
                          "--ctx-size is the total KV pool (default 131072). HTTP slots default to an equal share.\n"
@@ -1619,6 +1641,7 @@ int main(int argc, char ** argv) {
             else if (key == "--voice-codes") { options.voice_codes = value; }
             else if (key == "--expression") { options.expression = value; }
             else if (key == "--delivery") { options.delivery = value; }
+            else if (key == "--watermark") { options.watermark = value; }
             else if (key == "--speech-hold-words") { options.speech_hold_words = frankie_unsigned(value); }
             else if (key == "--codec-context") {
                 if (value != "off" && value != "convolution") { throw std::runtime_error("codec context must be off or convolution"); }
@@ -1695,6 +1718,11 @@ int main(int argc, char ** argv) {
         });
         mouth.warmup();
         mouth.report_memory();
+        std::unique_ptr<frankie_watermark> watermark;
+        if (!options.watermark.empty()) {
+            watermark = std::make_unique<frankie_watermark>(options.watermark);
+            std::cerr << "AudioSeal watermark: residual16, payload 0x" << std::hex << frankie_watermark_payload << std::dec << "\n";
+        }
         httplib::Server   server;
         frankie_completions completions(brain, server, options.http_slots);
         std::atomic<bool> occupied{ false };
@@ -1708,7 +1736,7 @@ int main(int argc, char ** argv) {
                 return;
             }
             try {
-                realtime_session session(brain, mouth, socket, argv[1], options);
+                realtime_session session(brain, mouth, watermark.get(), socket, argv[1], options);
                 session.run();
             } catch (const std::exception & e) {
                 std::cerr << "session closed: " << e.what() << "\n";

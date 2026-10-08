@@ -297,6 +297,17 @@ build-frankie/bin/llama-frankie-realtime frankie-breeze.gguf 18793 --device gpu 
 
 `--brain-model` loads a standalone brain GGUF (memory-mapped) in place of the package's brain; the rest of the package is unchanged. A brain whose width is not the trained 5120 uses the text interface: user audio reaches it as the ear's Parakeet transcript, precommit is skipped, and no layer-17 rows feed the bridge. Vision is off, and image inputs are rejected. Delivery reads the final hyper-connection stream before the last mixer (10240 values per row). The complete Flash system maps about 115 GB; plan device memory for it alone.
 
+### AudioSeal watermark (Frankie v9)
+
+`--watermark GGUF` passes every response's speech through AudioSeal's streaming 16-bit generator before PCM16 serialization, carrying the fixed public experiment tag `0xF601` (never an account, user or voice identifier). It matches the v9 demo's `residual16` path: a causal copy of the 24 kHz speech is resampled to 16 kHz and watermarked, and only the learned residual is resampled back and added to the original samples (a 30-sample, 1.25 ms alignment hold). Each response gets a new stream. Normal completion conserves every sample, and cancellation drops the held tail, so unmarked audio never goes out around the filter. As in the demo, backchannel asides are not watermarked. The generator runs on the CPU at about 2 ms per 20 ms frame, and the session's `frankie.watermark` capability reports `audioseal-residual16` or `off`.
+
+```sh
+python tools/frankie/convert-watermark.py generator_streaming.pth audioseal-wm16.gguf
+build-frankie/bin/llama-frankie-realtime frankie-breeze.gguf 18793 --watermark audioseal-wm16.gguf
+```
+
+Against the PyTorch reference the native generator and the full residual path both match at about 111 dB SNR. AudioSeal's streaming detector reads the payload from the output; `MTMD_WATERMARK_FIXTURE=DIR build/bin/test-mtmd-impl test_watermark_reference` checks a saved reference.
+
 ## Quantization and package assembly
 
 Each component can use the quantization supported by its existing converter and runtime. For example, a Q4 brain can be packaged with Q8_0 Parakeet, voice and vision matrices. Spatial convolutions, normalization and other unsupported or sensitive tensors retain their original types. Q8 describes the quantized matrices, not every tensor in the file; retain the package manifest to identify the exact types.

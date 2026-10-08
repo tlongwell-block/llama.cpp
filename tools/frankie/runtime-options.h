@@ -33,6 +33,7 @@ struct frankie_options {
     std::string voice, voice_text, voice_codes;
     std::string expression;
     std::string delivery; // brain-led delivery asset, overriding the package's
+    std::string watermark; // AudioSeal streaming generator (convert-watermark.py); empty = off
     std::string vap_model, bc_model, bc_detector;
     bool bc_detector_gpu = false;
     std::string ear_model, talker_model, mouth_model;

@@ -15,6 +15,7 @@ find_package(Threads REQUIRED)
 add_library(mtmd
             mtmd.cpp
             mtmd-turn.cpp
+            mtmd-watermark.cpp
             mtmd-vad.cpp
             mtmd-side.cpp
             mtmd-ear.cpp

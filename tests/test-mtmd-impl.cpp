@@ -12,6 +12,7 @@ namespace httplib::detail {
 #include "../tools/frankie/turn-session.h"
 #include "../tools/frankie/token-boundary.h"
 #include "../tools/frankie/image-input.h"
+#include "../tools/frankie/watermark.h"
 #include "llama-cpp.h"
 #endif
 
@@ -19,11 +20,14 @@ namespace httplib::detail {
 #include "mtmd-vad.h"
 #include "mtmd-side.h"
 #include "mtmd-turn.h"
+#include "mtmd-watermark.h"
 #include "mtmd-ear.h"
 #include "mtmd-audio.h"
 #include "clip-impl.h"
 #include "gguf.h"
 #include "mtmd-helper.h"
+#include <chrono>
+#include <cstring>
 #include <fstream>
 #include <cstdlib>
 #include <cmath>
@@ -962,6 +966,116 @@ MAKE_TEST(test_qwen3tts_icl_body) {
     std::cout << "ICL body rows=" << out.size() / 2048 << " F32 max_abs_error=" << worst
               << " BF16 rounded max_abs_error=" << rounded_worst << "\n";
 }
+
+#ifdef LLAMA_TEST_FRANKIE
+static std::vector<char> read_fixture_bytes(const std::string & path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) { throw std::runtime_error("missing fixture: " + path); }
+    std::vector<char> bytes(size_t(file.tellg()));
+    file.seekg(0);
+    file.read(bytes.data(), bytes.size());
+    return bytes;
+}
+
+template <typename T> static std::vector<T> read_fixture(const std::string & path) {
+    const auto bytes = read_fixture_bytes(path);
+    std::vector<T> values(bytes.size() / sizeof(T));
+    std::memcpy(values.data(), bytes.data(), values.size() * sizeof(T));
+    return values;
+}
+
+// Signal-to-error ratio of the added watermark: how closely native reproduces the reference's residual.
+static double watermark_snr(const std::vector<float> & base, const std::vector<float> & expected, const std::vector<float> & actual) {
+    double signal = 0, error = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        signal += double(expected[i] - base[i]) * double(expected[i] - base[i]);
+        error += double(actual[i] - expected[i]) * double(actual[i] - expected[i]);
+    }
+    return 10 * std::log10(signal / std::max(error, 1e-30));
+}
+
+MAKE_TEST(test_watermark_reference) {
+    const char * root = std::getenv("MTMD_WATERMARK_FIXTURE");
+    if (!root) { std::cout << "SKIP AudioSeal parity: set MTMD_WATERMARK_FIXTURE\n"; return; }
+    const std::string dir(root);
+    frankie_watermark owner(dir + "/audioseal-wm16.gguf");
+    const auto input = read_fixture<float>(dir + "/input.f32");
+    const auto expected = read_fixture<float>(dir + "/output.f32");
+    const auto marked16 = read_fixture<float>(dir + "/marked16.f32");
+    const auto fir = read_fixture<double>(dir + "/fir.f64");
+    auto low = read_fixture<float>(dir + "/low.f32");
+    low.resize(marked16.size());  // the fixture also logs the final pending frame twice
+
+    // The FIR design matches scipy.signal.firwin.
+    frankie_causal_resampler resampler(2, 3);
+    double fir_error = 0;
+    for (size_t i = 0; i < fir.size(); ++i) { fir_error = std::max(fir_error, std::abs(fir[i] - resampler.filter()[i])); }
+    t.assert_true("FIR taps match firwin", fir.size() == 61 && fir_error < 1e-15);
+
+    // The 16 kHz generator alone, frame by frame, against the reference model's output.
+    auto generate = [&](uint16_t payload) {
+        auto ggml = load_component_fixture(dir + "/audioseal-wm16.gguf");
+        mtmd_watermark model(ggml.get(), false);
+        const auto message = model.message(payload);
+        auto state = model.initial_state();
+        std::vector<float> out(low.size()), frame(mtmd_watermark::frame);
+        for (size_t i = 0; i < low.size(); i += mtmd_watermark::frame) {
+            const size_t n = std::min<size_t>(mtmd_watermark::frame, low.size() - i);
+            std::fill(frame.begin(), frame.end(), 0.0f);
+            std::copy(low.begin() + i, low.begin() + i + n, frame.begin());
+            model.process(state, message, frame.data(), frame.data());
+            std::copy(frame.begin(), frame.begin() + n, out.begin() + i);
+        }
+        return out;
+    };
+    const auto start = std::chrono::steady_clock::now();
+    const auto native16 = generate(frankie_watermark_payload);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const double generator_snr = watermark_snr(low, marked16, native16);
+    const double wrong_snr = watermark_snr(low, marked16, generate(0x0000));
+    std::cout << "audioseal frames=" << (low.size() + 319) / 320 << " ms_per_frame=" << ms / ((low.size() + 319) / 320)
+              << " generator_snr_db=" << generator_snr << " wrong_payload_snr_db=" << wrong_snr << "\n";
+    t.assert_true("generator parity", generator_snr > 60);
+    t.assert_true("wrong payload is caught", wrong_snr < 20);
+
+    // The whole residual stream on 24 kHz speech, in the reference's 1920-sample chunks
+    // and in irregular ones: same output, same sample count.
+    auto run = [&](const std::vector<size_t> & sizes) {
+        frankie_watermark::stream stream(owner);
+        std::vector<float> out;
+        size_t i = 0, k = 0;
+        while (i < input.size()) {
+            const size_t n = std::min(sizes[k++ % sizes.size()], input.size() - i);
+            const auto y = stream.push(input.data() + i, n);
+            out.insert(out.end(), y.begin(), y.end());
+            t.assert_true("output never leads input", stream.output_samples() <= stream.input_samples());
+            i += n;
+        }
+        const auto tail = stream.finish();
+        out.insert(out.end(), tail.begin(), tail.end());
+        return out;
+    };
+    const auto native = run({1920});
+    t.assert_equal("residual conserves samples", input.size(), native.size());
+    const double residual_snr = watermark_snr(input, expected, native);
+    std::cout << "audioseal residual samples=" << native.size() << " residual_snr_db=" << residual_snr << "\n";
+    t.assert_true("residual parity", residual_snr > 60);
+    const auto irregular = run({1, 319, 1921, 7, 480, 4096});
+    t.assert_true("chunking invariant", irregular == native);
+    if (const char * dump = std::getenv("MTMD_WATERMARK_DUMP")) {
+        std::ofstream(dump, std::ios::binary).write(reinterpret_cast<const char *>(native.data()), native.size() * sizeof(float));
+    }
+
+    // Cancellation is destruction: a fresh stream starts from zero history.
+    { frankie_watermark::stream abandoned(owner); abandoned.push(input.data(), 5000); }
+    t.assert_true("fresh stream after abandon", run({1920}) == native);
+    frankie_watermark::stream closed(owner);
+    closed.finish();
+    bool rejected = false;
+    try { closed.push(input.data(), 1); } catch (const std::runtime_error &) { rejected = true; }
+    t.assert_true("finished stream rejects audio", rejected);
+}
+#endif
 
 //
 // main
