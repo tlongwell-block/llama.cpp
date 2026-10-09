@@ -1605,7 +1605,7 @@ int main(int argc, char ** argv) {
     try {
         if (argc < 3 || std::strcmp(argv[1], "--help") == 0) {
             std::cerr << "Usage: llama-frankie-realtime PACKAGE PORT [--device cpu|gpu] [--threads N]\n"
-                         "  [--text-encoder-device cpu|gpu]\n"
+                         "  [--text-encoder-device cpu|gpu] [--vision-device cpu|gpu]\n"
                          "  [--ctx-size N] [--cache-type q4_0|q8_0|f16] [--batch-size N] [--ubatch-size N]\n"
                          "  [--thinking none|minimal|low|medium|high|xhigh|max] [--speech-context-words N]\n"
                          "  [--http-thinking none|minimal|low|medium|high|xhigh|max]\n"
@@ -1634,6 +1634,9 @@ int main(int argc, char ** argv) {
             } else if (key == "--text-encoder-device") {
                 if (value != "cpu" && value != "gpu") { throw std::runtime_error("text encoder device must be cpu or gpu"); }
                 options.text_encoder_gpu = value == "gpu";
+            } else if (key == "--vision-device") {
+                if (value != "cpu" && value != "gpu") { throw std::runtime_error("vision device must be cpu or gpu"); }
+                options.vision_gpu = value == "gpu";
             } else if (key == "--threads") { options.threads = int(frankie_unsigned(value)); }
             else if (key == "--host") { host = value; }
             else if (key == "--voice") { options.voice = value; }

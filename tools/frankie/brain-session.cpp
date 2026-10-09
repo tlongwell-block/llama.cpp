@@ -122,7 +122,7 @@ brain_session::brain_session(const std::string & package, const frankie_options 
         return;
     }
     auto vp                   = mtmd_context_params_default();
-    vp.use_gpu                = options.use_gpu;
+    vp.use_gpu                = options.use_gpu && options.vision_gpu;
     vp.n_threads              = options.threads;
     vp.image_max_tokens       = 1024;
     vp.model_reader           = component::callback;

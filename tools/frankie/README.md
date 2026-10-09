@@ -32,6 +32,8 @@ Realtime `session.instructions` has no separate byte limit. Instructions and too
 
 For a mouth with a separate text encoder, such as Breeze, `--text-encoder-device cpu` keeps that encoder on the CPU while `--device gpu` runs the brain and acoustic models on the GPU. This leaves more VRAM for context and live-audio buffers without changing quantization. The default is `gpu`; measure the additional speech latency when selecting CPU placement. Qwen3-TTS has no separate text encoder, so this option does not change its execution.
 
+`--vision-device cpu` likewise keeps the packaged vision encoder and its compute buffer on the CPU, freeing that VRAM for context or HTTP slots. Image turns still work but encode more slowly; text and speech are unchanged. The default is `gpu`.
+
 ### Human backchannels and interruptions
 
 An optional MaAI BC-Det checkpoint distinguishes a listener nod from a new turn

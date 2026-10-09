@@ -12,6 +12,7 @@ struct frankie_options {
     static constexpr uint32_t default_output_tokens = 32768;
     bool use_gpu = true;
     bool text_encoder_gpu = true;
+    bool vision_gpu = true;
     int threads = 4;
     uint32_t batch_size = 0; // automatic: 128 CPU, 512 GPU
     uint32_t ubatch_size = 0; // automatic: 128 CPU, 512 GPU
