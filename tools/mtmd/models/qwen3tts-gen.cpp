@@ -697,7 +697,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     std::vector<ggml_tensor *> k_cache(n_layer, nullptr);
     std::vector<ggml_tensor *> v_cache(n_layer, nullptr);
 
-    code_gen cg(*this, top_k, top_p, temp, cfg_scale);
+    code_gen cg(*this, top_k, top_p, temp);
     if (n_lanes > 1) {
         cg.cfg = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
         ggml_set_name(cg.cfg, "inp_cfg_scale");

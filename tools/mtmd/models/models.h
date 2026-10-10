@@ -268,14 +268,13 @@ struct clip_graph_qwen3tts_gen : clip_graph {
     // MTP-style code predictor, one token per codebook
     //
     struct code_gen : clip_graph {
-        code_gen(const clip_graph & parent, int top_k, float top_p, float temp, float cfg_scale)
-            : clip_graph(parent), top_k(top_k), top_p(top_p), temp(temp), cfg_scale(cfg_scale) {}
+        code_gen(const clip_graph & parent, int top_k, float top_p, float temp)
+            : clip_graph(parent), top_k(top_k), top_p(top_p), temp(temp) {}
         ggml_cgraph * build() override { GGML_ABORT("call prefill()/step() instead"); }
 
         int   top_k;
         float top_p;
         float temp;
-        float cfg_scale;
         ggml_tensor * cfg = nullptr; // "inp_cfg_scale", an input so one graph serves every guidance strength
 
         ggml_tensor * guide(ggml_tensor * logits) const;
