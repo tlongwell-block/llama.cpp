@@ -259,11 +259,14 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
     def _wav_decoder_config(self) -> dict[str, Any] | None:
         # code2wav has its own config.json, inside the speech_tokenizer dir
         if self._wav_config_cache is None:
-            path = self.dir_model / "speech_tokenizer" / "config.json"
+            path = self._wav_decoder_dir() / "config.json"
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             self._wav_config_cache = cfg["decoder_config"]
         return self._wav_config_cache
+
+    def _wav_decoder_dir(self) -> Path:
+        return self.dir_model / "speech_tokenizer"
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         # conv1d/conv1d_dw kernels must be F16, ggml_conv_1d(_dw) has no BF16 path
@@ -360,7 +363,7 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
         from safetensors.torch import load_file
 
         wav_config = self._wav_decoder_config()
-        state_dict = load_file(self.dir_model / "speech_tokenizer" / "model.safetensors")
+        state_dict = load_file(self._wav_decoder_dir() / "model.safetensors")
 
         def get(name: str) -> Tensor:
             return state_dict[name]

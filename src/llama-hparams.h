@@ -206,6 +206,12 @@ struct llama_hparams {
     float    situ_beta            = 1.0f;
     float    situ_linear_beta     = 0.0f;   // 0 = no linear-beta transform on the up branch
 
+    // hrm-text (looped H/L stacks)
+    uint32_t n_hrm_layers_per_stack = 0;
+    uint32_t n_hrm_h_cycles = 0;
+    uint32_t n_hrm_l_cycles = 0;
+    bool     hrm_prefix_lm = false;
+
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;
@@ -240,6 +246,9 @@ struct llama_hparams {
 
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
+
+    // width of a captured layer-input row (0 = use n_embd); wider when the residual is a hyper-connection stream
+    uint32_t n_embd_layer_inp_impl = 0;
 
     uint32_t dflash_block_size       = 0;
     uint32_t dflash_conv_kernel_size = 0;
@@ -418,6 +427,8 @@ struct llama_hparams {
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;
+
+    uint32_t n_embd_layer_inp() const;
 
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;

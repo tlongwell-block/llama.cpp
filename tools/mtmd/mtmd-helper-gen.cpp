@@ -21,6 +21,33 @@
 // Audio generation helpers
 //
 
+bool mtmd_helper_encode_audio(mtmd_context * ctx, const mtmd_bitmap * bitmap,
+                              int32_t n_embd, std::vector<float> & output) {
+    if (!ctx || !bitmap || !mtmd_bitmap_is_audio(bitmap) || !mtmd_support_audio(ctx) || n_embd <= 0) {
+        return false;
+    }
+    const std::string marker = mtmd_default_marker();
+    mtmd_input_text text{marker.c_str(), marker.size(), false, true};
+    std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(
+        mtmd_input_chunks_init(), mtmd_input_chunks_free);
+    if (!chunks || mtmd_tokenize(ctx, chunks.get(), &text, &bitmap, 1) != 0) { return false; }
+    std::vector<float> result;
+    for (size_t i = 0; i < mtmd_input_chunks_size(chunks.get()); ++i) {
+        const auto * chunk = mtmd_input_chunks_get(chunks.get(), i);
+        if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) { continue; }
+        if (mtmd_encode_chunk(ctx, chunk) != 0) { return false; }
+        const auto * rows = mtmd_get_output_embd(ctx);
+        const size_t count = size_t(n_embd) * mtmd_input_chunk_get_n_tokens(chunk);
+        if (!rows || !count || !std::all_of(rows, rows + count, [](float x) { return std::isfinite(x); })) {
+            return false;
+        }
+        result.insert(result.end(), rows, rows + count);
+    }
+    if (result.empty()) { return false; }
+    output = std::move(result);
+    return true;
+}
+
 // --tts-lang codes -> language names used by the codec_language special tokens
 static const std::unordered_map<std::string, std::string> tts_lang_codes = {
     { "zh", "chinese"    },
@@ -92,6 +119,7 @@ public:
     // set out_stop on end-of-speech, h_state_out must be null if no frame is generated
     virtual int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) = 0;
     virtual int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) = 0;
+    virtual const float * get_logits(int32_t * n_vocab) { *n_vocab = 0; return nullptr; }
 
 protected:
     llama_context * lctx;
@@ -101,6 +129,45 @@ protected:
     int n_embd;
     mtmd_gen_audio_info info;
 };
+
+bool mtmd_helper_qwen3tts_body(
+        size_t width, size_t max_rows,
+        const std::vector<float> & ref_text, const std::vector<float> & target_text,
+        const float * ref_codec, size_t n_ref_codec,
+        const std::vector<float> & tts_eos, const std::vector<float> & tts_pad,
+        const std::vector<float> & codec_bos, const std::vector<float> & codec_pad,
+        std::vector<float> & output) {
+    if (width == 0 || width > 16384 || max_rows > 32768 || max_rows < 2 ||
+        ref_text.size() % width || target_text.size() % width ||
+        tts_eos.size() != width || tts_pad.size() != width ||
+        codec_bos.size() != width || codec_pad.size() != width ||
+        (ref_codec == nullptr) != (n_ref_codec == 0)) {
+        return false;
+    }
+    size_t rows = 2;
+    for (size_t n : {ref_text.size() / width, target_text.size() / width, n_ref_codec}) {
+        if (n > max_rows - rows) { return false; }
+        rows += n;
+    }
+    std::vector<float> result;
+    result.reserve(rows * width);
+    auto append = [&](const float * data, size_t n, const std::vector<float> & pad) {
+        for (size_t i = 0; i < n * width; ++i) {
+            const float value = data[i] + pad[i % width];
+            if (!std::isfinite(value)) { return false; }
+            result.push_back(value);
+        }
+        return true;
+    };
+    if (!append(ref_text.data(), ref_text.size() / width, codec_pad) ||
+        !append(target_text.data(), target_text.size() / width, codec_pad) ||
+        !append(tts_eos.data(), 1, codec_pad) || !append(codec_bos.data(), 1, tts_pad) ||
+        !append(ref_codec, n_ref_codec, tts_pad)) {
+        return false;
+    }
+    output.swap(result);
+    return true;
+}
 
 // Qwen3-TTS: backbone samples codec_0, code_predictor gives the other 15 codebooks,
 // then code2wav decodes them to PCM
@@ -121,11 +188,86 @@ public:
         prompt_batch.reset();
         n_prompt = 0;
         prompt_pos = 0;
+        uncond_embd_buf.clear();
+        uncond_batch.reset();
+        n_uncond = 0;
+        uncond_prompt_pos = 0;
+        uncond_seq = -1;
+        uncond_pos = 0;
+        cfg_scale = 1.0f;
+        h_uncond.clear();
+        logits_buf.clear();
+        uncond_logits.clear();
+        attention_cold = false;
     }
 
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
+        std::vector<uint8_t> codec = std::move(c2w_state);
         reset();
         seq_id = inp->seq_id;
+        const bool breeze = info.model_variant && std::string(info.model_variant) == "breeze";
+        if (inp->continue_codec && !breeze) { return 1; }
+        // Breeze's sliding speech window keeps RoPE positions increasing past evicted rows
+        if (inp->n_past < 0 || (!breeze && inp->n_past) || inp->n_past > (1 << 30)) { return 1; }
+        pos = inp->n_past;
+        if (inp->uncond_prompt_embd || inp->n_uncond_prompt_embd) {
+            // Breeze guidance: both lanes keep their own history on their own sequences.
+            if (!breeze || !inp->uncond_prompt_embd || !inp->n_uncond_prompt_embd || !inp->prompt_embd ||
+                !std::isfinite(inp->cfg_scale) || inp->cfg_scale <= 0.0f || inp->uncond_seq_id == inp->seq_id ||
+                inp->uncond_seq_id < 0 || inp->uncond_n_past < 0 || inp->uncond_n_past > (1 << 30) ||
+                inp->n_uncond_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx), 32768)) {
+                LOG_ERR("mtmd_helper_gen_audio: invalid unconditional speech prompt\n");
+                return 1;
+            }
+            const size_t count = inp->n_uncond_prompt_embd * n_embd;
+            if (!std::all_of(inp->uncond_prompt_embd, inp->uncond_prompt_embd + count, [](float x) { return std::isfinite(x); })) {
+                return 1;
+            }
+            uncond_embd_buf.assign(inp->uncond_prompt_embd, inp->uncond_prompt_embd + count);
+            n_uncond = inp->n_uncond_prompt_embd;
+            uncond_seq = inp->uncond_seq_id;
+            uncond_pos = inp->uncond_n_past;
+            cfg_scale = inp->cfg_scale;
+        }
+        if (breeze || inp->prompt_embd || inp->n_prompt_embd) {
+            if (!breeze || !inp->prompt_embd || !inp->n_prompt_embd ||
+                inp->n_prompt_embd >= std::min<size_t>(llama_n_ctx(lctx), 32768) ||
+                inp->prompt_len || inp->speaker_ref || inp->target_offset || inp->ref_text ||
+                inp->ref_codes || inp->ref_codec_embd || inp->speaker_offset) {
+                LOG_ERR("mtmd_helper_gen_audio: invalid continuous speech prompt\n");
+                return 1;
+            }
+            const size_t count = inp->n_prompt_embd * n_embd;
+            if (!std::all_of(inp->prompt_embd, inp->prompt_embd + count, [](float x) { return std::isfinite(x); })) {
+                return 1;
+            }
+            prompt_embd_buf.assign(inp->prompt_embd, inp->prompt_embd + count);
+            n_prompt = inp->n_prompt_embd;
+            codec_0 = 0;
+            codec_eos = 2051;
+            overlay.assign(n_embd, 0.0f);
+            if (inp->continue_codec && !codec.empty()) {
+                // Codec context: the decoder's convolutions continue from the previous phrase,
+                // its attention starts over (MTPLX CodecContext "convolution").
+                c2w_state = std::move(codec);
+                attention_cold = true;
+            }
+            return prepare_prompt(inp);
+        }
+        if (!inp->prompt || inp->prompt_len > 131072 || inp->ref_text_len > 131072 ||
+            (inp->target_offset == nullptr) != (inp->n_target_offset == 0) ||
+            (inp->ref_codec_embd == nullptr) != (inp->n_ref_codec_embd == 0) ||
+            (inp->ref_text == nullptr) != (inp->ref_text_len == 0) ||
+            (inp->ref_codes == nullptr) != (inp->n_ref_frames == 0) ||
+            (inp->speaker_offset == nullptr) != (inp->n_speaker_offset == 0) ||
+            (inp->n_speaker_offset && (!inp->speaker_ref || inp->n_speaker_offset != (size_t) n_embd)) ||
+            (inp->n_ref_frames && inp->n_ref_codec_embd) ||
+            (inp->ref_text_len > 0) != (inp->n_ref_codec_embd > 0 || inp->n_ref_frames > 0) ||
+            inp->prime_frames > inp->n_ref_frames ||
+            inp->n_target_offset > 32768 || inp->n_ref_codec_embd > 32768 || inp->n_ref_frames > 32768) {
+            LOG_ERR("mtmd_helper_gen_audio: invalid Qwen conditioning input\n");
+            return 1;
+        }
 
         if (!ensure_cache()) {
             return 1;
@@ -142,6 +284,15 @@ public:
         if (inp->speaker_ref) {
             if (!encode_speaker(inp->speaker_ref, speaker_embd)) {
                 return 1;
+            }
+        }
+
+        if (inp->speaker_offset) {
+            if (speaker_embd.size() != inp->n_speaker_offset) { return 1; }
+            for (size_t i = 0; i < speaker_embd.size(); ++i) {
+                if (!std::isfinite(inp->speaker_offset[i])) { return 1; }
+                speaker_embd[i] += inp->speaker_offset[i];
+                if (!std::isfinite(speaker_embd[i])) { return 1; }
             }
         }
 
@@ -181,45 +332,139 @@ public:
         prompt.push_back(sum_row(tts_pad, c_think_e));
         if (!speaker_embd.empty()) prompt.push_back(sum_vec(tts_pad, speaker_embd));
         prompt.push_back(sum_row(tts_bos, codec_pad));
-        for (int i = 3; i < n_ids - 5; i++) prompt.push_back(sum_row(ids[(size_t) i], codec_pad));
-        prompt.push_back(sum_row(tts_eos, codec_pad));
-        prompt.push_back(sum_row(tts_pad, codec_bos));
+        std::vector<float> reference_rows, target_rows, body;
+        if (inp->ref_text_len) {
+            const std::string reference = "<|im_start|>assistant\n" +
+                std::string(inp->ref_text, inp->ref_text_len) + "<|im_end|>\n";
+            std::vector<llama_token> ref_ids(reference.size() + 16);
+            const int count = llama_tokenize(vocab, reference.c_str(), (int32_t) reference.size(),
+                                             ref_ids.data(), (int32_t) ref_ids.size(), false, true);
+            if (count < 5) { return 1; }
+            for (int i = 3; i < count - 2; ++i) {
+                const auto value = row(ref_ids[i]);
+                reference_rows.insert(reference_rows.end(), value.begin(), value.end());
+            }
+        }
+        if (inp->target_offset && inp->n_target_offset != (size_t) (n_ids - 8)) {
+            LOG_ERR("mtmd_helper_gen_audio: target conditioning token count mismatch\n");
+            return 1;
+        }
+        for (int i = 3; i < n_ids - 5; ++i) {
+            auto value = row(ids[i]);
+            if (inp->target_offset) {
+                for (int j = 0; j < n_e; ++j) { value[j] += inp->target_offset[(size_t) (i - 3) * n_e + j]; }
+            }
+            target_rows.insert(target_rows.end(), value.begin(), value.end());
+        }
+        std::vector<float> reference_codec_rows;
+        const bool cacheable_reference = inp->ref_codes && inp->n_ref_frames <= 2048;
+        const bool same_reference = cacheable_reference && cached_codes.size() == inp->n_ref_frames * 16 &&
+            std::equal(cached_codes.begin(), cached_codes.end(), inp->ref_codes);
+        if (same_reference) {
+            reference_codec_rows = cached_codec_rows;
+        } else if (inp->ref_codes) {
+            const size_t max_frames = std::min<size_t>(llama_n_ctx(lctx), 32768);
+            if (inp->n_ref_frames > max_frames) { return 1; }
+            reference_codec_rows.reserve(inp->n_ref_frames * n_e);
+            for (size_t frame = 0; frame < inp->n_ref_frames; ++frame) {
+                std::vector<int32_t> codes(inp->ref_codes + frame * 16, inp->ref_codes + (frame + 1) * 16);
+                auto request = mtmd_gen_inp_default(mctx);
+                request.type = MTMD_GEN_PROCESS_TYPE_EMBED_CODES;
+                request.codes = codes.data();
+                request.n_codes = codes.size();
+                request.seed = inp->seed;
+                mtmd_gen_out result{};
+                if (mtmd_gen_audio_process(mctx, &request, &result)) { return 1; }
+                reference_codec_rows.insert(reference_codec_rows.end(), result.embd, result.embd + n_e);
+            }
+        }
+        const float * ref_codec = inp->ref_codes ? reference_codec_rows.data() : inp->ref_codec_embd;
+        const size_t ref_frames = inp->ref_codes ? inp->n_ref_frames : inp->n_ref_codec_embd;
+        const size_t capacity = std::min<size_t>(llama_n_ctx(lctx), 32768);
+        if (capacity <= prompt.size() || !mtmd_helper_qwen3tts_body(
+                n_e, capacity - prompt.size(), reference_rows, target_rows,
+                ref_codec, ref_frames,
+                row(tts_eos), row(tts_pad), row(codec_bos), row(codec_pad), body)) {
+            LOG_ERR("mtmd_helper_gen_audio: invalid or oversized Qwen prefill\n");
+            return 1;
+        }
+        for (size_t i = 0; i < body.size(); i += n_e) {
+            prompt.emplace_back(body.begin() + i, body.begin() + i + n_e);
+        }
 
         n_prompt = (int) prompt.size();
-
-        // the talker uses the qwen3vl interleaved mrope, all sections are equal for a text/codec stream
-        mrope = llama_model_rope_type(model) == LLAMA_ROPE_TYPE_MROPE ||
-                llama_model_rope_type(model) == LLAMA_ROPE_TYPE_IMROPE;
-        const int n_pos_per_embd = mrope ? 4 : 1;
 
         prompt_embd_buf.resize((size_t) n_prompt * (size_t) n_e);
         for (int i = 0; i < n_prompt; i++) {
             memcpy(prompt_embd_buf.data() + (size_t) i * n_e, prompt[(size_t) i].data(), (size_t) n_e * sizeof(float));
         }
 
-        prompt_batch.reset(new decode_embd_batch(prompt_embd_buf.data(), n_prompt, n_pos_per_embd, n_e));
-        if (mrope) prompt_batch->set_position_mrope_1d(0, seq_id);
-        else       prompt_batch->set_position_normal  (0, seq_id);
-        prompt_pos = 0;
-
-        pos = 0;
-        const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
-        top_k = inp->top_k > 0 ? inp->top_k : def.top_k;
-        top_p = inp->top_p > 0 ? inp->top_p : def.top_p;
-        seed  = inp->seed;
-        out_type = inp->out_type;
+        if (prepare_prompt(inp)) { return 1; }
 
         // the prompt above holds the whole text stream up to tts_eos, so every generated
         // frame adds tts_pad on top of the codes embedding
         overlay = row(tts_pad);
 
+        const bool same_prime = same_reference && cached_prime_frames == inp->prime_frames;
+        if (same_prime) { c2w_state = cached_prime_state; }
+        for (size_t start = same_prime ? inp->n_ref_frames : inp->n_ref_frames - inp->prime_frames;
+             start < inp->n_ref_frames;) {
+            // Bound priming scratch; c2w_state retains the full decoder history.
+            const size_t frames = std::min(size_t(8), inp->n_ref_frames - start);
+            std::vector<int32_t> codes(inp->ref_codes + start * 16, inp->ref_codes + (start + frames) * 16);
+            auto request = mtmd_gen_inp_default(mctx);
+            request.type = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
+            request.codes = codes.data();
+            request.n_codes = codes.size();
+            request.seed = seed;
+            request.state_data = c2w_state.empty() ? nullptr : (const char *) c2w_state.data();
+            request.state_size = c2w_state.size();
+            mtmd_gen_out result{};
+            if (mtmd_gen_audio_process(mctx, &request, &result)) { reset(); return 1; }
+            c2w_state.assign(result.state_data, result.state_data + result.state_size);
+            start += frames;
+        }
+        // One exact reference per model instance; retain only successful bounded state.
+        if (cacheable_reference && c2w_state.size() <= 64 * 1024 * 1024) {
+            cached_codes.assign(inp->ref_codes, inp->ref_codes + inp->n_ref_frames * 16);
+            cached_codec_rows = reference_codec_rows;
+            cached_prime_frames = inp->prime_frames;
+            cached_prime_state = c2w_state;
+        } else {
+            cached_codes.clear();
+            cached_codec_rows.clear();
+            cached_prime_state.clear();
+        }
+        return 0;
+    }
+
+    int32_t prepare_prompt(const mtmd_helper_gen_audio_inp * inp) {
+        mrope = llama_model_rope_type(model) == LLAMA_ROPE_TYPE_MROPE ||
+                llama_model_rope_type(model) == LLAMA_ROPE_TYPE_IMROPE;
+        prompt_batch.reset(new decode_embd_batch(prompt_embd_buf.data(), n_prompt, mrope ? 4 : 1, n_embd));
+        if (mrope) prompt_batch->set_position_mrope_1d(pos, seq_id);
+        else       prompt_batch->set_position_normal(pos, seq_id);
+        prompt_pos = 0;
+        if (n_uncond) {
+            if (mrope) { return 1; }
+            uncond_batch.reset(new decode_embd_batch(uncond_embd_buf.data(), n_uncond, 1, n_embd));
+            uncond_batch->set_position_normal(uncond_pos, uncond_seq);
+            uncond_prompt_pos = 0;
+        }
+        const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
+        if (!std::isfinite(inp->code_temperature) || inp->code_temperature < 0) { return 1; }
+        code_temperature = inp->code_temperature > 0 ? inp->code_temperature : def.temp;
+        top_k = inp->top_k > 0 ? inp->top_k : def.top_k;
+        top_p = inp->top_p > 0 ? inp->top_p : def.top_p;
+        seed = inp->seed;
+        out_type = inp->out_type;
         return 0;
     }
 
     int32_t step_prompt(int32_t n_batch) override {
         GGML_ASSERT(n_batch > 0);
         if (prompt_pos >= n_prompt) {
-            return 0;
+            return step_uncond_prompt(n_batch);
         }
         const int32_t n_tokens_batch = std::min(n_batch, n_prompt - prompt_pos);
         llama_batch batch_view = prompt_batch->get_view(prompt_pos, n_tokens_batch);
@@ -241,9 +486,68 @@ public:
             // prompt fully processed, its embedding buffer is no longer needed
             prompt_batch.reset();
             prompt_embd_buf.clear();
+            keep_outputs(-1, h_state_buf, logits_buf);
+            return n_uncond ? n_uncond : 0;
+        }
+        return n_prompt - prompt_pos + n_uncond;
+    }
+
+    // the unconditional lane's prompt, after the conditional one
+    int32_t step_uncond_prompt(int32_t n_batch) {
+        if (uncond_prompt_pos >= n_uncond) {
             return 0;
         }
-        return n_prompt - prompt_pos;
+        const int32_t count = std::min(n_batch, n_uncond - uncond_prompt_pos);
+        llama_batch view = uncond_batch->get_view(uncond_prompt_pos, count);
+        if (uncond_prompt_pos + count == n_uncond) {
+            view.logits[count - 1] = 1;
+        }
+        if (llama_decode(lctx, view) != 0) {
+            LOG_ERR("mtmd_helper_gen_audio: unconditional prompt decode failed\n");
+            return -1;
+        }
+        uncond_pos        += count;
+        uncond_prompt_pos += count;
+        if (uncond_prompt_pos < n_uncond) {
+            return n_uncond - uncond_prompt_pos;
+        }
+        uncond_batch.reset();
+        uncond_embd_buf.clear();
+        keep_outputs(-1, h_uncond, uncond_logits);
+        return 0;
+    }
+
+    // copies one output row's hidden state and logits
+    void keep_outputs(int32_t i, std::vector<float> & hidden, std::vector<float> & logits) {
+        const float * h = llama_get_embeddings_ith(lctx, i);
+        const float * l = llama_get_logits_ith(lctx, i);
+        if (h) {
+            hidden.assign(h, h + n_embd);
+        } else {
+            hidden.clear();
+        }
+        if (l) {
+            logits.assign(l, l + llama_vocab_n_tokens(vocab));
+        } else {
+            logits.clear();
+        }
+    }
+
+    const float * get_logits(int32_t * n_vocab) override {
+        *n_vocab = 0;
+        if (logits_buf.empty() || (n_uncond && uncond_logits.size() != logits_buf.size())) {
+            return nullptr;
+        }
+        if (n_uncond) {
+            mixed_logits.resize(logits_buf.size());
+            for (size_t i = 0; i < logits_buf.size(); ++i) {
+                mixed_logits[i] = uncond_logits[i] + cfg_scale * (logits_buf[i] - uncond_logits[i]);
+            }
+        } else {
+            mixed_logits = logits_buf;
+        }
+        *n_vocab = (int32_t) mixed_logits.size();
+        return mixed_logits.data();
     }
 
     int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) override {
@@ -262,7 +566,13 @@ public:
         mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
         inp.type  = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
         inp.code0 = sampled - codec_0;
-        inp.embd  = const_cast<float *>(h_state_in);
+        // after a continuous prompt the lanes' own hidden states drive the depth decoder
+        inp.embd  = const_cast<float *>(h_state_buf.size() == (size_t) n_embd ? h_state_buf.data() : h_state_in);
+        if (n_uncond) {
+            inp.uncond_embd = h_uncond.data();
+            inp.cfg_scale   = cfg_scale;
+        }
+        inp.temp = code_temperature;
         inp.top_k = top_k;
         inp.top_p = top_p;
         inp.seed  = seed;
@@ -282,6 +592,29 @@ public:
         std::vector<float> fb(out.embd, out.embd + n_embd);
         for (int i = 0; i < n_embd; i++) fb[(size_t) i] += overlay[(size_t) i];
 
+        if (n_uncond) {
+            // the same frame feeds both lanes, each at its own position on its own sequence
+            fb.insert(fb.end(), fb.begin(), fb.end());
+            decode_embd_batch pair(fb.data(), 2, 1, n_embd);
+            llama_seq_id lanes[2] = { seq_id, uncond_seq };
+            for (int i = 0; i < 2; ++i) {
+                pair.batch.pos[i]      = i ? uncond_pos : pos;
+                pair.batch.n_seq_id[i] = 1;
+                pair.batch.seq_id[i]   = &lanes[i];
+                pair.batch.logits[i]   = 1;
+            }
+            pos++;
+            uncond_pos++;
+            if (llama_decode(lctx, pair.batch) != 0) {
+                LOG_ERR("mtmd_helper_gen_audio: decode failed\n");
+                return 1;
+            }
+            keep_outputs(0, h_state_buf, logits_buf);
+            keep_outputs(1, h_uncond, uncond_logits);
+            *h_state_out = h_state_buf.data();
+            return 0;
+        }
+
         const int n_pos_per_embd = mrope ? 4 : 1;
         decode_embd_batch batch_embd(fb.data(), 1, n_pos_per_embd, n_embd);
         if (mrope) batch_embd.set_position_mrope_1d(pos, seq_id);
@@ -294,8 +627,7 @@ public:
             return 1;
         }
 
-        const float * he = llama_get_embeddings_ith(lctx, -1);
-        h_state_buf.assign(he, he + n_embd);
+        keep_outputs(-1, h_state_buf, logits_buf);
         *h_state_out = h_state_buf.data();
 
         return 0;
@@ -366,34 +698,25 @@ private:
 
     // runs the reference wav through the speaker encoder, returns one x-vector embedding row
     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
-        if (!mtmd_support_audio(mctx)) {
-            LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
+        // Compare samples, not bitmap addresses: callers may replace or mutate a reference.
+        const size_t bytes = mtmd_bitmap_get_n_bytes(bitmap);
+        const auto * samples = mtmd_bitmap_get_data(bitmap);
+        if (!mtmd_bitmap_is_audio(bitmap) || !samples || !bytes || bytes > 16 * 1024 * 1024) {
             return false;
         }
-        const std::string  marker = mtmd_default_marker();
-        mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
-        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-        const mtmd_bitmap * bptr = bitmap;
-        bool ok = mtmd_tokenize(mctx, chunks, &text, &bptr, 1) == 0;
-        if (ok) {
-            ok = false;
-            for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
-                const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
-                if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-                    continue;
-                }
-                if (mtmd_encode_chunk(mctx, chunk) != 0) {
-                    LOG_ERR("mtmd_helper_gen_audio: speaker encode failed\n");
-                    break;
-                }
-                const float * embd = mtmd_get_output_embd(mctx);
-                const size_t  n = (size_t) llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk);
-                out.assign(embd, embd + n);
-                ok = true;
-                break;
-            }
+        if (cached_speaker_pcm.size() == bytes &&
+            std::memcmp(cached_speaker_pcm.data(), samples, bytes) == 0) {
+            out = cached_speaker_embd;
+            return true;
         }
-        mtmd_input_chunks_free(chunks);
+        bool ok = mtmd_helper_encode_audio(mctx, bitmap, llama_model_n_embd_inp(model), out);
+        if (ok && out.size() == (size_t) n_embd &&
+            std::all_of(out.begin(), out.end(), [](float x) { return std::isfinite(x); })) {
+            cached_speaker_pcm.assign(samples, samples + bytes);
+            cached_speaker_embd = out;
+        } else {
+            ok = false;
+        }
         return ok;
     }
 
@@ -409,6 +732,7 @@ private:
         inp.seed       = seed; // same seed as gen_code, else clip reseeds mid-generation
         inp.state_data = c2w_state.empty() ? nullptr : (const char *) c2w_state.data();
         inp.state_size = c2w_state.size();
+        inp.reset_attention = attention_cold;
         mtmd_gen_out out{};
         if (mtmd_gen_audio_process(mctx, &inp, &out) != 0) {
             LOG_ERR("mtmd_helper_gen_audio: gen_wav process failed\n");
@@ -416,6 +740,7 @@ private:
         }
         audio_pcm.insert(audio_pcm.end(), out.audio, out.audio + out.n_samples);
         c2w_state.assign(out.state_data, out.state_data + out.state_size);
+        attention_cold = false;
         codes_buf.clear();
         return true;
     }
@@ -437,6 +762,13 @@ private:
     // must match hparams.wav_tfm_swa hardcoded in clip.cpp
     size_t window_frames = 72;
 
+    std::vector<int32_t> cached_codes;
+    std::vector<unsigned char> cached_speaker_pcm;
+    std::vector<float> cached_speaker_embd;
+    std::vector<float> cached_codec_rows;
+    std::vector<uint8_t> cached_prime_state;
+    size_t cached_prime_frames = 0;
+
     // per-generation state, cleared by reset()
     llama_seq_id seq_id = 0;
     bool mrope = false;
@@ -446,14 +778,25 @@ private:
     std::unique_ptr<decode_embd_batch> prompt_batch;
     int n_prompt = 0;
     int prompt_pos = 0;
+    float    code_temperature = 1.0f;
     int32_t  top_k = 50;
     float    top_p = 1.0f;
     uint32_t seed  = UINT32_MAX;
     std::vector<int32_t> codes_buf;
     std::vector<uint8_t> c2w_state;
+    bool attention_cold = false; // the next GEN_WAV keeps c2w_state's convolutions only
     std::vector<float>   audio_pcm;
     std::vector<float> overlay;
     std::vector<float> h_state_buf;
+    // Breeze guidance: the unconditional lane, and both lanes' last logits
+    std::vector<float> uncond_embd_buf;
+    std::unique_ptr<decode_embd_batch> uncond_batch;
+    int n_uncond = 0;
+    int uncond_prompt_pos = 0;
+    llama_seq_id uncond_seq = -1;
+    int uncond_pos = 0;
+    float cfg_scale = 1.0f;
+    std::vector<float> h_uncond, logits_buf, uncond_logits, mixed_logits;
     mtmd_helper_gen_audio_outtype out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
     std::vector<char> out_buf;
 };
@@ -525,6 +868,13 @@ public:
         }
 
         pack = pockettts_pack(info.model_variant);
+
+        if (inp->n_past || inp->target_offset || inp->n_target_offset || inp->ref_text || inp->ref_text_len ||
+            inp->ref_codec_embd || inp->n_ref_codec_embd || inp->ref_codes || inp->n_ref_frames || inp->prime_frames ||
+            inp->speaker_offset || inp->n_speaker_offset) {
+            LOG_ERR("mtmd_helper_gen_audio: conditioning rows require Qwen3-TTS\n");
+            return 1;
+        }
 
         const std::string text = prepare_text(std::string(inp->prompt, inp->prompt_len),
                                               pack.pad_short_text);
@@ -905,35 +1255,7 @@ private:
 
     // runs the reference wav through the mimi encoder, returns one row per 12.5Hz frame
     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
-        if (!mtmd_support_audio(mctx)) {
-            LOG_ERR("mtmd_helper_gen_audio: mmproj has no voice encoder\n");
-            return false;
-        }
-        const std::string  marker = mtmd_default_marker();
-        mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
-        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-        const mtmd_bitmap * bptr = bitmap;
-        bool ok = mtmd_tokenize(mctx, chunks, &text, &bptr, 1) == 0;
-        if (ok) {
-            ok = false;
-            for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
-                const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
-                if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-                    continue;
-                }
-                if (mtmd_encode_chunk(mctx, chunk) != 0) {
-                    LOG_ERR("mtmd_helper_gen_audio: voice encode failed\n");
-                    break;
-                }
-                const float * embd = mtmd_get_output_embd(mctx);
-                const size_t  n = (size_t) llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk);
-                out.assign(embd, embd + n);
-                ok = true;
-                break;
-            }
-        }
-        mtmd_input_chunks_free(chunks);
-        return ok;
+        return mtmd_helper_encode_audio(mctx, bitmap, llama_model_n_embd_inp(model), out);
     }
 
     // decodes the buffered latents, the mimi decoder state carries over between calls
@@ -1051,6 +1373,11 @@ int32_t mtmd_helper_gen_audio_step_gen(mtmd_helper_gen_audio * ctx, llama_token 
         *out_stop = stop;
     }
     return ret;
+}
+
+const float * mtmd_helper_gen_audio_get_logits(mtmd_helper_gen_audio * ctx, int32_t * n_vocab) {
+    *n_vocab = 0;
+    return ctx->pipeline ? ctx->pipeline->get_logits(n_vocab) : nullptr;
 }
 
 int32_t mtmd_helper_gen_audio_get_output(mtmd_helper_gen_audio * ctx, int32_t * out_sample_rate,

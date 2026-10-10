@@ -590,6 +590,36 @@ static void test_keep_tail(testing & t) {
 static void test_mrope(testing & t) {
     llama_vocab vocab;
 
+    t.test("mtp_hidden_rows_follow_reordered_embeddings", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(0, {1}, false);
+        bb.add(1, {0}, true);
+        bb.add(1, {1}, true);
+        std::vector<llama_pos> pos = {0, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+        std::vector<float> hidden = {-10, -11, -20, -21, -30, -31, -40, -41};
+        auto batch = bb.make();
+        batch.pos = pos.data();
+        llama_batch_allocr ba(4);
+        t.assert_true(ba.init(batch, vocab, nullptr, bb.n_embd, 2, false, hidden.data()));
+        const auto ub = ba.split_equal(4, false, 0);
+        t.assert_equal(4u, ub.n_tokens);
+        const int order[] = {0, 2, 1, 3};
+        for (int i = 0; i < 4; ++i) {
+            for (int k = 0; k < 2; ++k) {
+                t.assert_equal(bb.embd[2 * order[i] + k], ub.embd[2 * i + k]);
+                t.assert_equal(hidden[2 * order[i] + k], ub.embd_h[2 * i + k]);
+            }
+            for (int axis = 0; axis < 4; ++axis) {
+                t.assert_equal(pos[4 * axis + order[i]], ub.pos[4 * axis + i]);
+            }
+        }
+        // A later ordinary decode must not inherit the previous hidden input.
+        t.assert_true(ba.init(batch, vocab, nullptr, bb.n_embd, 2, false));
+        t.assert_true(ba.split_simple(1).embd_h == nullptr);
+        t.assert_equal(-10.0f, ub.embd_h[0]);
+    });
+
     t.test("pos_layout_and_split", [&](testing & t) {
         const uint32_t n_pos = 4;
         const uint32_t n_embd = 2;

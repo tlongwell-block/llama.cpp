@@ -345,7 +345,7 @@ class PocketTTSMmprojModel(MmprojModel):
         suffix = ".weight" if key_with_suffix.endswith(".scale") else "." + suffix
         yield (self.format_tensor_name(tensor, bid, suffix=suffix), data_torch)
 
-    def _seanet_tensor(self, name: str, data_torch: Tensor) -> Iterable[tuple[str, Tensor]]:
+    def _seanet_tensor(self, name: str, data_torch: Tensor, n_stages: int = _N_SEANET_STAGES) -> Iterable[tuple[str, Tensor]]:
         T = gguf.MODEL_TENSOR
         is_decoder = name.startswith("mimi.decoder.")
         idx = int(name.split(".model.", 1)[1].split(".")[0])
@@ -362,11 +362,11 @@ class PocketTTSMmprojModel(MmprojModel):
         if idx == 0:
             yield (self.format_tensor_name(conv_in, suffix=suffix), data_torch)
             return
-        if idx == 3 * _N_SEANET_STAGES + 2:
+        if idx == 3 * n_stages + 2:
             yield (self.format_tensor_name(conv_out, suffix=suffix), data_torch)
             return
 
-        for stage in range(_N_SEANET_STAGES):
+        for stage in range(n_stages):
             res_idx = _DEC_RES_IDX(stage) if is_decoder else _ENC_RES_IDX(stage)
             scale_idx = _DEC_SCALE_IDX(stage) if is_decoder else _ENC_SCALE_IDX(stage)
             if idx == scale_idx:

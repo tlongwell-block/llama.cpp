@@ -58,6 +58,9 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    gguf_reader_callback_t model_reader = nullptr;
+    void * model_reader_user_data = nullptr;
+    uint64_t model_reader_size = 0;
 };
 
 struct clip_init_result {
@@ -91,6 +94,7 @@ enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
     CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
+    CLIP_GEN_PROCESS_EMBED_CODES, // one codec frame to talker embedding
 };
 struct clip_encode_params {
     int n_threads = 1;
@@ -108,6 +112,7 @@ struct clip_encode_params {
     std::vector<float> * out_feats = nullptr; // continuous counterpart of out_codes
     uint32_t seed = UINT32_MAX;               // UINT32_MAX for random
     float   temp = 0.0f;                      // sampling temperature, noise scale for flow-matching decoders
+    float   cfg_scale = 1.0f;                 // != 1: imgs holds the conditional then the unconditional hidden state
     bool * out_is_eos = nullptr;
 
     // GEN_WAV
@@ -116,6 +121,7 @@ struct clip_encode_params {
     std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
     const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
     std::vector<uint8_t> *       state_out = nullptr; // state for the next call
+    bool reset_attention = false;                     // zero the tfm_* slots of state_in, keep the rest
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
 

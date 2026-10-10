@@ -6,6 +6,13 @@
 ggml_tensor * clip_graph_qwen3tts_gen::code_gen::do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const {
     logits = ggml_reshape_1d(ctx0, logits, ggml_nelements(logits));
     const int64_t n_vocab = logits->ne[0];
+    if (hparams.gen_model_variant == "breeze") {
+        auto * keep = ggml_step(ctx0, ggml_arange(ctx0, 0, (float) n_vocab, 1));
+        logits = ggml_add(ctx0, logits, ggml_log(ctx0, keep));
+        if (temp > 0.0f && temp != 1.0f) {
+            logits = ggml_scale(ctx0, logits, 1.0f / temp);
+        }
+    }
 
     // sort a's rows by idx
     auto sort_by = [this](ggml_tensor * a, ggml_tensor * idx) {
@@ -103,13 +110,15 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::const_i32(ggml_tensor * anchor,
     return ggml_cast(ctx0, ggml_scale_bias(ctx0, v, 0.0f, value), GGML_TYPE_I32);
 }
 
-// causal keep-mask row for a query at position pos, window size n_kv_pad
-ggml_tensor * clip_graph_qwen3tts_gen::code_gen::causal_mask_row(int64_t n_kv_pad, int pos) const {
-    ggml_tensor * ones = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_pad, n_kv_pad), 1.0f);
-    ggml_tensor * keep = ggml_tri(ctx0, ones, GGML_TRI_TYPE_LOWER_DIAG);
-    ggml_tensor * row  = ggml_view_1d(ctx0, keep, n_kv_pad, (size_t) pos * keep->nb[1]);
-    ggml_tensor * mask = ggml_log(ctx0, row); // 0 = keep, -inf = masked
-    return ggml_reshape_4d(ctx0, mask, n_kv_pad, 1, 1, 1);
+// the same position for every lane, as rope's i32 position input
+ggml_tensor * clip_graph_qwen3tts_gen::code_gen::lane_positions(int pos, int64_t n_lanes) const {
+    return ggml_cast(ctx0, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_lanes), (float) pos), GGML_TYPE_I32);
+}
+
+// one input row, copied to every lane: [n_embd] -> [n_embd, n_lanes]
+ggml_tensor * clip_graph_qwen3tts_gen::code_gen::to_lanes(ggml_tensor * cur, int64_t n_lanes) const {
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0], 1);
+    return n_lanes > 1 ? ggml_repeat_4d(ctx0, cur, cur->ne[0], n_lanes, 1, 1) : cur;
 }
 
 // talker hidden size -> predictor hidden size (small_to_mtp_projection)
@@ -124,21 +133,21 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::project_in(ggml_tensor * cur) c
     return cur;
 }
 
-// one transformer layer at position pos; writes k/v into k_cache_layer/v_cache_layer at row pos
+// one transformer layer at the next position, for every lane at once: cur is [n_embd, n_lanes].
+// each lane's k/v history is [d_head * n_head_kv, n_pos, n_lanes]; this position is appended, and
+// attention runs over the whole history, which is exactly the causal window.
 ggml_tensor * clip_graph_qwen3tts_gen::code_gen::layer_forward(
         ggml_tensor * cur,
         const clip_layer & layer,
         ggml_tensor * inp_pos,
-        ggml_tensor * kq_mask,
         ggml_tensor *& k_cache_layer,
         ggml_tensor *& v_cache_layer,
-        int64_t n_kv_pad,
-        int pos,
         int il) const {
     const int     n_head    = hparams.n_head;
     const int     n_head_kv = hparams.n_head_kv;
     const int64_t d_head    = layer.q_w->ne[1] / n_head; // real head_dim, not n_embd / n_head
     const float   kq_scale  = 1.0f / sqrtf((float) d_head);
+    const int64_t n_lanes   = cur->ne[1];
 
     ggml_tensor * residual = cur;
 
@@ -149,29 +158,32 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::layer_forward(
     ggml_tensor * k = ggml_mul_mat(ctx0, layer.k_w, h);
     ggml_tensor * v = ggml_mul_mat(ctx0, layer.v_w, h);
 
-    q = ggml_reshape_3d(ctx0, q, d_head, n_head, 1);
-    k = ggml_reshape_3d(ctx0, k, d_head, n_head_kv, 1);
+    q = ggml_reshape_3d(ctx0, q, d_head, n_head, n_lanes);
+    k = ggml_reshape_3d(ctx0, k, d_head, n_head_kv, n_lanes);
 
-    q = ggml_rms_norm(ctx0, q, hparams.eps);
-    q = ggml_mul(ctx0, q, layer.q_norm);
-    k = ggml_rms_norm(ctx0, k, hparams.eps);
-    k = ggml_mul(ctx0, k, layer.k_norm);
+    if (layer.q_norm) {
+        q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, hparams.eps), layer.q_norm);
+    }
+    if (layer.k_norm) {
+        k = ggml_mul(ctx0, ggml_rms_norm(ctx0, k, hparams.eps), layer.k_norm);
+    }
 
-    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
+    q = ggml_rope_ext(ctx0, q, inp_pos, model.gen_code_rope_freqs, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    k = ggml_rope_ext(ctx0, k, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
+    k = ggml_rope_ext(ctx0, k, inp_pos, model.gen_code_rope_freqs, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // write k/v into the cache at row pos, flat layout
-    ggml_tensor * k_flat = ggml_reshape_1d(ctx0, k, d_head * n_head_kv);
-    k_cache_layer = cache_set(k_cache_layer, pos, k_flat);
-    v_cache_layer = cache_set(v_cache_layer, pos, v);
+    ggml_tensor * k_new = ggml_reshape_3d(ctx0, k, d_head * n_head_kv, 1, n_lanes);
+    ggml_tensor * v_new = ggml_reshape_3d(ctx0, v, d_head * n_head_kv, 1, n_lanes);
+    k_cache_layer = k_cache_layer ? ggml_concat(ctx0, k_cache_layer, k_new, 1) : k_new;
+    v_cache_layer = v_cache_layer ? ggml_concat(ctx0, v_cache_layer, v_new, 1) : v_new;
+    const int64_t n_pos = k_cache_layer->ne[1];
 
-    ggml_tensor * q_cur = ggml_reshape_4d(ctx0, q, d_head, n_head, 1, 1);
-    ggml_tensor * k_cur = ggml_reshape_4d(ctx0, k_cache_layer, d_head, n_head_kv, n_kv_pad, 1);
-    ggml_tensor * v_cur = ggml_reshape_4d(ctx0, v_cache_layer, d_head, n_head_kv, n_kv_pad, 1);
+    ggml_tensor * q_cur = ggml_reshape_4d(ctx0, q, d_head, n_head, 1, n_lanes);
+    ggml_tensor * k_cur = ggml_reshape_4d(ctx0, k_cache_layer, d_head, n_head_kv, n_pos, n_lanes);
+    ggml_tensor * v_cur = ggml_reshape_4d(ctx0, v_cache_layer, d_head, n_head_kv, n_pos, n_lanes);
 
-    ggml_tensor * attn_out = build_attn(layer.o_w, layer.o_b, q_cur, k_cur, v_cur, kq_mask, kq_scale, il);
+    ggml_tensor * attn_out = build_attn(layer.o_w, layer.o_b, q_cur, k_cur, v_cur, nullptr, kq_scale, il);
 
     cur = ggml_add(ctx0, residual, attn_out);
 
@@ -186,33 +198,40 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::layer_forward(
     return ggml_add(ctx0, cur, down);
 }
 
+// paired guidance over [n_vocab, n_lanes] logits: the unconditional lane (1) pushed toward the conditional lane (0)
+ggml_tensor * clip_graph_qwen3tts_gen::code_gen::guide(ggml_tensor * logits) const {
+    if (logits->ne[1] == 1) {
+        return logits;
+    }
+    ggml_tensor * cond   = ggml_view_1d(ctx0, logits, logits->ne[0], 0);
+    ggml_tensor * uncond = ggml_view_1d(ctx0, logits, logits->ne[0], logits->nb[1]);
+    return ggml_add(ctx0, uncond, ggml_mul(ctx0, ggml_sub(ctx0, cond, uncond), cfg));
+}
+
 // position 0: hidden bridge, seeds the k/v cache, no sampling
-// position 1: embed(code0), sample with lm_head[0], write out_code_cache[1]
-void clip_graph_qwen3tts_gen::code_gen::prefill(
+// position 1: embed(code0), returns the logits of lm_head[0]
+// h_state is [n_mmproj_embd, n_lanes], one backbone hidden state per lane; code0 is shared
+ggml_tensor * clip_graph_qwen3tts_gen::code_gen::prefill(
         std::vector<ggml_tensor *> & k_cache,
         std::vector<ggml_tensor *> & v_cache,
-        ggml_tensor *& out_code_cache,
         ggml_tensor * h_state,
-        ggml_tensor * code0_embd,
-        ggml_tensor * inp_rand) const {
-    const int64_t n_kv_pad = k_cache[0]->ne[1];
+        ggml_tensor * code0_embd) const {
+    const int64_t n_lanes = h_state->ne[1];
 
     {
         ggml_tensor * cur     = project_in(h_state);
-        ggml_tensor * kq_mask = causal_mask_row(n_kv_pad, 0);
-        ggml_tensor * inp_pos = const_i32(k_cache[0], 0.0f);
+        ggml_tensor * inp_pos = lane_positions(0, n_lanes);
         for (size_t il = 0; il < model.layers.size(); il++) {
-            cur = layer_forward(cur, model.layers[il], inp_pos, kq_mask, k_cache[il], v_cache[il], n_kv_pad, 0, (int) il);
+            cur = layer_forward(cur, model.layers[il], inp_pos, k_cache[il], v_cache[il], (int) il);
         }
         // position 0's output is unused, it only seeded the cache
     }
 
     {
-        ggml_tensor * cur     = project_in(code0_embd);
-        ggml_tensor * kq_mask = causal_mask_row(n_kv_pad, 1);
-        ggml_tensor * inp_pos = const_i32(k_cache[0], 1.0f);
+        ggml_tensor * cur     = to_lanes(project_in(code0_embd), n_lanes);
+        ggml_tensor * inp_pos = lane_positions(1, n_lanes);
         for (size_t il = 0; il < model.layers.size(); il++) {
-            cur = layer_forward(cur, model.layers[il], inp_pos, kq_mask, k_cache[il], v_cache[il], n_kv_pad, 1, (int) il);
+            cur = layer_forward(cur, model.layers[il], inp_pos, k_cache[il], v_cache[il], (int) il);
         }
 
         cur = ggml_rms_norm(ctx0, cur, hparams.eps);
@@ -220,32 +239,27 @@ void clip_graph_qwen3tts_gen::code_gen::prefill(
 
         ggml_tensor * head_w = model.gen_code_head_w;
         ggml_tensor * head_g = ggml_view_2d(ctx0, head_w, head_w->ne[0], head_w->ne[1], head_w->nb[1], 0); // lm_head[0]
-        ggml_tensor * logits = ggml_mul_mat(ctx0, head_g, cur);
-
-        ggml_tensor * sampled = do_sampling(logits, inp_rand);
-        out_code_cache = cache_set(out_code_cache, 1, sampled);
+        return ggml_mul_mat(ctx0, head_g, cur);
     }
 }
 
-// one decode step of code_predictor
+// one decode step of code_predictor, for every lane
 // at step_idx g:
 // - read code from out_code_cache[g], then embed it with codebook table g-1
-// - write new kv at cache row g+1, sample with lm_head[g]
-// - write result to out_code_cache[g+1]
+// - append kv at position g+1, return the [n_vocab, n_lanes] logits of lm_head[g]
 // step_idx must be in [1, n_acoustic - 1]
 ggml_tensor * clip_graph_qwen3tts_gen::code_gen::step(
         std::vector<ggml_tensor *> & k_cache,
         std::vector<ggml_tensor *> & v_cache,
         ggml_tensor * out_code_cache,
-        ggml_tensor * inp_rand,
-        int step_idx) const {
+        int step_idx,
+        int64_t n_lanes) const {
     const int64_t n_acoustic = model.gen_code_head_w->ne[2];
     GGML_ASSERT(step_idx >= 1 && step_idx < n_acoustic);
     GGML_ASSERT(k_cache.size() == model.layers.size());
     GGML_ASSERT(v_cache.size() == model.layers.size());
 
-    const int64_t n_kv_pad = k_cache[0]->ne[1];
-    const int     pos      = step_idx + 1; // new cache row and RoPE position
+    const int pos = step_idx + 1; // new cache row and RoPE position
 
     // embed the previous code via this step's codebook table (rows are already scalars)
     ggml_tensor * code_in = ggml_view_1d(ctx0, out_code_cache, 1, (size_t) step_idx * out_code_cache->nb[1]);
@@ -257,18 +271,17 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::step(
     cur = ggml_reshape_1d(ctx0, cur, cur->ne[0]);
     cb(cur, "step_embd_in", step_idx);
 
-    cur = project_in(cur);
+    cur = to_lanes(project_in(cur), n_lanes);
     cb(cur, "step_proj_in", step_idx);
 
-    ggml_tensor * kq_mask = causal_mask_row(n_kv_pad, pos);
-    ggml_tensor * inp_pos = const_i32(k_cache[0], (float) pos);
+    ggml_tensor * inp_pos = lane_positions(pos, n_lanes);
 
     for (size_t il = 0; il < model.layers.size(); il++) {
-        cur = layer_forward(cur, model.layers[il], inp_pos, kq_mask, k_cache[il], v_cache[il], n_kv_pad, pos, (int) il);
+        cur = layer_forward(cur, model.layers[il], inp_pos, k_cache[il], v_cache[il], (int) il);
         cb(cur, "step_layer_out", (int) il);
     }
 
-    // final norm, this step's lm_head, sample, write the result
+    // final norm, this step's lm_head
     cur = ggml_rms_norm(ctx0, cur, hparams.eps);
     cur = ggml_mul(ctx0, cur, model.gen_code_norm_w);
 
@@ -277,11 +290,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::step(
                                         (size_t) step_idx * head_w->nb[2]);
     ggml_tensor * logits = ggml_mul_mat(ctx0, head_g, cur);
     cb(logits, "step_logits", step_idx);
-
-    ggml_tensor * sampled = do_sampling(logits, inp_rand);
-    cb(sampled, "step_sampled", step_idx);
-
-    return cache_set(out_code_cache, pos, sampled);
+    return logits;
 }
 
 // causal conv1d, stride 1: prepend persisted left-context instead of zero-padding, then a plain conv
@@ -652,8 +661,7 @@ std::vector<c2w_state_slot> list_c2w_state_slots(const clip_hparams & hparams, c
     return slots;
 }
 
-// both sub-graphs are always built, so the topology stays constant
-// ggml_build_forward_select() then picks the one that actually runs
+// every process's tensors are built, but only the selected process is expanded into the graph
 ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     GGML_ASSERT(n_batch == 1); // this module only ever processes one frame at a time
 
@@ -661,12 +669,15 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     switch (gen_process) {
         case CLIP_GEN_PROCESS_GEN_CODE: idx = 0; break;
         case CLIP_GEN_PROCESS_GEN_WAV:  idx = 1; break;
+        case CLIP_GEN_PROCESS_EMBED_CODES: idx = 2; break;
         default: GGML_ABORT("unknown gen_process");
     }
 
     // ---- CLIP_GEN_PROCESS_GEN_CODE: backbone hidden state -> 16 RVQ codes + next-step embd ----
     // not build_inp_raw(), a GEN_WAV call's `img` has no hidden-state data
-    ggml_tensor * h_state = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_mmproj_embd);
+    // with guidance, the conditional then the unconditional backbone hidden state
+    const int n_lanes = cfg_scale != 1.0f ? 2 : 1;
+    ggml_tensor * h_state = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_mmproj_embd * n_lanes);
     ggml_set_name(h_state, "inp_raw"); // must keep this exact name, clip_encode() sets it by name
     ggml_set_input(h_state);
 
@@ -680,20 +691,18 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
 
     const int64_t n_acoustic = model.gen_code_head_w->ne[2]; // 15
     const int     n_codes    = (int) n_acoustic + 1;         // 16
-    const int64_t n_kv_pad   = n_codes;
     const int     n_layer    = (int) model.layers.size();
-    const int     n_head     = hparams.n_head;
-    const int     n_head_kv  = hparams.n_head_kv;
-    const int64_t d_head     = model.layers[0].q_w->ne[1] / n_head;
 
-    // zero-filled per layer k/v caches, so masked-out rows can't hold garbage
-    std::vector<ggml_tensor *> k_cache(n_layer), v_cache(n_layer);
-    for (int il = 0; il < n_layer; il++) {
-        k_cache[il] = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_head * n_head_kv, n_kv_pad), 0.0f);
-        v_cache[il] = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_head * n_head_kv, n_kv_pad), 0.0f);
+    // per layer k/v history, every lane at once; each lane has its own depth history, all embed the same sampled codes
+    std::vector<ggml_tensor *> k_cache(n_layer, nullptr);
+    std::vector<ggml_tensor *> v_cache(n_layer, nullptr);
+
+    code_gen cg(*this, top_k, top_p, temp);
+    if (n_lanes > 1) {
+        cg.cfg = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+        ggml_set_name(cg.cfg, "inp_cfg_scale");
+        ggml_set_input(cg.cfg);
     }
-
-    code_gen cg(*this, top_k, top_p);
 
     ggml_tensor * out_code_cache = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_codes);
     out_code_cache = cg.cache_set(out_code_cache, 0, code0);
@@ -702,13 +711,17 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     ggml_set_name(inp_rand0, "inp_rand_0");
     ggml_set_input(inp_rand0);
 
-    cg.prefill(k_cache, v_cache, out_code_cache, h_state, code0_embd, inp_rand0);
+    ggml_tensor * logits = cg.guide(cg.prefill(k_cache, v_cache, ggml_reshape_2d(ctx0, h_state, n_mmproj_embd, n_lanes), code0_embd));
+    out_code_cache = cg.cache_set(out_code_cache, 1, cg.do_sampling(logits, inp_rand0));
 
     for (int g = 1; g < n_acoustic; g++) {
         ggml_tensor * inp_rand = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
         ggml_set_name(inp_rand, ("inp_rand_" + std::to_string(g)).c_str());
         ggml_set_input(inp_rand);
-        out_code_cache = cg.step(k_cache, v_cache, out_code_cache, inp_rand, g);
+        logits = cg.guide(cg.step(k_cache, v_cache, out_code_cache, g, n_lanes));
+        ggml_tensor * sampled = cg.do_sampling(logits, inp_rand);
+        cb(sampled, "step_sampled", g);
+        out_code_cache = cg.cache_set(out_code_cache, g + 1, sampled);
     }
 
     // output 1: this frame's 16 sampled codes, for the caller's code2wav window
@@ -732,7 +745,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     cb(out_embd, "gen_audio_out", -1);
 
     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
+    GGML_ASSERT(n_frames > 0 && n_frames <= hparams.wav_tfm_swa);
 
     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
     ggml_set_name(inp_codes, "inp_codes");
@@ -755,16 +768,34 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
         ggml_set_output(slot.second);
     }
 
-    // out_embd goes last, clip_encode() reads it back via ggml_graph_node(gf, -1)
-    ggml_tensor * outs[2];
-    outs[0] = out_codes; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 2, idx);
-    for (auto & slot : c2w.state_out) {
-        outs[0] = out_codes; outs[1] = slot.second;
-        ggml_build_forward_select(gf, outs, 2, idx);
+    ggml_tensor * ref_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_codes);
+    ggml_set_name(ref_codes, "inp_ref_codes");
+    ggml_set_input(ref_codes);
+    ggml_tensor * ref_embd = nullptr;
+    for (int g = 0; g < n_codes; ++g) {
+        ggml_tensor * code = ggml_view_1d(ctx0, ref_codes, 1, (size_t) g * sizeof(int32_t));
+        ggml_tensor * table = g == 0 ? model.gen_code_out_embd_w :
+            ggml_view_2d(ctx0, model.gen_code_embd_w, model.gen_code_embd_w->ne[0], model.gen_code_embd_w->ne[1],
+                         model.gen_code_embd_w->nb[1], (size_t) (g - 1) * model.gen_code_embd_w->nb[2]);
+        ggml_tensor * value = ggml_get_rows(ctx0, table, code);
+        ref_embd = ref_embd ? ggml_add(ctx0, ref_embd, value) : value;
     }
-    outs[0] = out_embd; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 2, idx);
+
+    ggml_set_name(ref_embd, "ref_code_embd");
+    ggml_set_output(ref_embd);
+
+    // only the selected process goes in the graph, so its compute buffer holds that branch alone.
+    // clip_encode() caches the speech graphs per process, each with its own buffer.
+    // out_embd goes last, clip_encode() reads it back via ggml_graph_node(gf, -1)
+    auto expand = [&](ggml_tensor * code, ggml_tensor * wav, ggml_tensor * embed) {
+        ggml_tensor * outs[3] = { code, wav, embed };
+        ggml_build_forward_expand(gf, outs[idx]);
+    };
+    expand(out_codes, out_audio, ref_embd);
+    for (auto & slot : c2w.state_out) {
+        expand(out_codes, slot.second, ref_embd);
+    }
+    expand(out_embd, out_audio, ref_embd);
 
     return gf;
 }

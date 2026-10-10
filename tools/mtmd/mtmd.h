@@ -2,6 +2,7 @@
 #define MTMD_H
 
 #include "ggml.h"
+#include "gguf.h"
 #include "llama.h"
 
 #include <stddef.h>
@@ -122,6 +123,12 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // Optional GGUF byte source used during loading instead of the filename.
+    // The callback must return the requested byte count, or a short read on failure.
+    gguf_reader_callback_t model_reader;
+    void * model_reader_user_data;
+    uint64_t model_reader_size;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -148,6 +155,10 @@ MTMD_API bool mtmd_support_vision(const mtmd_context * ctx);
 
 // whether the current model supports audio input
 MTMD_API bool mtmd_support_audio(const mtmd_context * ctx);
+
+// Release audio-input weights and buffers when no encoding is in flight.
+// Audio generation remains available; subsequent audio-input calls are unsupported.
+MTMD_API void mtmd_release_audio_encoder(mtmd_context * ctx);
 
 // get audio sample rate in Hz, for example 16000 for Whisper
 // return -1 if audio is not supported
@@ -387,6 +398,7 @@ enum mtmd_gen_process_type {
     MTMD_GEN_PROCESS_TYPE_GEN_WAV,  // convert semantic to PCM audio
                                     // for qwen3tts, this is code2wav
                                     // for pocket-tts, this is mimi decoder
+    MTMD_GEN_PROCESS_TYPE_EMBED_CODES, // Qwen3-TTS: one complete codec frame to summed talker row
 };
 
 struct mtmd_gen_inp {
@@ -399,6 +411,8 @@ struct mtmd_gen_inp {
     float   top_p;
     uint32_t seed; // UINT32_MAX for random
     float    temp; // sampling temperature, or noise scale for flow-matching decoders
+    const float * uncond_embd; // Breeze guidance: the unconditional hidden state, n_text_embd elements, or null
+    float    cfg_scale;        // with uncond_embd: logits = uncond + cfg_scale * (cond - uncond)
 
     // for MTMD_GEN_PROCESS_TYPE_GEN_WAV
     // pass either codes (discrete) or feats (continuous), depending on the pipeline
@@ -408,6 +422,7 @@ struct mtmd_gen_inp {
     size_t        n_feats;
     const char * state_data;
     size_t       state_size;
+    bool         reset_attention; // keep state_data's convolution history, start attention cold
 };
 
 struct mtmd_gen_out {
@@ -452,6 +467,8 @@ MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(
     const char * mmproj_fname,
     struct mtmd_context_params ctx_params);
+// Actual currently allocated model and compute buffers of a loaded context.
+MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const mtmd_context * ctx);
 #endif
 
 //

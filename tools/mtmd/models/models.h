@@ -50,6 +50,11 @@ struct clip_graph_qwen3vl : clip_graph_qwen2vl {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_ling3vl : clip_graph_qwen3vl {
+    clip_graph_ling3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_qwen3vl(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
 struct clip_graph_minimax_m3 : clip_graph {
     clip_graph_minimax_m3(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
@@ -243,61 +248,65 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
 };
 
 struct clip_graph_qwen3tts_gen : clip_graph {
-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p)
-        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
+    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p, int n_frames,
+                            float temp = 0.0f, float cfg_scale = 1.0f)
+        : clip_graph(ctx, img), gen_process(gen_process), n_frames(n_frames), top_k(top_k), top_p(top_p), temp(temp), cfg_scale(cfg_scale) {}
     ggml_cgraph * build() override;
 
     // which sub-graph build() constructs, fixed at graph-build time
     clip_gen_process_type gen_process;
+    int n_frames;
 
     // sampling params, fixed at graph-build time (GEN_CODE only)
     int   top_k;
     float top_p;
+    float temp;      // Breeze only: depth sampling temperature, 0 keeps 1
+    float cfg_scale; // != 1: two lanes, the second unconditional, mixed before sampling
 
     //
     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
     // MTP-style code predictor, one token per codebook
     //
     struct code_gen : clip_graph {
-        code_gen(const clip_graph & parent, int top_k, float top_p)
-            : clip_graph(parent), top_k(top_k), top_p(top_p) {}
+        code_gen(const clip_graph & parent, int top_k, float top_p, float temp)
+            : clip_graph(parent), top_k(top_k), top_p(top_p), temp(temp) {}
         ggml_cgraph * build() override { GGML_ABORT("call prefill()/step() instead"); }
 
         int   top_k;
         float top_p;
+        float temp;
+        ggml_tensor * cfg = nullptr; // "inp_cfg_scale", an input so one graph serves every guidance strength
+
+        ggml_tensor * guide(ggml_tensor * logits) const;
 
         ggml_tensor * cache_set(ggml_tensor * cache, int row_idx, ggml_tensor * value) const;
         ggml_tensor * do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const;
 
         ggml_tensor * const_i32(ggml_tensor * anchor, float value) const;
-        ggml_tensor * causal_mask_row(int64_t n_kv_pad, int pos) const;
+        ggml_tensor * lane_positions(int pos, int64_t n_lanes) const;
+        ggml_tensor * to_lanes(ggml_tensor * cur, int64_t n_lanes) const;
         ggml_tensor * project_in(ggml_tensor * cur) const;
 
         ggml_tensor * layer_forward(
                 ggml_tensor * cur,
                 const clip_layer & layer,
                 ggml_tensor * inp_pos,
-                ggml_tensor * kq_mask,
                 ggml_tensor *& k_cache_layer,
                 ggml_tensor *& v_cache_layer,
-                int64_t n_kv_pad,
-                int pos,
                 int il) const;
 
-        void prefill(
+        ggml_tensor * prefill(
                 std::vector<ggml_tensor *> & k_cache,
                 std::vector<ggml_tensor *> & v_cache,
-                ggml_tensor *& out_code_cache,
                 ggml_tensor * h_state,
-                ggml_tensor * code0_embd,
-                ggml_tensor * inp_rand) const;
+                ggml_tensor * code0_embd) const;
 
         ggml_tensor * step(
                 std::vector<ggml_tensor *> & k_cache,
                 std::vector<ggml_tensor *> & v_cache,
                 ggml_tensor * out_code_cache,
-                ggml_tensor * inp_rand,
-                int step_idx) const;
+                int step_idx,
+                int64_t n_lanes) const;
     };
 
     //
@@ -355,10 +364,13 @@ struct clip_graph_pockettts_seanet : clip_graph {
 
 // mimi encoder + speaker_proj: reference waveform -> voice conditioning rows
 struct clip_graph_pockettts_spkenc : clip_graph {
-    clip_graph_pockettts_spkenc(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    clip_graph_pockettts_spkenc(clip_ctx * ctx, const clip_image_f32 & img, bool streaming = false)
+        : clip_graph(ctx, img), streaming(streaming) {}
     ggml_cgraph * build() override;
+    bool streaming;
 
-    ggml_tensor * tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, ggml_tensor * inp_pos, ggml_tensor * kq_mask, int il) const;
+    ggml_tensor * tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, ggml_tensor * inp_pos, ggml_tensor * kq_mask, int il,
+                                    clip_graph_pockettts_seanet * state = nullptr) const;
 };
 
 //
@@ -391,6 +403,7 @@ std::vector<c2w_state_slot> list_c2w_state_slots(const clip_hparams & hparams, c
 
 // same, for the streaming mimi decoder (pocket-tts GEN_WAV)
 std::vector<c2w_state_slot> list_pockettts_state_slots(const clip_hparams & hparams, const clip_model & model);
+std::vector<c2w_state_slot> list_mimi_encoder_state_slots(const clip_hparams & hparams, const clip_model & model);
 
 struct clip_graph_kimik25 : clip_graph {
     clip_graph_kimik25(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
