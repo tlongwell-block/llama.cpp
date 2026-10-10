@@ -200,7 +200,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::guide(ggml_tensor * cond, ggml_
     if (!uncond) {
         return cond;
     }
-    return ggml_add(ctx0, uncond, ggml_scale(ctx0, ggml_sub(ctx0, cond, uncond), cfg_scale));
+    return ggml_add(ctx0, uncond, ggml_mul(ctx0, ggml_sub(ctx0, cond, uncond), cfg));
 }
 
 // position 0: hidden bridge, seeds the k/v cache, no sampling
@@ -707,6 +707,11 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     }
 
     code_gen cg(*this, top_k, top_p, temp, cfg_scale);
+    if (n_lanes > 1) {
+        cg.cfg = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+        ggml_set_name(cg.cfg, "inp_cfg_scale");
+        ggml_set_input(cg.cfg);
+    }
 
     ggml_tensor * out_code_cache = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_codes);
     out_code_cache = cg.cache_set(out_code_cache, 0, code0);
@@ -793,17 +798,18 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     ggml_set_name(ref_embd, "ref_code_embd");
     ggml_set_output(ref_embd);
 
+    // only the selected process goes in the graph, so its compute buffer holds that branch alone.
+    // clip_encode() caches the speech graphs per process, each with its own buffer.
     // out_embd goes last, clip_encode() reads it back via ggml_graph_node(gf, -1)
-    ggml_tensor * outs[3];
-    outs[2] = ref_embd;
-    outs[0] = out_codes; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 3, idx);
+    auto expand = [&](ggml_tensor * code, ggml_tensor * wav, ggml_tensor * embed) {
+        ggml_tensor * outs[3] = { code, wav, embed };
+        ggml_build_forward_expand(gf, outs[idx]);
+    };
+    expand(out_codes, out_audio, ref_embd);
     for (auto & slot : c2w.state_out) {
-        outs[0] = out_codes; outs[1] = slot.second;
-        ggml_build_forward_select(gf, outs, 3, idx);
+        expand(out_codes, slot.second, ref_embd);
     }
-    outs[0] = out_embd; outs[1] = out_audio;
-    ggml_build_forward_select(gf, outs, 3, idx);
+    expand(out_embd, out_audio, ref_embd);
 
     return gf;
 }

@@ -144,6 +144,22 @@ static void clip_image_convert_f32_to_u8(const clip_image_f32& src, clip_image_u
 #endif
 
 
+// A built and allocated graph kept for reuse. Speech generation runs the same few graph shapes
+// every codec frame, so rebuilding, splitting and allocating them each call costs more CPU
+// than the GPU spends computing them. Each entry owns its node memory and scheduler, so the
+// shapes can alternate without invalidating one another; a reused graph keeps its split ids,
+// which also lets the CUDA backend replay its captured graph without re-checking every node.
+struct clip_graph_cache_entry {
+    clip_gen_process_type gen_process;
+    int   nx, ny, n_codes, top_k;
+    float top_p, temp;
+    bool  guided; // two lanes; the guidance scale itself is an input
+
+    std::vector<uint8_t>   meta;
+    ggml_backend_sched_ptr sched;
+    ggml_cgraph *          gf = nullptr;
+};
+
 struct clip_ctx {
     clip_model model;
 
@@ -162,6 +178,9 @@ struct clip_ctx {
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
+    std::vector<clip_graph_cache_entry> graph_cache; // per-frame speech graphs, see clip_graph_cache_entry
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
@@ -222,14 +241,19 @@ struct clip_ctx {
     }
 
     void init_scheduler(const clip_context_params & ctx_params) {
-        sched.reset(
+        cb_eval = ctx_params.cb_eval;
+        cb_eval_user_data = ctx_params.cb_eval_user_data;
+        sched = new_scheduler();
+    }
+
+    ggml_backend_sched_ptr new_scheduler() {
+        ggml_backend_sched_ptr s(
             ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, true)
         );
-
-        if (ctx_params.cb_eval != nullptr) {
-            ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+        if (cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(s.get(), cb_eval, cb_eval_user_data);
         }
-
+        return s;
     }
 
     ~clip_ctx() {
@@ -4518,6 +4542,52 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
+// the cached graph for this call's shape, a new empty entry on a miss, or nullptr when the
+// call is not cached. Only the Qwen3-TTS generator is cached: its graph is a function of the
+// fields below alone, all other inputs are uploaded on every call.
+static clip_graph_cache_entry * clip_graph_cache_get(clip_ctx * ctx, const clip_image_f32_batch & imgs,
+                                                     const clip_encode_params & params) {
+    if (ctx->proj_type() != PROJECTOR_TYPE_QWEN3TTS_GEN || imgs.entries.size() != 1) {
+        return nullptr;
+    }
+    const int n_codes = params.codes ? (int) params.codes->size() : 0;
+    // streaming decodes one frame at a time, priming and final flushes of other lengths are rare
+    if (params.gen_process == CLIP_GEN_PROCESS_GEN_WAV && n_codes != ctx->model.gen_code_head_w->ne[2] + 1) {
+        return nullptr;
+    }
+    for (auto & e : ctx->graph_cache) {
+        if (e.gen_process == params.gen_process && e.nx == imgs.entries[0].nx() && e.ny == imgs.entries[0].ny() &&
+            e.n_codes == n_codes && e.top_k == params.top_k && e.top_p == params.top_p &&
+            e.temp == params.temp && e.guided == (params.cfg_scale != 1.0f)) {
+            return &e;
+        }
+    }
+    // a turn uses a handful of shapes, a long tail of them means something varies per call
+    const size_t max_entries = 16;
+    if (ctx->graph_cache.size() >= max_entries) {
+        ctx->graph_cache.clear();
+    }
+    clip_graph_cache_entry e;
+    e.gen_process = params.gen_process;
+    e.nx = imgs.entries[0].nx();
+    e.ny = imgs.entries[0].ny();
+    e.n_codes = n_codes;
+    e.top_k = params.top_k;
+    e.top_p = params.top_p;
+    e.temp = params.temp;
+    e.guided = params.cfg_scale != 1.0f;
+    e.meta.resize(ctx->buf_compute_meta.size());
+    if (ctx->graph_cache.empty()) {
+        // the first entry takes over the warmup scheduler and the buffers it reserved
+        e.sched = std::move(ctx->sched);
+        ctx->sched = ctx->new_scheduler();
+    } else {
+        e.sched = ctx->new_scheduler();
+    }
+    ctx->graph_cache.push_back(std::move(e));
+    return &ctx->graph_cache.back();
+}
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
@@ -4545,12 +4615,39 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ctx->rng.seed(params->seed == UINT32_MAX ? std::random_device{}() : params->seed);
     }
 
-    // build the inference graph
-    ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+    // build the inference graph, or reuse the cached one of the same shape
+    clip_graph_cache_entry * cached = clip_graph_cache_get(ctx, imgs, *params);
+    ggml_backend_sched_t sched = cached ? cached->sched.get() : ctx->sched.get();
+    ggml_cgraph * gf = cached ? cached->gf : nullptr;
+    if (gf == nullptr) {
+        ggml_backend_sched_reset(sched);
+        if (cached) {
+            // the builder lays out its nodes in buf_compute_meta, lend it the entry's memory
+            std::swap(ctx->buf_compute_meta, cached->meta);
+            try {
+                gf = clip_get_graph_builder(ctx, imgs, params)->build();
+            } catch (...) {
+                std::swap(ctx->buf_compute_meta, cached->meta);
+                ctx->graph_cache.pop_back();
+                throw;
+            }
+            std::swap(ctx->buf_compute_meta, cached->meta);
+        } else {
+            gf = clip_get_graph_builder(ctx, imgs, params)->build();
+        }
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+            if (cached) {
+                ctx->graph_cache.pop_back();
+            }
+            return false;
+        }
+        if (cached) {
+            cached->gf = gf;
+            LOG_INF("%s: cached graph %d (gen_process %d, %d codes), %zu entries, compute buffer %.2f MiB\n", __func__,
+                ggml_graph_n_nodes(gf), (int) cached->gen_process, cached->n_codes, ctx->graph_cache.size(),
+                ggml_backend_sched_get_buffer_size(sched, ctx->backend) / 1024.0 / 1024.0);
+        }
     }
 
     // set inputs
@@ -5457,6 +5554,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     }
                     std::vector<int32_t> code0 = { params->code0 };
                     set_input_i32("inp_code0", code0);
+                    if (params->cfg_scale != 1.0f) {
+                        set_input_f32("inp_cfg_scale", { params->cfg_scale });
+                    }
 
                     // one uniform(0,1) draw per codebook, used by do_sampling()
                     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -5894,7 +5994,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
-    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    auto status = ggml_backend_sched_graph_compute(sched, gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;

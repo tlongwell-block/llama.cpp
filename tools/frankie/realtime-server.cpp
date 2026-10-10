@@ -7,6 +7,7 @@
 #include "cpp-httplib/httplib.h"
 #include "mouth-session.h"
 #include "speech-stream.h"
+#include "pcm-worker.h"
 #include "watermark.h"
 #include "mtmd-vad.h"
 #include "turn-session.h"
@@ -1331,15 +1332,22 @@ struct realtime_session {
                 // As in the v9 demo: one causal watermark stream per response, after the
                 // final mouth PCM and before PCM16. Phrase marks keep source positions,
                 // which the sample-conserving stream maps one to one onto output.
+                // The stream marks and sends on its own thread, two codec frames deep.
                 std::optional<frankie_watermark::stream> marking;
-                if (watermark && audio_output) { marking.emplace(*watermark); }
+                std::optional<frankie_pcm_worker> marker;
+                if (watermark && audio_output) {
+                    marking.emplace(*watermark);
+                    marker.emplace([&](const float * samples, size_t count) {
+                        const auto marked = marking->push(samples, count);
+                        emit_pcm(marked.data(), marked.size());
+                    }, 2 * 1920);
+                }
                 uint64_t speech_samples = 0;
                 auto emit_audio = [&](const float * samples, size_t count) {
                     speech_samples += count;
-                    if (!marking) { return emit_pcm(samples, count); }
+                    if (!marker) { return emit_pcm(samples, count); }
                     if (brain.cancelled.load()) { throw std::runtime_error("cancelled"); }
-                    const auto marked = marking->push(samples, count);
-                    emit_pcm(marked.data(), marked.size());
+                    marker->push(samples, count);
                 };
                 const bool pipelined = audio_output;
                 std::unique_ptr<speech_stream> speech;
@@ -1362,6 +1370,7 @@ struct realtime_session {
                     speech->finish();
                 }
                 if (marking) {
+                    marker->finish();
                     if (brain.cancelled.load()) { throw std::runtime_error("cancelled"); }
                     const auto tail = marking->finish();
                     emit_pcm(tail.data(), tail.size());

@@ -276,6 +276,7 @@ struct clip_graph_qwen3tts_gen : clip_graph {
         float top_p;
         float temp;
         float cfg_scale;
+        ggml_tensor * cfg = nullptr; // "inp_cfg_scale", an input so one graph serves every guidance strength
 
         ggml_tensor * guide(ggml_tensor * cond, ggml_tensor * uncond) const;
 

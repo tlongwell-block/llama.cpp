@@ -10,6 +10,11 @@
 #include <stdexcept>
 #include <iostream>
 
+// Depth-decoder sampling of every phrase; warmup() builds the guided graph with the same values.
+constexpr float breeze_code_temperature = 0.9f;
+constexpr int   code_top_k = 50;
+constexpr float code_top_p = 1.0f;
+
 mouth_session::mouth_session(const std::string & package, const frankie_options & config,
                              const voice_transcriber & transcribe) :
     talker_source(package, "talker", config.talker_model),
@@ -262,6 +267,26 @@ void mouth_session::warmup() {
     const plain_style style{1.0f, 3.0f, 256, -1, false};
     std::lock_guard<std::mutex> lock(execution);
     for (int i = 0; i < 2; ++i) { speak_impl(text, {}, {}, &style); }
+    if (breeze && delivery) {
+        // Guided replies sample codes through a two-lane graph the plain warmup never runs. Run it
+        // twice here, so a reply's first frames don't pay its build and CUDA graph capture. The
+        // other seed leaves replies' sampling as it was: their next call reseeds.
+        std::vector<float> hidden(llama_model_n_embd(model.get()), 0.0f);
+        mtmd_gen_inp inp = mtmd_gen_inp_default(mctx.get());
+        inp.type        = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
+        inp.code0       = 0;
+        inp.embd        = hidden.data();
+        inp.uncond_embd = hidden.data();
+        inp.cfg_scale   = 3.0f;
+        inp.temp        = breeze_code_temperature;
+        inp.top_k       = code_top_k;
+        inp.top_p       = code_top_p;
+        inp.seed        = 0;
+        for (int i = 0; i < 2; ++i) {
+            mtmd_gen_out out{};
+            if (mtmd_gen_audio_process(mctx.get(), &inp, &out)) { throw std::runtime_error("guided mouth warmup failed"); }
+        }
+    }
 }
 
 void mouth_session::speak_backchannel(int reaction, bool strong, const audio_callback & on_audio) {
@@ -509,9 +534,9 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         input.speaker_offset = expression ? speaker_offset.data() : nullptr;
         input.n_speaker_offset = expression ? speaker_offset.size() : 0;
         }
-        input.code_temperature = breeze ? 0.9f : 0.6f;
-        input.top_k         = 50;
-        input.top_p         = 1.0f;
+        input.code_temperature = breeze ? breeze_code_temperature : 0.6f;
+        input.top_k         = code_top_k;
+        input.top_p         = code_top_p;
         input.seed          = 42;
         input.out_type      = MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM;
         // Codec context (MTPLX "convolution"): a reply's phrases share the decoder's convolution state.
