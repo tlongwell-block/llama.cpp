@@ -278,24 +278,22 @@ struct clip_graph_qwen3tts_gen : clip_graph {
         float cfg_scale;
         ggml_tensor * cfg = nullptr; // "inp_cfg_scale", an input so one graph serves every guidance strength
 
-        ggml_tensor * guide(ggml_tensor * cond, ggml_tensor * uncond) const;
+        ggml_tensor * guide(ggml_tensor * logits) const;
 
         ggml_tensor * cache_set(ggml_tensor * cache, int row_idx, ggml_tensor * value) const;
         ggml_tensor * do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const;
 
         ggml_tensor * const_i32(ggml_tensor * anchor, float value) const;
-        ggml_tensor * causal_mask_row(int64_t n_kv_pad, int pos) const;
+        ggml_tensor * lane_positions(int pos, int64_t n_lanes) const;
+        ggml_tensor * to_lanes(ggml_tensor * cur, int64_t n_lanes) const;
         ggml_tensor * project_in(ggml_tensor * cur) const;
 
         ggml_tensor * layer_forward(
                 ggml_tensor * cur,
                 const clip_layer & layer,
                 ggml_tensor * inp_pos,
-                ggml_tensor * kq_mask,
                 ggml_tensor *& k_cache_layer,
                 ggml_tensor *& v_cache_layer,
-                int64_t n_kv_pad,
-                int pos,
                 int il) const;
 
         ggml_tensor * prefill(
@@ -308,7 +306,8 @@ struct clip_graph_qwen3tts_gen : clip_graph {
                 std::vector<ggml_tensor *> & k_cache,
                 std::vector<ggml_tensor *> & v_cache,
                 ggml_tensor * out_code_cache,
-                int step_idx) const;
+                int step_idx,
+                int64_t n_lanes) const;
     };
 
     //
