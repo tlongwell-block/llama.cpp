@@ -22,7 +22,8 @@ class frankie_completions {
         json input;
         bool chat = false, streaming = false, ready = false, done = false;
         std::atomic<bool> cancelled{false};
-        std::string id, raw, sent, reasoning, error;
+        std::string id, sent, reasoning, error;
+        common_chat_input raw;
         const int64_t created = std::time(nullptr);
         llama_tokens prompt, draft;
         size_t offset = 0, generated = 0, maximum = frankie_options::default_output_tokens;
@@ -121,6 +122,7 @@ class frankie_completions {
             j.images.clear();
             j.parser = common_chat_parser_params(formatted);
             j.parser.parser = formatted.parser;
+            j.parser.generation_prompt = common_chat_input_tokenize(vocab, formatted.generation_prompt);
             sampling.generation_prompt = formatted.generation_prompt;
             j.send({{"index", 0}, {"delta", {{"role", "assistant"}}}, {"finish_reason", nullptr}});
         } else {
@@ -199,9 +201,9 @@ class frankie_completions {
         }
         common_chat_msg message;
         message.role = "assistant";
-        message.content = j.raw;
+        message.content = j.raw.text;
         if (j.chat) {
-            message = common_chat_parse(common_chat_input(j.raw), false, j.parser);
+            message = common_chat_parse(j.raw, false, j.parser);
             message.role = "assistant";
             std::vector<std::string> ids;
             size_t serial = 0;
@@ -222,7 +224,7 @@ class frankie_completions {
         j.result = {{"id", j.id}, {"object", j.chat ? "chat.completion" : "text_completion"},
             {"created", j.created}, {"model", "Frankie"},
             {"choices", json::array({j.chat ? json{{"index", 0}, {"message", msg}, {"finish_reason", finish_reason}}
-                                           : json{{"index", 0}, {"text", j.raw}, {"finish_reason", finish_reason}}})},
+                                           : json{{"index", 0}, {"text", j.raw.text}, {"finish_reason", finish_reason}}})},
             {"usage", {{"prompt_tokens", j.prompt.size()}, {"completion_tokens", j.generated},
                        {"prompt_tokens_details", {{"cached_tokens", j.cached}}},
                        {"total_tokens", j.prompt.size() + j.generated}}}};
@@ -327,8 +329,8 @@ class frankie_completions {
 
     void stream_output(job & j) {
         if (!j.streaming) { return; }
-        auto parsed = j.chat ? common_chat_parse(common_chat_input(j.raw), true, j.parser) : common_chat_msg{};
-        const auto & text = j.chat ? parsed.content : j.raw;
+        auto parsed = j.chat ? common_chat_parse(j.raw, true, j.parser) : common_chat_msg{};
+        const auto & text = j.chat ? parsed.content : j.raw.text;
         json delta = json::object();
         if (text.compare(0, j.sent.size(), j.sent) != 0) { throw std::runtime_error("text parser retracted streamed output"); }
         if (text.size() > j.sent.size()) { delta[j.chat ? "content" : "text"] = text.substr(j.sent.size()); j.sent = text; }
@@ -478,7 +480,7 @@ class frankie_completions {
                         for (const auto token : ids) {
                             j.pending = token;
                             if (llama_vocab_is_eog(vocab, token)) { finished = "stop"; break; }
-                            j.raw += common_token_to_piece(vocab, token, true);
+                            j.raw.append(common_token_to_piece(vocab, token, true), token);
                             ++j.generated;
                             if (j.generated >= j.maximum) { finished = "length"; break; }
                         }
