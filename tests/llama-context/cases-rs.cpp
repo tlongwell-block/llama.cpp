@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <utility>
 #include <vector>
 
 // roll back multiple sequences, then replay them in a single batch whose per-seq token count exceeds n_ubatch: each
@@ -525,6 +526,211 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// capture the layer inputs, intermediate and final, of a multi-seq batch with sparse outputs: the batch interleaves
+// the seqs and is wider than n_ubatch, so the ubatches extract the rows out of batch order. Every captured row is
+// compared against single-seq reference runs, and the logits against a context with the taps off.
+struct case_layer_inp : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "layer_inp"; }
+
+    const char * description() const override {
+        return "layer inputs of a split multi-seq batch match single-seq runs, and the taps leave the logits unchanged";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN4EXP) {
+            return "requires the final-state tap of Qwen3.5 or Qwen4exp";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int      n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        const uint32_t n_layer = (uint32_t) llama_model_n_layer(mr.model);
+        const size_t   n_embd  = (size_t) llama_model_n_embd(mr.model);
+        const size_t   n_final = (size_t) llama_model_n_embd_layer_inp(mr.model);
+
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        if (llama_arch_from_string(arch_name) == LLM_ARCH_QWEN4EXP) {
+            CTX_REQUIRE(n_final > n_embd && n_final == (size_t) llama_model_n_embd_out(mr.model),
+                    "the final tap is not the hyper-connection stream (" + std::to_string(n_final) + " floats)");
+        } else {
+            CTX_REQUIRE(n_final == n_embd, "the final tap is not n_embd wide (" + std::to_string(n_final) + " floats)");
+        }
+
+        constexpr uint32_t  n_seqs   = 3;
+        constexpr llama_pos n_prefix = 5;
+        constexpr uint32_t  n_new[n_seqs] = { 11, 6, 14 }; // uneven, so that the seqs leave the ubatches at different times
+
+        const auto width     = [&](uint32_t il) { return il == n_layer ? n_final : n_embd; };
+        const auto is_output = [&](uint32_t s, uint32_t i) { return i % 3 == 1 || i + 1 == n_new[s]; };
+
+        // nextn off, unmasked (MTP target) and masked: each crops the output rows at a different point of the graph
+        bool nextn        = false;
+        bool nextn_masked = false;
+
+        const auto make = [&](bool taps) {
+            ctx_opts opts;
+            opts.n_ctx      = 256;
+            opts.n_batch    = 64;
+            opts.n_ubatch   = 8;
+            opts.n_seq_max  = n_seqs;
+            opts.kv_unified = 0;
+
+            auto ctx = mr.ctx(opts);
+            if (ctx) {
+                llama_set_embeddings_nextn(ctx.get(), nextn, nextn_masked);
+            }
+            for (uint32_t il = 0; ctx && taps && il <= n_layer; ++il) {
+                llama_set_embeddings_layer_inp(ctx.get(), il, true);
+            }
+            return ctx;
+        };
+
+        // the captures of one run, rows[k] is the (seq, new token) of batch index k
+        struct capture {
+            std::vector<std::pair<uint32_t, uint32_t>> rows;
+            std::vector<std::vector<float>>            layer; // per layer id, rows.size()*width floats
+        };
+
+        // decode the prefixes, then the new tokens of seqs in a single batch, round-robin over the seqs
+        const auto decode = [&](llama_context * ctx, const std::vector<uint32_t> & seqs, bool taps, capture & out) {
+            for (uint32_t s : seqs) {
+                if (!decode_gen(ctx, n_vocab, (llama_seq_id) s, 0, n_prefix)) {
+                    return false;
+                }
+            }
+
+            common_batch batch(ctx);
+            for (uint32_t i = 0; i < *std::max_element(n_new, n_new + n_seqs); ++i) {
+                for (uint32_t s : seqs) {
+                    if (i < n_new[s]) {
+                        const llama_pos pos = n_prefix + (llama_pos) i;
+                        batch.add(gen_token(n_vocab, (llama_seq_id) s, pos), pos, (llama_seq_id) s, is_output(s, i));
+                        out.rows.emplace_back(s, i);
+                    }
+                }
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                return false;
+            }
+
+            for (uint32_t il = 0; taps && il <= n_layer; ++il) {
+                const float * data = llama_get_embeddings_layer_inp(ctx, il);
+                if (data == nullptr) {
+                    return false;
+                }
+                out.layer.emplace_back(data, data + out.rows.size()*width(il));
+            }
+            return true;
+        };
+
+        std::vector<uint32_t> all(n_seqs);
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            all[s] = s;
+        }
+
+        for (const auto & mode : { std::make_pair(false, false), std::make_pair(true, false), std::make_pair(true, true) }) {
+        nextn        = mode.first;
+        nextn_masked = mode.second;
+        const std::string tag = !nextn ? "nextn off" : nextn_masked ? "nextn masked" : "nextn unmasked";
+
+            auto ctx_tap = make(true);
+            auto ctx_off = make(false);
+            CTX_REQUIRE(ctx_tap && ctx_off, "failed to create the contexts");
+
+            capture cap;
+            capture cap_off;
+            CTX_REQUIRE(decode(ctx_tap.get(), all, true, cap), tag + ": " + "the multi-seq decode with taps failed");
+            CTX_REQUIRE(decode(ctx_off.get(), all, false, cap_off), tag + ": " + "the multi-seq decode without taps failed");
+            CTX_REQUIRE(cap.rows.size() > 2*llama_n_ubatch(ctx_tap.get()), tag + ": " + "the batch does not span several ubatches");
+
+            // the multi-seq batch index of each (seq, new token)
+            std::vector<std::vector<int32_t>> idx(n_seqs);
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                idx[s].assign(n_new[s], -1);
+            }
+            for (size_t k = 0; k < cap.rows.size(); ++k) {
+                idx[cap.rows[k].first][cap.rows[k].second] = (int32_t) k;
+            }
+
+            // rows that differ only in batch order must be told apart
+            CTX_REQUIRE(compare_logits(cap.layer[0].data(), cap.layer[0].data() + n_embd, n_embd).nmse() > 0.0,
+                    tag + ": " + "the first two batch rows have identical inputs");
+
+            // unmasked, the nextn rows are the final state of every token too, read through a separate buffer
+            if (nextn && !nextn_masked) {
+                CTX_REQUIRE(n_final == (size_t) llama_model_n_embd_out(mr.model), tag + ": the nextn rows have another width");
+                logits_diff diff_nextn;
+                for (size_t k = 0; k < cap.rows.size(); ++k) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tap.get(), (int32_t) k);
+                    CTX_REQUIRE(h, tag + ": missing nextn row " + std::to_string(k));
+                    diff_nextn.add(h, cap.layer[n_layer].data() + k*n_final, n_final);
+                }
+                TLOG_INF("%s: %s: final tap against the nextn rows: max diff %g\n", __func__, tag.c_str(), (double) diff_nextn.diff_max);
+                CTX_REQUIRE(diff_nextn.diff_max == 0.0f, tag + ": the final tap differs from the nextn rows (first difference at " +
+                        std::to_string(diff_nextn.i_first) + ")");
+            }
+
+            logits_diff diff_off;
+            std::vector<logits_diff> diff_layer(n_layer + 1);
+            logits_diff diff_ref;
+
+            for (size_t k = 0; k < cap.rows.size(); ++k) {
+                if (is_output(cap.rows[k].first, cap.rows[k].second)) {
+                    const float * l_tap = llama_get_logits_ith(ctx_tap.get(), (int32_t) k);
+                    const float * l_off = llama_get_logits_ith(ctx_off.get(), (int32_t) k);
+                    CTX_REQUIRE(l_tap && l_off, "missing multi-seq logits at batch index " + std::to_string(k));
+                    diff_off.add(l_off, l_tap, n_vocab);
+                }
+            }
+
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                auto ctx_ref = make(true);
+                CTX_REQUIRE(ctx_ref, "failed to create the reference context");
+
+                capture ref;
+                CTX_REQUIRE(decode(ctx_ref.get(), { s }, true, ref), "the single-seq decode of seq " + std::to_string(s) + " failed");
+
+                for (uint32_t i = 0; i < n_new[s]; ++i) {
+                    const int32_t k = idx[s][i];
+                    for (uint32_t il = 0; il <= n_layer; ++il) {
+                        const size_t w = width(il);
+                        diff_layer[il].add(ref.layer[il].data() + i*w, cap.layer[il].data() + (size_t) k*w, w);
+                    }
+                    if (is_output(s, i)) {
+                        const float * l_ref = llama_get_logits_ith(ctx_ref.get(), (int32_t) i);
+                        const float * l_tap = llama_get_logits_ith(ctx_tap.get(), k);
+                        CTX_REQUIRE(l_ref && l_tap, "missing reference logits of seq " + std::to_string(s));
+                        diff_ref.add(l_ref, l_tap, n_vocab);
+                    }
+                }
+            }
+
+            for (uint32_t il = 0; il <= n_layer; ++il) {
+                TLOG_INF("%s: %s: layer %u (%zu floats) against single-seq runs: max diff %g, nmse %g\n",
+                        __func__, tag.c_str(), il, width(il), (double) diff_layer[il].diff_max, diff_layer[il].nmse());
+                CTX_REQUIRE(diff_layer[il].nmse() <= NMSE_THRESHOLD,
+                        tag + ": layer " + std::to_string(il) + " inputs differ from the single-seq runs (nmse " +
+                        std::to_string(diff_layer[il].nmse()) + ", first difference at " + std::to_string(diff_layer[il].i_first) + ")");
+            }
+
+            TLOG_INF("%s: %s: logits against single-seq runs: max diff %g, nmse %g; against taps off: max diff %g, nmse %g\n",
+                    __func__, tag.c_str(), (double) diff_ref.diff_max, diff_ref.nmse(), (double) diff_off.diff_max, diff_off.nmse());
+            CTX_REQUIRE(diff_ref.nmse() <= NMSE_THRESHOLD, tag + ": logits differ from the single-seq runs (nmse " + std::to_string(diff_ref.nmse()) + ")");
+            CTX_REQUIRE(diff_off.nmse() <= NMSE_THRESHOLD, tag + ": the taps changed the logits (nmse " + std::to_string(diff_off.nmse()) + ")");
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -532,6 +738,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_layer_inp>());
 
     return cases;
 }

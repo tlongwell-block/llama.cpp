@@ -159,6 +159,8 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    const bool tap_final = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -179,7 +181,7 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
         }
 
-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids) && !tap_final) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -213,11 +215,15 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
+    if (tap_final) {
+        res->t_layer_inp[n_layer] = cur; // the final state, one row per token
+        if (crop_before_nextn(inp_out_ids)) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
+
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
-    if (!cparams.embeddings_nextn_masked) {
-        res->t_layer_inp[n_layer] = cur; // the final state, one row per token
-    }
 
     if (crop_after_nextn(inp_out_ids)) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
