@@ -5954,8 +5954,8 @@ struct test_mul_mat_f32 : public test_mul_mat {
     std::string vars() override { return test_mul_mat::vars() + ",full_f32=1"; }
     double max_nmse_err() override { return 1e-10; }
 
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        auto * out = test_mul_mat::build_graph(ctx);
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        auto * out = test_mul_mat::build_graph(ctx, ctx_weights);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_prec_set_src(out, GGML_PREC_F32, 1);
         return out;
