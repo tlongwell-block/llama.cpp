@@ -3,11 +3,11 @@
 #include <set>
 #include "brain-output.h"
 #include "chat.h"
-#include "clip-impl.h"
 #include "component.h"
 #include "llama-cpp.h"
 #include "mtmd-ear.h"
 #include "mtmd-helper.h"
+#include "mtmd-subcontext.h"
 #include "runtime-options.h"
 #include "prompt-counts.h"
 #include "speculative.h"
@@ -45,7 +45,9 @@ class brain_session {
     std::atomic<int64_t> speech_buffer_until_us{0};
     std::atomic<bool> http_pending{false};
     component                                           encoder_source, bridge_source, brain_source, vision_source;
-    std::unique_ptr<clip_ctx, decltype(&clip_free)>     encoder{ nullptr, clip_free };
+    std::unique_ptr<mtmd_model>                          encoder_model;
+    std::unique_ptr<mtmd_backends>                       encoder_backends;
+    std::unique_ptr<mtmd_subcontext>                     encoder;
     std::unique_ptr<mtmd_ear>                           ear;
     llama_model_ptr                                     model;
     mtmd::context_ptr                                   vision;
@@ -70,7 +72,7 @@ class brain_session {
     sequence_state capture_sequence();
     void restore_sequence(const sequence_state & state);
     void clear_sequence();
-    int decode(const llama_batch & batch);
+    int decode(common_batch & batch);
     void configure_thinking(common_params_sampling & sampling, const common_chat_params & formatted, int budget) const;
     std::shared_ptr<const sequence_state> checkpoint;
     // Only system/tool context may survive a connection; never cache user turns here.

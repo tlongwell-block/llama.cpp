@@ -21,16 +21,22 @@ brain_session::brain_session(const std::string & package, const frankie_options 
     brain_source(package, "brain"),
     vision_source(package, "vision"), options(config) {
     options.resolve_context();
-    clip_context_params ep{};
-    ep.use_gpu                = options.use_gpu;
-    ep.flash_attn_type        = CLIP_FLASH_ATTN_TYPE_DISABLED;
+    mtmd_model_params ep;
     ep.model_reader           = component::callback;
     ep.model_reader_user_data = &encoder_source;
     ep.model_reader_size      = encoder_source.size();
-    encoder.reset(clip_init("embedded-ear", ep).ctx_a);
-    if (!encoder) {
+    auto device = mtmd_select_device(options.use_gpu, nullptr);
+    auto weight_device = device ? device : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!weight_device) {
+        throw std::runtime_error("ear backend unavailable");
+    }
+    encoder_model = mtmd_model_load("embedded-ear", ep, ggml_backend_dev_buffer_type(weight_device)).a;
+    if (!encoder_model || encoder_model->n_mmproj_embd() != 512) {
         throw std::runtime_error("ear load failed");
     }
+    encoder_backends = std::make_unique<mtmd_backends>(device, options.threads, encoder_model->max_nodes, nullptr, nullptr);
+    const mtmd_subctx_params encoder_params { MTMD_FLASH_ATTN_TYPE_DISABLED, false };
+    encoder = std::make_unique<mtmd_subcontext>(*encoder_model, *encoder_backends, encoder_params);
     ggml_context *                                      raw = nullptr;
     std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
         gguf_init_from_callback(component::callback, &bridge_source, 1024 * 1024, bridge_source.size(),
@@ -145,25 +151,24 @@ std::vector<float> brain_session::encode_audio(const std::vector<float> & pcm, s
             throw std::runtime_error("nonfinite input audio");
         }
     }
-    mtmd_audio_preprocessor_parakeet frontend(encoder.get());
+    mtmd_audio_preprocessor_parakeet frontend(encoder_model.get());
+    frontend.mel_config.n_threads = options.threads;
+    frontend.mel_config.sched = encoder_backends->sched.get();
     frontend.initialize();
-    std::vector<mtmd_audio_mel> mel;
-    if (!frontend.preprocess(pcm.data(), pcm.size(), mel) || mel.size() != 1) {
+    auto audio = frontend.preprocess(pcm.data(), pcm.size());
+    if (!frontend.compute(audio) || audio.entries.size() != 1) {
         throw std::runtime_error("frontend failed");
     }
     const auto frontend_done = std::chrono::steady_clock::now();
-    clip_image_f32 image;
-    image.set_size({ int(mel[0].n_len), 80 }, false, true);
-    image.cpy_buf(mel[0].data);
-    size_t nf = clip_n_output_tokens(encoder.get(), &image);
-    if (nf == 0 || nf + 1 > audio_row_limit()) {
+    const int nf = encoder_model->n_output_tokens(&audio.entries.front());
+    if (nf <= 0 || size_t(nf) + 1 > audio_row_limit()) {
         throw std::runtime_error("encoder frame bounds");
     }
-    std::vector<float>   frames(nf * 512);
-    clip_image_f32_batch batch;
+    std::vector<float> frames(size_t(nf) * 512);
+    mtmd_image_f32_batch batch;
     batch.is_audio = true;
-    batch.entries.push_back(std::move(image));
-    if (!clip_image_batch_encode(encoder.get(), options.threads, &batch, frames)) {
+    batch.entries = std::move(audio.entries);
+    if (!encoder->encode_batch(options.threads, &batch, frames)) {
         throw std::runtime_error("encoder failed");
     }
     const auto encoder_done = std::chrono::steady_clock::now();
@@ -223,19 +228,12 @@ void brain_session::decode_text(const std::string & text, int & pos, size_t & us
         if (cancelled.load()) {
             throw std::runtime_error("cancelled");
         }
-        int  count     = std::min(batch_size, n - start);
-        auto batch     = llama_batch_init(count, 0, 1);
-        batch.n_tokens = count;
+        const int count = std::min(batch_size, n - start);
+        common_batch batch(ctx.get());
         for (int i = 0; i < count; ++i) {
-            batch.token[i]     = tokens[start + i];
-            batch.pos[i]       = pos++;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = (start + i == n - 1);
+            batch.add(tokens[start + i], pos++, 0, start + i == n - 1);
         }
-        int rc = decode(batch);
-        llama_batch_free(batch);
-        if (rc) {
+        if (decode(batch)) {
             throw std::runtime_error("text decode failed");
         }
         if (n >= 8192 && ((start + count) / 8192 != start / 8192 || start + count == n)) {
@@ -264,8 +262,8 @@ void brain_session::reset(bool preserve_checkpoint) {
     clear_sequence();
 }
 
-int brain_session::decode(const llama_batch & batch) {
-    const int rc = llama_decode(ctx.get(), batch);
+int brain_session::decode(common_batch & batch) {
+    const int rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
     if (!rc && speculative && !common_speculative_process(speculative.get(), batch)) {
         return -1;
     }
@@ -393,8 +391,8 @@ brain_session::listener_reaction brain_session::probe_listener(const request & i
     auto chat = input.chat_input();
     chat.enable_thinking = false;
     chat.add_generation_prompt = true;
-    const auto formatted = common_chat_templates_apply(templates.get(), chat);
-    const auto marker = formatted.prompt.find(partial_marker);
+    const auto prompt = common_chat_templates_apply(templates.get(), chat).prompt.str();
+    const auto marker = prompt.find(partial_marker);
     if (marker == std::string::npos) { throw std::runtime_error("listener probe has no active audio marker"); }
     const std::string ask = "\n(You are listening while the user is still talking. Which one-word listener reaction fits what they have said so far? Answer with exactly one of: Hmm, Yeah, Wow, Aw, Nothing.)";
     const bool verify = std::getenv("FRANKIE_VERIFY_ROLLBACK") != nullptr;
@@ -415,7 +413,7 @@ brain_session::listener_reaction brain_session::probe_listener(const request & i
     try {
         int pos = partial_pos;
         size_t used = partial_used;
-        decode_text(ask + formatted.prompt.substr(marker + partial_marker.size()), pos, used);
+        decode_text(ask + prompt.substr(marker + partial_marker.size()), pos, used);
         const char * words[] = {"Hmm", "Yeah", "Wow", "Aw", "Nothing"};
         const auto * logits = llama_get_logits_ith(ctx.get(), -1);
         if (!logits) { throw std::runtime_error("listener probe has no logits"); }
@@ -468,44 +466,44 @@ void brain_session::warm_prefix(common_chat_templates_inputs input) {
     boundary.role = "user";
     boundary.content = "[FRANKIE_WARM_BOUNDARY]";
     input.messages.push_back(boundary);
-    auto formatted = common_chat_templates_apply(templates.get(), input);
-    const auto cut = formatted.prompt.find(boundary.content);
-    if (cut == std::string::npos || formatted.prompt.find(boundary.content, cut + 1) != std::string::npos) {
+    auto prompt = common_chat_templates_apply(templates.get(), input).prompt.str();
+    const auto cut = prompt.find(boundary.content);
+    if (cut == std::string::npos || prompt.find(boundary.content, cut + 1) != std::string::npos) {
         throw std::runtime_error("ambiguous warm prefix boundary");
     }
-    formatted.prompt.resize(cut);
-    if (formatted.prompt.size() > 4 * 1024 * 1024) {
+    prompt.resize(cut);
+    if (prompt.size() > 4 * 1024 * 1024) {
         throw std::runtime_error("formatted prefix too large");
     }
     reset();
     int pos = 0;
     size_t used = 0;
-    if (warm_checkpoint && warm_prefix_text == formatted.prompt) {
+    if (warm_checkpoint && warm_prefix_text == prompt) {
         restore_sequence(*warm_checkpoint);
         pos = warm_pos; used = warm_used;
         checkpoint = warm_checkpoint;
-        checkpoint_prefix = formatted.prompt; checkpoint_pos = pos; checkpoint_used = used;
+        checkpoint_prefix = prompt; checkpoint_pos = pos; checkpoint_used = used;
         std::cerr << "system_prefix_cache_hit bytes=" << warm_checkpoint->size() << "\n";
     } else {
-        decode_text(formatted.prompt, pos, used);
+        decode_text(prompt, pos, used);
         if (cancelled.load()) { throw std::runtime_error("cancelled"); }
-        save_checkpoint(formatted.prompt, pos, used);
+        save_checkpoint(prompt, pos, used);
         // Bound the host cache independently of the configured long context.
         warm_checkpoint.reset(); warm_prefix_text.clear();
         if (checkpoint->size() <= 256 * 1024 * 1024) {
-            warm_checkpoint = checkpoint; warm_prefix_text = formatted.prompt;
+            warm_checkpoint = checkpoint; warm_prefix_text = prompt;
             warm_pos = pos; warm_used = used;
         }
     }
     if (cancelled.load()) { throw std::runtime_error("cancelled"); }
-    cached_prefix = formatted.prompt;
+    cached_prefix = prompt;
     cached_pos = pos;
     cached_used = used;
     cache_valid = true;
 }
 
 size_t brain_session::prompt_tokens(const request & request, const std::map<std::string, size_t> & pending_audio) const {
-    const auto formatted = common_chat_templates_apply(templates.get(), request.chat_input());
+    const auto prompt = common_chat_templates_apply(templates.get(), request.chat_input()).prompt.str();
     const auto * vocab = llama_model_get_vocab(model.get());
     size_t used = 0, offset = 0;
     auto count_text = [&](const std::string & text) {
@@ -516,12 +514,12 @@ size_t brain_session::prompt_tokens(const request & request, const std::map<std:
         });
     };
     for (;;) {
-        const auto marker = formatted.prompt.find("[FRANKIE_", offset);
-        if (marker == std::string::npos) { count_text(formatted.prompt.substr(offset)); break; }
-        count_text(formatted.prompt.substr(offset, marker - offset));
-        const auto end = formatted.prompt.find(']', marker);
+        const auto marker = prompt.find("[FRANKIE_", offset);
+        if (marker == std::string::npos) { count_text(prompt.substr(offset)); break; }
+        count_text(prompt.substr(offset, marker - offset));
+        const auto end = prompt.find(']', marker);
         if (end == std::string::npos) { throw std::runtime_error("broken media marker"); }
-        const auto key = formatted.prompt.substr(marker, end - marker + 1);
+        const auto key = prompt.substr(marker, end - marker + 1);
         const auto audio = request.audio_rows.find(key);
         const auto pending = pending_audio.find(key);
         const auto image = request.images.find(key);
@@ -552,22 +550,14 @@ void brain_session::decode_rows(const std::vector<float> & rows, size_t start, s
     const size_t batch_size = std::min(128u, llama_n_batch(ctx.get()));
     for (; start < end; start += batch_size) {
         if (cancelled.load()) { throw std::runtime_error("cancelled"); }
-        const int count = std::min(batch_size, end - start);
-        auto batch = llama_batch_init(count, 5120, 1);
-        batch.n_tokens = count;
-        std::free(batch.pos);
-        batch.pos = static_cast<llama_pos *>(std::malloc(4 * count * sizeof(llama_pos)));
-        std::memcpy(batch.embd, rows.data() + start * 5120, count * 5120 * sizeof(float));
-        for (int i = 0; i < count; ++i) {
-            for (int axis = 0; axis < 4; ++axis) { batch.pos[axis * count + i] = pos; }
-            ++pos;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i] = false;
+        const size_t count = std::min(batch_size, end - start);
+        common_batch batch(ctx.get());
+        for (size_t i = 0; i < count; ++i) {
+            std::array<llama_pos, GGML_MROPE_SECTIONS> positions;
+            positions.fill(pos++);
+            batch.add_embd({ rows.data() + (start + i) * 5120, 1, 5120 }, positions.data(), 0, false);
         }
-        const int rc = decode(batch);
-        llama_batch_free(batch);
-        if (rc) { throw std::runtime_error("audio decode failed"); }
+        if (decode(batch)) { throw std::runtime_error("audio decode failed"); }
     }
 }
 
@@ -629,9 +619,27 @@ void brain_session::prefill(const request & request, const std::string & prompt,
             }
             if (mtmd_helper_eval_chunks_with_callback(vision.get(), ctx.get(), chunks.get(), pos, 0,
                     std::min(128u, llama_n_batch(ctx.get())), false, &pos,
-                    [](llama_batch batch, void * user) {
+                    [](const mtmd_helper_embd_batch * decoded, void * user) {
                         auto * self = static_cast<brain_session *>(user);
-                        return self->speculative && !common_speculative_process(self->speculative.get(), batch) ? -1 : 0;
+                        if (!self->speculative) {
+                            return 0;
+                        }
+                        common_batch batch(self->ctx.get());
+                        for (int32_t i = 0; i < decoded->n_tokens; ++i) {
+                            if (decoded->token) {
+                                batch.add(decoded->token[i], decoded->pos[i], decoded->seq_id,
+                                          decoded->logits_last && i == decoded->n_tokens - 1);
+                            } else {
+                                std::array<llama_pos, GGML_MROPE_SECTIONS> positions{};
+                                for (int32_t section = 0; section < decoded->n_pos; ++section) {
+                                    positions[section] = decoded->pos[size_t(section) * decoded->n_tokens + i];
+                                }
+                                const size_t n_embd = decoded->n_embd;
+                                batch.add_embd({ decoded->embd + size_t(i) * n_embd, 1, n_embd },
+                                               positions.data(), decoded->seq_id, false);
+                            }
+                        }
+                        return common_speculative_process(self->speculative.get(), batch) ? 0 : -1;
                     }, this)) {
                 throw std::runtime_error("image evaluation failed");
             }
@@ -664,12 +672,12 @@ void brain_session::precommit(const request & input, const std::string & marker,
     }
     auto snapshot = input;
     snapshot.audio_rows[marker] = rows;
-    const auto formatted = common_chat_templates_apply(templates.get(), snapshot.chat_input());
-    const auto cut = formatted.prompt.find(marker);
-    if (cut == std::string::npos || formatted.prompt.find(marker, cut + 1) != std::string::npos) {
+    const auto prompt = common_chat_templates_apply(templates.get(), snapshot.chat_input()).prompt.str();
+    const auto cut = prompt.find(marker);
+    if (cut == std::string::npos || prompt.find(marker, cut + 1) != std::string::npos) {
         throw std::runtime_error("precommit marker missing or ambiguous");
     }
-    const auto prefix = formatted.prompt.substr(0, cut);
+    const auto prefix = prompt.substr(0, cut);
     if (partial_marker == marker && partial_prefix == prefix && count <= partial_rows.size() / 5120) { return; }
     if (partial_marker != marker || partial_prefix != prefix) {
         partial_marker.clear();
@@ -677,13 +685,13 @@ void brain_session::precommit(const request & input, const std::string & marker,
     }
     const size_t retained = partial_rows.size();
     std::copy(partial_rows.begin(), partial_rows.end(), snapshot.audio_rows[marker].begin());
-    if (formatted.prompt.size() > 4 * 1024 * 1024 || input.chat.messages.size() > max_messages) {
+    if (prompt.size() > 4 * 1024 * 1024 || input.chat.messages.size() > max_messages) {
         throw std::runtime_error("precommit prompt bounds");
     }
     int pos = 0;
     size_t used = 0;
     try {
-        prefill(snapshot, formatted.prompt, pos, used, marker, count, {});
+        prefill(snapshot, prompt, pos, used, marker, count, {});
         llama_synchronize(ctx.get());
         partial_rows.resize(count * 5120);
         std::copy(rows.begin() + retained, rows.begin() + count * 5120, partial_rows.begin() + retained);
@@ -701,9 +709,9 @@ void brain_session::precommit(const request & input, const std::string & marker,
 
 void brain_session::finish_audio(const request & input, const std::string & marker, std::vector<float> & rows) {
     auto compute_lock = lock_compute();
-    const auto formatted = common_chat_templates_apply(templates.get(), input.chat_input());
-    if (marker == partial_marker && formatted.prompt.compare(0, partial_prefix.size(), partial_prefix) == 0 &&
-        formatted.prompt.compare(partial_prefix.size(), marker.size(), marker) == 0) {
+    const auto prompt = common_chat_templates_apply(templates.get(), input.chat_input()).prompt.str();
+    if (marker == partial_marker && prompt.compare(0, partial_prefix.size(), partial_prefix) == 0 &&
+        prompt.compare(partial_prefix.size(), marker.size(), marker) == 0) {
         if (rows.size() < partial_rows.size() + 5120) { throw std::runtime_error("final audio shorter than precommit"); }
         std::copy(partial_rows.begin(), partial_rows.end(), rows.begin());
     }
@@ -746,18 +754,19 @@ brain_session::response brain_session::generate(const request & request, const s
         }
     }
     auto formatted = common_chat_templates_apply(templates.get(), input);
-    if (formatted.prompt.size() > 4 * 1024 * 1024) {
+    const auto prompt = formatted.prompt.str();
+    if (prompt.size() > 4 * 1024 * 1024) {
         throw std::runtime_error("formatted prompt too large");
     }
     // A historical assistant turn need not retain the generation-only thinking
     // header. Checkpoint the closed input so that change cannot replay all audio.
-    std::string prefix = formatted.prompt;
+    std::string prefix = prompt;
     if (request.realtime_history) {
         auto closed = input;
         closed.add_generation_prompt = false;
-        auto candidate = common_chat_templates_apply(templates.get(), closed).prompt;
-        if (!candidate.empty() && formatted.prompt.compare(0, candidate.size(), candidate) == 0 &&
-            frankie_token_boundary(llama_model_get_vocab(model.get()), formatted.prompt, candidate.size())) {
+        auto candidate = common_chat_templates_apply(templates.get(), closed).prompt.str();
+        if (!candidate.empty() && prompt.compare(0, candidate.size(), candidate) == 0 &&
+            frankie_token_boundary(llama_model_get_vocab(model.get()), prompt, candidate.size())) {
             prefix = std::move(candidate);
         }
     }
@@ -767,7 +776,7 @@ brain_session::response brain_session::generate(const request & request, const s
         prefill(request, prefix, pos, used, "", 0, on_stage);
         save_checkpoint(prefix, pos, used);
         if (on_stage) { on_stage("brain_checkpoint_done"); }
-        decode_text(formatted.prompt.substr(prefix.size()), pos, used);
+        decode_text(prompt.substr(prefix.size()), pos, used);
     } catch (...) {
         partial_marker.clear();
         partial_rows.clear();
@@ -789,16 +798,15 @@ brain_session::response brain_session::generate(const request & request, const s
     if (!sampler) {
         throw std::runtime_error("brain sampler failed");
     }
+    const auto * vocab = llama_model_get_vocab(model.get());
     common_chat_parser_params parser(formatted);
-    parser.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-    if (!formatted.parser.empty()) {
-        parser.parser.load(formatted.parser);
-    }
+    parser.parser = std::move(formatted.parser);
+    parser.generation_prompt = common_chat_input_tokenize(vocab, formatted.generation_prompt);
+    common_chat_input generated;
     bool finished = false;
     size_t answer_tokens = 0, generated_tokens = 0, drafted_tokens = 0, accepted_tokens = 0;
     const size_t maximum = std::min(context_tokens() - used,
         request.answer_limit ? size_t(request.answer_limit) + request.reasoning_budget + 16 : context_tokens());
-    const auto * vocab = llama_model_get_vocab(model.get());
     llama_token pending = common_sampler_sample(sampler.get(), ctx.get(), -1);
     common_sampler_accept(sampler.get(), pending, true);
     if (on_stage) { on_stage("brain_first_token"); }
@@ -821,14 +829,12 @@ brain_session::response brain_session::generate(const request & request, const s
                 throw std::runtime_error("MTP draft rollback failed");
             }
         }
-        auto batch = llama_batch_init(1 + draft.size(), 0, 1);
-        common_batch_add(batch, pending, pos, { 0 }, true);
+        common_batch batch(ctx.get());
+        batch.add(pending, pos, 0, true);
         for (size_t j = 0; j < draft.size(); ++j) {
-            common_batch_add(batch, draft[j], pos + 1 + j, { 0 }, true);
+            batch.add(draft[j], pos + 1 + j, 0, true);
         }
-        const int rc = decode(batch);
-        llama_batch_free(batch);
-        if (rc) { throw std::runtime_error("generation decode failed"); }
+        if (decode(batch)) { throw std::runtime_error("generation decode failed"); }
         // The last sampled token has not executed. It becomes the next anchor;
         // only the current anchor and verified draft rows can feed the voice bridge.
         auto ids = common_sampler_sample_and_accept_n(sampler.get(), ctx.get(), draft);
@@ -858,9 +864,11 @@ brain_session::response brain_session::generate(const request & request, const s
                     if (!std::isfinite(v)) { throw std::runtime_error("nonfinite hidden state"); }
                 }
             }
-            result.raw.text += common_token_to_piece(vocab, token, true);
+            const auto piece = common_token_to_piece(vocab, token, true);
+            result.raw.text += piece;
+            generated.append(piece, token);
             ++generated_tokens;
-            result.message = common_chat_parse(result.raw.text, true, parser);
+            result.message = common_chat_parse(generated, true, parser);
             result.message.role = "assistant";
             if (!result.message.content.empty() || !result.message.tool_calls.empty()) {
                 if (++answer_tokens > request.answer_limit && request.answer_limit) {
@@ -902,7 +910,7 @@ brain_session::response brain_session::generate(const request & request, const s
     if (!finished) {
         throw output_limit("max_output_tokens");
     }
-    result.message      = common_chat_parse(result.raw.text, false, parser);
+    result.message      = common_chat_parse(generated, false, parser);
     result.message.role = "assistant";
     if (result.message.tool_calls.size() > 1) {
         throw std::runtime_error("parallel calls not enabled");
@@ -924,7 +932,7 @@ brain_session::response brain_session::generate(const request & request, const s
     if (on_text) {
         on_text(result, true);
     }
-    cached_prefix = formatted.prompt + result.raw.text;
+    cached_prefix = prompt + result.raw.text;
     cached_pos = pos;
     cached_used = used + generated_tokens;
     cache_valid = true;
@@ -942,7 +950,14 @@ void brain_session::report_memory() const {
                       << " context=" << bytes.context << " compute=" << bytes.compute << "\n";
         }
     }
-    for (const auto & [device, bytes] : clip_get_mem_usage(encoder.get())) {
+    auto encoder_memory = encoder_backends->get_mem_compute();
+    for (const auto & [device, bytes] : encoder_model->mem_weights) {
+        encoder_memory[device] += bytes;
+    }
+    for (const auto & [device, bytes] : encoder->get_mem_compute()) {
+        encoder_memory[device] += bytes;
+    }
+    for (const auto & [device, bytes] : encoder_memory) {
         std::cerr << "memory parakeet backend=" << ggml_backend_dev_name(device) << " bytes=" << bytes << "\n";
     }
     if (vision) {

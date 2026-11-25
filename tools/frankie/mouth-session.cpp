@@ -62,7 +62,10 @@ mouth_session::mouth_session(const std::string & package, const frankie_options 
     if (!mctx) {
         throw std::runtime_error("mouth load failed");
     }
-    generator = std::make_unique<mtmd_helper::gen_audio>(ctx.get(), mctx.get());
+    generator.init(ctx.get(), mctx.get());
+    if (!generator.valid()) {
+        throw std::runtime_error("mouth generation context failed");
+    }
     if (is_breeze) {
         const auto key = gguf_find_key(talker_source.metadata(), "qwen3.attention.key_length");
         const auto head_dim = key >= 0 ? gguf_get_val_u32(talker_source.metadata(), key) :
@@ -240,7 +243,7 @@ void mouth_session::hold_speech() {
 // (mlx_audio breeze_tts.generate).
 llama_token mouth_session::sample_breeze(const std::vector<llama_token> & history) {
     int32_t n = 0;
-    const float * raw = generator->get_logits(&n);
+    const float * raw = generator.get_logits(&n);
     if (!raw || n != 2052) { throw std::runtime_error("Breeze logits"); }
     std::vector<float> logits(raw, raw + n);
     const float penalty = delivery ? 1.1f : 1.0f;
@@ -268,9 +271,11 @@ void mouth_session::warmup() {
     std::lock_guard<std::mutex> lock(execution);
     for (int i = 0; i < 2; ++i) { speak_impl(text, {}, {}, &style); }
     if (breeze && delivery) {
-        // Guided replies sample codes through a two-lane graph the plain warmup never runs. Run it
-        // twice here, so a reply's first frames don't pay its build and CUDA graph capture. The
-        // other seed leaves replies' sampling as it was: their next call reseeds.
+        // The two-lane graph needs its own warmup for CUDA graph capture.
+        auto params = mtmd_gen_state_params_default();
+        params.seed = 0;
+        mtmd::gen_state_ptr state(mtmd_gen_state_init(mctx.get(), params));
+        if (!state) { throw std::runtime_error("guided mouth warmup state failed"); }
         std::vector<float> hidden(llama_model_n_embd(model.get()), 0.0f);
         mtmd_gen_inp inp = mtmd_gen_inp_default(mctx.get());
         inp.type        = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
@@ -281,10 +286,9 @@ void mouth_session::warmup() {
         inp.temp        = breeze_code_temperature;
         inp.top_k       = code_top_k;
         inp.top_p       = code_top_p;
-        inp.seed        = 0;
         for (int i = 0; i < 2; ++i) {
             mtmd_gen_out out{};
-            if (mtmd_gen_audio_process(mctx.get(), &inp, &out)) { throw std::runtime_error("guided mouth warmup failed"); }
+            if (mtmd_gen_audio_process(mctx.get(), state.get(), &inp, &out)) { throw std::runtime_error("guided mouth warmup failed"); }
         }
     }
 }
@@ -441,7 +445,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
     const bool windowed = breeze && !style && options.speech_context_words && breeze->supports_context() && speech_row_bytes;
     const int max_frames = style ? style->frames : breeze ? int(std::min<size_t>(384, std::max<size_t>(75, breeze_tokens * 12))) : 512;
     const int lanes = guided ? 2 : 1;
-    auto & gen = *generator;
+    auto & gen = generator;
     size_t emitted = 0;
     double energy = 0.0;
     float gain = style ? style->gain : 1.0f;
@@ -506,7 +510,7 @@ std::vector<float> mouth_session::speak_impl(const brain_session::response & res
         }
         for (int lane = 0; lane < lanes; ++lane) { start[lane] = continuing ? speech_next[lane] : 0; }
         if (on_stage) { on_stage(continuing ? "mouth_context_reused" : "mouth_context_reset"); }
-        mtmd_helper_gen_audio_inp input{};
+        auto input          = mtmd_helper_gen_audio_inp_default();
         input.seq_id        = seq;
         input.n_past        = start[0];
         if (breeze) {

@@ -3,8 +3,6 @@
 #include "mtmd-turn.h"
 #include "mtmd-backend.h"
 #include "mtmd-graph.h"
-#include "clip-impl.h"
-#include "clip-model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -298,31 +296,39 @@ float mtmd_turn::detect(const std::array<float, 512> & user, const std::array<fl
 }
 
 struct mtmd_backchannel::impl {
-    std::unique_ptr<clip_ctx, decltype(&clip_free)> encoder{nullptr, clip_free};
     mtmd_turn head;
+    std::unique_ptr<mtmd_model> model;
+    std::unique_ptr<mtmd_backends> backends;
+    std::unique_ptr<mtmd_subcontext> encoder;
+    std::array<std::unique_ptr<mtmd_subctx_enc_state>, 2> cache;
     int threads;
     uint64_t steps = 0;
     std::array<float, 2> previous{};
-    std::array<std::vector<uint8_t>, 2> cache;
     std::array<std::array<float, 512>, 2> features{};
 
     impl(ggml_context * weights, const char * path, const mtmd_context_params & params)
         : head(weights, mtmd_turn::mode::detection, params.use_gpu), threads(params.n_threads) {
-        clip_context_params options{};
-        options.use_gpu = params.use_gpu;
-        options.device = params.device;
-        options.cb_eval = params.cb_eval;
-        options.cb_eval_user_data = params.cb_eval_user_data;
-        options.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
+        mtmd_model_params options;
+        options.progress_callback = params.progress_callback;
+        options.progress_callback_user_data = params.progress_callback_user_data;
         options.model_reader = params.model_reader;
         options.model_reader_user_data = params.model_reader_user_data;
         options.model_reader_size = params.model_reader_size;
-        auto loaded = clip_init(path, options);
-        encoder.reset(loaded.ctx_a);
-        if (loaded.ctx_v) { clip_free(loaded.ctx_v); }
-        if (loaded.ctx_gen_a) { clip_free(loaded.ctx_gen_a); }
-        if (!encoder || clip_get_hparams(encoder.get())->gen_model_variant != "mimi") {
+
+        ggml_backend_dev_t device = mtmd_select_device(params.use_gpu, params.device);
+        ggml_backend_dev_t weight_device = device ? device : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        model = mtmd_model_load(path, options, ggml_backend_dev_buffer_type(weight_device)).a;
+        if (!model || model->proj_type != PROJECTOR_TYPE_POCKETTTS_SPKENC || model->hparams.gen_model_variant != "mimi") {
             throw std::runtime_error("BC-Det requires the continuous Mimi encoder");
+        }
+
+        backends = std::make_unique<mtmd_backends>(device, threads, model->max_nodes, params.cb_eval, params.cb_eval_user_data);
+        encoder = std::make_unique<mtmd_subcontext>(*model, *backends, mtmd_subctx_params{MTMD_FLASH_ATTN_TYPE_DISABLED, false});
+        for (auto & state : cache) {
+            state.reset(encoder->enc_state_init(1920 / model->hparams.mimi_encoder_hop()));
+            if (!state) {
+                throw std::runtime_error("cannot allocate continuous Mimi state");
+            }
         }
     }
 };
@@ -334,7 +340,9 @@ mtmd_backchannel::~mtmd_backchannel() = default;
 void mtmd_backchannel::reset() {
     data->steps = 0;
     data->previous.fill(0);
-    for (auto & cache : data->cache) { cache.clear(); }
+    for (auto & state : data->cache) {
+        ggml_backend_buffer_clear(state->buf.get(), 0);
+    }
     data->head.reset();
 }
 
@@ -360,23 +368,20 @@ float mtmd_backchannel::process(const std::array<float, 1280> & user, const std:
             pcm[i] = (1.0f - frac) * a + frac * b;
         }
         data->previous[ch] = input.back();
-        clip_image_f32_batch batch;
+        mtmd_image_f32_batch batch;
         batch.is_audio = true;
         batch.entries.emplace_back();
         batch.entries[0].set_size({1920, 1}, false, true);
-        batch.entries[0].cpy_buf(pcm);
+        batch.entries[0].cpy_buf(std::move(pcm));
         std::vector<float> output(512);
-        std::vector<uint8_t> next;
-        clip_encode_params params;
+        mtmd_subctx_encode_params params;
         params.imgs = &batch;
         params.n_threads = data->threads;
         params.out_embd = &output;
-        params.state_in = &data->cache[ch];
-        params.state_out = &next;
-        if (!clip_encode(data->encoder.get(), &params) || output.size() != 512) {
+        params.enc_state = data->cache[ch].get();
+        if (!data->encoder->encode(&params) || output.size() != 512) {
             throw std::runtime_error("streaming Mimi encode failed");
         }
-        data->cache[ch] = std::move(next);
         std::copy(output.begin(), output.end(), data->features[ch].begin());
     }
     if (data->steps++ == 0) { return -1; }

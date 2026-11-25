@@ -17,7 +17,7 @@ import gguf
 from conversion.gemma import Gemma3Model
 from conversion.qwen import Qwen3Model
 from conversion.qwen3tts import Qwen3TTSSpeakerEncoderModel
-from conversion.pockettts import PocketTTSMmprojModel
+from conversion.pockettts import mimi_seanet_tensors
 
 
 def tensor(directory, name):
@@ -79,7 +79,7 @@ class BreezeEncoder(Gemma3Model):
         from transformers import PreTrainedTokenizerFast
 
         tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(self.dir_model / "tokenizer.json"))
-        return super().get_vocab_base(tokenizer)
+        return self._get_vocab_base(tokenizer)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -88,12 +88,12 @@ class BreezeEncoder(Gemma3Model):
         self.gguf_writer.add_context_length(256)
         self.gguf_writer.add_pooling_type(gguf.PoolingType.NONE)
 
-    def modify_tensors(self, data, name, bid):
+    def modify_tensors(self, data_torch, name, bid):
         if name == "model.embed_tokens.weight":
-            data = data.float().clone()
+            data_torch = data_torch.float().clone()
             eoi = tensor(self.dir_model, "text_encoder.embed_tokens.eoi_embedding")
-            data[self.hparams["eoi_token_index"]] = eoi / data.shape[1] ** .5
-        yield from super().modify_tensors(data, name, bid)
+            data_torch[self.hparams["eoi_token_index"]] = eoi / data_torch.shape[1] ** .5
+        yield from super().modify_tensors(data_torch, name, bid)
 
 
 class BreezeAcoustic(Qwen3TTSSpeakerEncoderModel):
@@ -161,7 +161,7 @@ class BreezeAcoustic(Qwen3TTSSpeakerEncoderModel):
             for name in source.keys():
                 if name.startswith("encoder.encoder.layers."):
                     canonical = name.replace("encoder.encoder.layers.", "mimi.encoder.model.", 1)
-                    yield from PocketTTSMmprojModel._seanet_tensor(self, canonical, source.get_tensor(name), 4)
+                    yield from mimi_seanet_tensors(self, canonical, source.get_tensor(name), 4)
         yield "a.downsample.conv.weight", tensor(root, "encoder.downsample.conv.weight")
         mappings = {
             "input_layernorm": "ln1", "post_attention_layernorm": "ln2",
@@ -188,8 +188,8 @@ class BreezeAcoustic(Qwen3TTSSpeakerEncoderModel):
             yield f"a.rvq.{i}.codebook.weight", codebooks
             yield f"a.rvq.{i}.norm", codebooks.square().sum(-1) / 2
 
-    def modify_tensors(self, data, name, bid):
-        yield name, data
+    def modify_tensors(self, data_torch, name, bid):
+        yield name, data_torch
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         if not name.startswith("a.gen.code."):

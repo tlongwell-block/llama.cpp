@@ -17,7 +17,7 @@ class mouth_session {
     llama_model_ptr                                     model;
     llama_context_ptr                                   ctx;
     mtmd::context_ptr                                   mctx;
-    std::unique_ptr<mtmd_helper::gen_audio>               generator;
+    mtmd_helper::gen_audio                              generator;
     std::unique_ptr<mtmd_side>                          side;
     std::unique_ptr<breeze_mouth>                       breeze;
     std::unique_ptr<mtmd_expression>                    expression;

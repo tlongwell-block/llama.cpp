@@ -7,6 +7,7 @@
 #include "cpp-httplib/httplib.h"
 #include "nlohmann/json.hpp"
 
+#include <array>
 #include <condition_variable>
 #include <cmath>
 #include <deque>
@@ -86,14 +87,15 @@ class frankie_completions {
             auto formatted = common_chat_templates_apply(brain.templates.get(), input);
             sampling = frankie_brain_sampling(input.enable_thinking);
             if (input.enable_thinking) { brain.configure_thinking(sampling, formatted, budget); }
+            const auto prompt = formatted.prompt.str();
             size_t offset = 0;
-            while (offset < formatted.prompt.size()) {
-                const auto marker = formatted.prompt.find("[FRANKIE_", offset);
-                auto tokens = common_tokenize(vocab, formatted.prompt.substr(offset, marker - offset), false, true);
+            while (offset < prompt.size()) {
+                const auto marker = prompt.find("[FRANKIE_", offset);
+                auto tokens = common_tokenize(vocab, prompt.substr(offset, marker - offset), false, true);
                 j.prompt.insert(j.prompt.end(), tokens.begin(), tokens.end());
                 if (marker == std::string::npos) { break; }
-                const auto end = formatted.prompt.find(']', marker);
-                const auto found = j.images.find(formatted.prompt.substr(marker, end - marker + 1));
+                const auto end = prompt.find(']', marker);
+                const auto found = j.images.find(prompt.substr(marker, end - marker + 1));
                 if (end == std::string::npos || found == j.images.end()) { throw std::invalid_argument("unknown media marker"); }
                 mtmd_input_part part{};
                 part.bitmap = found->second.get();
@@ -118,8 +120,7 @@ class frankie_completions {
             }
             j.images.clear();
             j.parser = common_chat_parser_params(formatted);
-            j.parser.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-            if (!formatted.parser.empty()) { j.parser.parser.load(formatted.parser); }
+            j.parser.parser = formatted.parser;
             sampling.generation_prompt = formatted.generation_prompt;
             j.send({{"index", 0}, {"delta", {{"role", "assistant"}}}, {"finish_reason", nullptr}});
         } else {
@@ -200,7 +201,7 @@ class frankie_completions {
         message.role = "assistant";
         message.content = j.raw;
         if (j.chat) {
-            message = common_chat_parse(j.raw, false, j.parser);
+            message = common_chat_parse(common_chat_input(j.raw), false, j.parser);
             message.role = "assistant";
             std::vector<std::string> ids;
             size_t serial = 0;
@@ -298,7 +299,18 @@ class frankie_completions {
             return;
         }
         count = std::min(count, size_t(j.image_batch->batch.n_tokens) - j.image_offset);
-        if (brain.decode(j.image_batch->get_view(j.image_offset, count))) { throw std::runtime_error("image prefill failed"); }
+        const auto view = j.image_batch->get_view(j.image_offset, count);
+        common_batch image_batch(brain.ctx.get());
+        image_batch.n_pos = j.image_batch->n_pos_per_embd;
+        for (int32_t row = 0; row < view.n_tokens; ++row) {
+            std::array<llama_pos, GGML_MROPE_SECTIONS> pos{};
+            for (int section = 0; section < image_batch.n_pos; ++section) {
+                pos[section] = view.pos[section * view.n_tokens + row];
+            }
+            image_batch.add_embd({view.embd + row * j.image_batch->n_mmproj_embd, 1,
+                                  static_cast<size_t>(j.image_batch->n_mmproj_embd)}, pos.data(), j.seq, false);
+        }
+        if (brain.decode(image_batch)) { throw std::runtime_error("image prefill failed"); }
         j.image_offset += count;
         if (j.image_offset == size_t(j.image_batch->batch.n_tokens)) {
             j.offset += j.image_offset;
@@ -315,7 +327,7 @@ class frankie_completions {
 
     void stream_output(job & j) {
         if (!j.streaming) { return; }
-        auto parsed = j.chat ? common_chat_parse(j.raw, true, j.parser) : common_chat_msg{};
+        auto parsed = j.chat ? common_chat_parse(common_chat_input(j.raw), true, j.parser) : common_chat_msg{};
         const auto & text = j.chat ? parsed.content : j.raw;
         json delta = json::object();
         if (text.compare(0, j.sent.size(), j.sent) != 0) { throw std::runtime_error("text parser retracted streamed output"); }
@@ -375,8 +387,7 @@ class frankie_completions {
                 llama_memory_seq_rm(llama_get_memory(brain.draft_ctx.get()), j.seq, j.pos, -1);
             }
         }
-        auto batch = llama_batch_init(llama_n_batch(brain.ctx.get()), 0, 1);
-        struct release { llama_batch & batch; ~release() { llama_batch_free(batch); } } release_batch{batch};
+        common_batch batch(brain.ctx.get());
         struct output { std::shared_ptr<job> slot; std::vector<int> indices; bool verify; };
         std::vector<output> outputs;
         bool prefilled = false;
@@ -407,24 +418,24 @@ class frankie_completions {
                     const auto next_image = j.media.lower_bound(j.offset);
                     if (next_image != j.media.end()) { end = std::min(end, next_image->first); }
                     while (j.offset < end) {
-                        common_batch_add(batch, j.prompt[j.offset], j.pos++, {j.seq}, j.offset + 1 == j.prompt.size());
+                        batch.add(j.prompt[j.offset], j.pos++, j.seq, j.offset + 1 == j.prompt.size());
                         ++j.offset;
                     }
-                    if (j.offset == j.prompt.size()) { outputs.push_back({slot, {batch.n_tokens - 1}, false}); }
+                    if (j.offset == j.prompt.size()) { outputs.push_back({slot, {batch.size() - 1}, false}); }
                 } else {
                     if (prefill_turn) { continue; }
                     output item{slot, {}, true};
-                    common_batch_add(batch, j.pending, j.pos, {j.seq}, true);
-                    item.indices.push_back(batch.n_tokens - 1);
+                    batch.add(j.pending, j.pos, j.seq, true);
+                    item.indices.push_back(batch.size() - 1);
                     for (size_t k = 0; k < j.draft.size(); ++k) {
-                        common_batch_add(batch, j.draft[k], j.pos + 1 + k, {j.seq}, true);
-                        item.indices.push_back(batch.n_tokens - 1);
+                        batch.add(j.draft[k], j.pos + 1 + k, j.seq, true);
+                        item.indices.push_back(batch.size() - 1);
                     }
                     outputs.push_back(std::move(item));
                 }
             } catch (const std::exception & e) { fail(j, e.what()); }
         }
-        if (batch.n_tokens) {
+        if (batch.size()) {
             const int rc = brain.decode(batch);
             if (rc) {
                 for (auto & slot : active) { if (slot && !slot->done) { fail(*slot, "text batch decode failed"); } }
