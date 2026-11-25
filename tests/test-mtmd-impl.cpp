@@ -28,7 +28,7 @@ namespace httplib::detail {
 #include "mtmd-watermark.h"
 #include "mtmd-ear.h"
 #include "mtmd-audio.h"
-#include "clip-impl.h"
+#include "mtmd-model.h"
 #include "gguf.h"
 #include "mtmd-helper.h"
 #include <chrono>
@@ -849,7 +849,7 @@ MAKE_TEST(test_ear_reference) {
         }
         return out;
     };
-    clip_hparams hp;
+    mtmd_hparams hp;
     hp.audio_n_fft = 512; hp.audio_window_len = 400; hp.audio_hop_len = 160;
     hp.audio_sample_rate = 16000; hp.n_mel_bins = 80; hp.parakeet_mlx_frontend = true;
     hp.mel_filters = read("filters", 80 * 257); hp.window = read("window", 400);
@@ -857,23 +857,26 @@ MAKE_TEST(test_ear_reference) {
     frontend.initialize();
     const auto pcm = read("audio16", 32000);
     const auto mel_ref = read("mel", 201 * 80);
-    std::vector<mtmd_audio_mel> mels;
-    t.assert_equal("ear frontend processes PCM", true, frontend.preprocess(pcm.data(), pcm.size(), mels));
-    t.assert_equal("ear frontend frame count", int64_t(201), mels.at(0).n_len);
+    auto preprocessed = frontend.preprocess(pcm.data(), pcm.size());
+    t.assert_equal("ear frontend processes PCM", true, !preprocessed.entries.empty());
+    t.assert_equal("ear frontend computes mel", true, frontend.compute(preprocessed));
+    const auto & mel = preprocessed.entries.at(0);
+    t.assert_equal("ear frontend frame count", 201, mel.nx());
     float mel_error = 0;
     for (size_t i = 0; i < 201; ++i) {
-        for (size_t j = 0; j < 80; ++j) { mel_error = std::max(mel_error, std::abs(mels[0].data[j * 201 + i] - mel_ref[i * 80 + j])); }
+        for (size_t j = 0; j < 80; ++j) { mel_error = std::max(mel_error, std::abs(mel.get_ro_buf()[j * 201 + i] - mel_ref[i * 80 + j])); }
     }
     std::cout << "ear frontend max abs error: " << mel_error << "\n";
     t.assert_equal("ear frozen frontend", true, mel_error < 1e-4f);
-    t.assert_equal("ear frontend rejects short PCM", false, frontend.preprocess(pcm.data(), 256, mels));
+    t.assert_equal("ear frontend rejects short PCM", false, !frontend.preprocess(pcm.data(), 256).entries.empty());
     const auto input = read("frames", 26 * 512);
     if (std::getenv("MTMD_EAR_ENCODER_TEST")) {
-        clip_context_params params{};
-        params.use_gpu = std::getenv("MTMD_EAR_GPU") != nullptr;
-        params.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
-        params.cb_eval_user_data = const_cast<std::string *>(&dir);
-        params.cb_eval = [](ggml_tensor * tensor, bool ask, void * user) {
+        mtmd_model_params params;
+        auto device = mtmd_select_device(std::getenv("MTMD_EAR_GPU") != nullptr, nullptr);
+        auto weight_device = device ? device : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!weight_device) { throw std::runtime_error("ear backend unavailable"); }
+        auto buft = ggml_backend_dev_buffer_type(weight_device);
+        auto cb_eval = [](ggml_tensor * tensor, bool ask, void * user) {
             const std::string name(tensor->name);
             const bool capture = name == "encoder_out" || name.find("pre_") == 0 || (name.find("enc_") == 0 && name.size() > 4 && name.substr(name.size() - 4) == "_res");
             if (ask) { return capture; }
@@ -903,14 +906,16 @@ MAKE_TEST(test_ear_reference) {
             if (!s.file.read(static_cast<char *>(out), n)) { return 0; }
             return n;
         };
-        const auto loaded = clip_init("not-a-file.gguf", params);
-        const auto encoder = std::unique_ptr<clip_ctx, decltype(&clip_free)>(loaded.ctx_a, clip_free);
-        if (!encoder) { throw std::runtime_error("cannot load native ear encoder"); }
+        auto loaded = mtmd_model_load("not-a-file.gguf", params, buft);
+        if (!loaded.a) { throw std::runtime_error("cannot load native ear encoder"); }
+        mtmd_backends backends(device, 4, loaded.a->max_nodes, cb_eval, const_cast<std::string *>(&dir));
+        mtmd_subcontext encoder(*loaded.a, backends, { MTMD_FLASH_ATTN_TYPE_DISABLED, false });
         t.assert_equal("model reader chunks bounded", true, source.largest <= 1024 * 1024);
         auto failed_load = [&](const char * label) {
-            const auto failed = clip_init("not-a-file.gguf", params);
-            t.assert_equal(label, true, !failed.ctx_v && !failed.ctx_a && !failed.ctx_gen_a);
-            clip_free(failed.ctx_v); clip_free(failed.ctx_a); clip_free(failed.ctx_gen_a);
+            bool rejected = false;
+            try { mtmd_model_load("not-a-file.gguf", params, buft); }
+            catch (const std::runtime_error &) { rejected = true; }
+            t.assert_equal(label, true, rejected);
         };
         source.readable = 16;
         failed_load("model reader rejects short header");
@@ -920,9 +925,9 @@ MAKE_TEST(test_ear_reference) {
         params.model_reader_size = 0;
         failed_load("model reader requires bounds");
 
-        clip_image_f32 image;
+        mtmd_image_f32 image;
         image.set_size({201, 80}, false, true);
-        auto encoder_mel = mels[0].data;
+        auto encoder_mel = mel.get_ro_buf();
         if (std::getenv("MTMD_EAR_FROZEN_MEL")) {
             for (size_t i = 0; i < 201; ++i) {
                 for (size_t j = 0; j < 80; ++j) { encoder_mel[j * 201 + i] = mel_ref[i * 80 + j]; }
@@ -930,10 +935,10 @@ MAKE_TEST(test_ear_reference) {
         }
         image.cpy_buf(encoder_mel);
         std::vector<float> encoded(input.size());
-        clip_image_f32_batch batch;
+        mtmd_image_f32_batch batch;
         batch.is_audio = true;
         batch.entries.push_back(std::move(image));
-        if (!clip_image_batch_encode(encoder.get(), 4, &batch, encoded)) { throw std::runtime_error("ear encoder failed"); }
+        if (!encoder.encode_batch(4, &batch, encoded)) { throw std::runtime_error("ear encoder failed"); }
         t.assert_equal("ear encoder output size", input.size(), encoded.size());
         float encoder_error = 0;
         double squared_error = 0, power = 0;

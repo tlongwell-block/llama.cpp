@@ -36,17 +36,11 @@ class breeze_mouth {
         const int count = llama_tokenize(llama_model_get_vocab(model.get()), prompt.data(), prompt.size(),
                                          ids.data(), ids.size(), true, true);
         if (count <= 0 || count > 256) { throw std::runtime_error("Breeze text encoder token bounds"); }
-        auto batch = llama_batch_init(count, 0, 1);
+        common_batch batch(ctx.get());
         for (int i = 0; i < count; ++i) {
-            batch.token[i] = ids[i];
-            batch.pos[i] = i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i] = true;
+            batch.add(ids[i], i, 0, true);
         }
-        batch.n_tokens = count;
-        const int rc = llama_encode(ctx.get(), batch);
-        llama_batch_free(batch);
+        const int rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_ENCODE, batch.get());
         if (rc) { throw std::runtime_error("Breeze text encoding failed"); }
         const auto * rows = llama_get_embeddings(ctx.get());
         if (!rows) { throw std::runtime_error("Breeze text encoder produced no embeddings"); }
