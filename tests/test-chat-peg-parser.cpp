@@ -23,6 +23,7 @@ static void test_command7_parser_compare(testing & t);
 static void test_prefix_tool_names(testing & t);
 static void test_tagged_peg_parser(testing & t);
 static void test_permute(testing & t);
+static void test_invalid_utf8(testing & t);
 
 int main(int argc, char * argv[]) {
     testing t(std::cout);
@@ -42,6 +43,7 @@ int main(int argc, char * argv[]) {
     t.test("prefix tool names", test_prefix_tool_names);
     t.test("tagged peg parser", test_tagged_peg_parser);
     t.test("permute", test_permute);
+    t.test("invalid utf8", test_invalid_utf8);
 
     return t.summary();
 }
@@ -358,11 +360,6 @@ static void test_example_native(testing & t) {
             auto parser  = build_parser(tc);
             auto lazy    = !tc.tools.empty() && tc.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
             auto grammar = build_grammar([&](const common_grammar_builder & builder) {
-                for (const auto & def : tc.tools) {
-                    auto function   = def.at("function");
-                    auto parameters = function.at("parameters");
-                    builder.resolve_refs(parameters);
-                };
                 parser.build_grammar(builder, lazy);
             });
 
@@ -440,11 +437,6 @@ static void test_example_qwen3_coder(testing & t) {
     });
 
     auto grammar = build_grammar([&](const common_grammar_builder & builder) {
-        for (const auto & def : tools) {
-            auto function   = def.at("function");
-            auto parameters = function.at("parameters");
-            builder.resolve_refs(parameters);
-        };
         parser.build_grammar(builder);
     });
 
@@ -513,11 +505,6 @@ static void test_example_qwen3_non_coder(testing & t) {
     });
 
     auto grammar = build_grammar([&](const common_grammar_builder & builder) {
-        for (const auto & def : tools) {
-            auto function   = def.at("function");
-            auto parameters = function.at("parameters");
-            builder.resolve_refs(parameters);
-        };
         parser.build_grammar(builder);
     });
 
@@ -1020,6 +1007,39 @@ static void test_permute(testing & t) {
         }
     });
 
+    t.test("optional arguments interleave required arguments", [&](testing & t) {
+        auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+            return p.permute("ab", { p.literal("a"), p.literal("b") }, { p.literal("x"), p.literal("y") }) + p.end();
+        });
+        for (const std::string input : { "ab", "ba", "xayb", "ybxa", "abxy", "xyab" }) {
+            t.assert_true("accepts " + input, accepts(parser, input));
+        }
+        for (const std::string input : { "", "x", "ax", "yb", "xaaby", "abz" }) {
+            t.assert_true("rejects missing, duplicate or unknown required argument " + input, !accepts(parser, input));
+        }
+    });
+
+    t.test("tagged arguments reject duplicate names", [&](testing & t) {
+        auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+            auto arg = p.tool_arg(p.tool_arg_name(p.literal("x")) + p.tool_arg_string_value(p.literal("v")));
+            return p.tool_open(p.literal("(")) + p.tool_name(p.literal("f")) +
+                   p.zero_or_more(arg) + p.tool_close(p.literal(")")) + p.end();
+        });
+        for (const std::string input : { "(fxv)", "(fxvxv)" }) {
+            common_peg_parse_context ctx(input);
+            auto result = parser.parse(ctx);
+            t.assert_true("syntax parsed", result.success());
+            common_chat_msg msg;
+            bool rejected = false;
+            try {
+                common_chat_peg_mapper(msg).from_ast(ctx.ast, result);
+            } catch (const std::runtime_error & e) {
+                rejected = std::string(e.what()).find("duplicate tool argument") != std::string::npos;
+            }
+            t.assert_equal("only duplicates rejected", input == "(fxvxv)", rejected);
+        }
+    });
+
     t.test("single element", [&](testing & t) {
         auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
             return p.permute("a", { p.literal("a") }) + p.end();
@@ -1082,5 +1102,38 @@ static void test_permute(testing & t) {
             root ::= "a" "b" "c" "d" "e" "f" "g"
             space ::= | " " | "\n"{1,2} [ \t]{0,20}
         )""", gbnf_of(parser));
+    });
+}
+
+static void test_invalid_utf8(testing & t) {
+    auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+        return "<think>" + p.reasoning(p.until("</think>")) + "</think>" + p.content(p.rest()) + p.end();
+    });
+
+    t.test("replaced in reasoning and content", [&](testing & t) {
+        std::string input("<think>plan\xFF\xFE</think>caf\xC3\xA9 \x80 done");
+        common_peg_parse_context ctx(input);
+        auto result = parser.parse(ctx);
+        t.assert_true("success", result.success());
+
+        common_chat_msg msg;
+        auto mapper = common_chat_peg_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+
+        t.assert_equal("reasoning", "plan\xEF\xBF\xBD\xEF\xBF\xBD", msg.reasoning_content);
+        t.assert_equal("content", "caf\xC3\xA9 \xEF\xBF\xBD done", msg.content);
+    });
+
+    t.test("partial input keeps trailing incomplete sequence out", [&](testing & t) {
+        std::string input("<think>x</think>a\x80" "b\xE4\xB8");
+        common_peg_parse_context ctx(input, COMMON_PEG_PARSE_FLAG_LENIENT);
+        auto result = parser.parse(ctx);
+        t.assert_true("not fail", !result.fail());
+
+        common_chat_msg msg;
+        auto mapper = common_chat_peg_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+
+        t.assert_equal("content", "a\xEF\xBF\xBD" "b", msg.content);
     });
 }

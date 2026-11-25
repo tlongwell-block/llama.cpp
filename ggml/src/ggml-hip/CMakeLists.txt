@@ -12,7 +12,7 @@ list(APPEND CMAKE_PREFIX_PATH  ${ROCM_PATH})
 list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}/lib64/cmake")
 
 if (NOT DEFINED CMAKE_HIP_FLAGS_DEBUG)
-    set(CMAKE_HIP_FLAGS_DEBUG "-g -O2")
+    set(CMAKE_HIP_FLAGS_DEBUG "-g -Xarch_device -O2 -Xarch_host -O0")
 endif()
 
 # CMake on Windows doesn't support the HIP language yet
@@ -51,8 +51,8 @@ if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
 endif()
 
-if (${hip_VERSION} VERSION_LESS 6.1)
-    message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
+if (${hip_VERSION} VERSION_LESS 6.3)
+    message(FATAL_ERROR "At least ROCM/HIP V6.3 is required")
 endif()
 
 message(STATUS "HIP and hipBLAS found")
